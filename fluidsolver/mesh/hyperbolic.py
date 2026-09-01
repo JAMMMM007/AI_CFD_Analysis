@@ -61,7 +61,7 @@ def hyperbolic_grid(
     area_relaxation: float = 0.0,
     max_retries: int = 6,
     allow_partial: bool = False,
-    max_width_ratio: float = 3.0,
+    max_width_ratio: float = 8.0,
 ) -> tuple[np.ndarray, int]:
     """March an O-grid outward from ``contour``.
 
@@ -98,6 +98,13 @@ def hyperbolic_grid(
         Under ``allow_partial``, stop once neighbouring cells within a layer
         differ in width by more than this. Only meaningful with
         ``allow_partial``, since without it there is nothing to hand over to.
+
+        The default is loose on purpose. Smooth stretching around a trailing edge
+        reaches a ratio near six on an aerofoil while the grid is still perfectly
+        usable, and the failure this is guarding against does not creep -- the
+        sawtooth goes from 5.6 to 12.6 to 123 in three layers. Anything between
+        those two is equivalent; a limit tight enough to catch the stretching
+        throws away a third of the marched grid for nothing.
     allow_partial
         Return the layers that did succeed instead of raising when one folds, or
         when ``max_width_ratio`` is breached.
@@ -170,8 +177,22 @@ def hyperbolic_grid(
         # layer carrying cells forty times their neighbours is worthless even
         # though every area is still positive. Stop while the grid is good and
         # let the caller's far field take over.
+        #
+        # The widths here are the *actual* cell widths, one-sided. Measuring them
+        # with :func:`_d_xi` instead -- as this did -- gives the check the same
+        # blind spot the metric itself has and that :func:`_d4` exists to cover:
+        # a central difference skips the point it is centred on, so it cannot see
+        # a sawtooth alternating between neighbours. On a NACA 0012 at y+ = 1 the
+        # two disagree completely. The central-difference ratio drifts smoothly
+        # up to 3.16 and never moves again, tripping a limit of 3 at layer 48 on
+        # nothing more than honest stretching; the true ratio sits at 5.6 there
+        # and then goes 12.6, 123 as adjacent points collide at layer 54. So the
+        # old check stopped the march two thirds of a chord short of where it
+        # could have gone, and would have sailed past the collision that matters.
         if allow_partial and j > 0:
-            width = np.hypot(*_d_xi(new_layer).T)
+            width = np.linalg.norm(
+                np.roll(new_layer, -1, axis=0) - new_layer, axis=1
+            )
             ratio = np.maximum(
                 np.roll(width, -1) / width, width / np.roll(width, -1)
             ).max()

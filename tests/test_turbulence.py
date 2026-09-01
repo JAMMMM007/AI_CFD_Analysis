@@ -198,6 +198,46 @@ class TestWallConditions:
         k, _ = model.boundaries.wall_turbulence()
         assert np.all(k == 0.0)
 
+    def test_the_omega_residual_measures_the_system_that_is_solved(self, rig):
+        """The wall row is replaced before the solve, so it must be replaced
+        before the residual too.
+
+        Regression, and the reason this solver could never report convergence.
+        ``omega`` in the wall cell is prescribed, not solved: its row is
+        overwritten with the identity. The residual was taken before that, so it
+        measured the wall row's *unsubstituted* equation -- an equation that is
+        then discarded, on the stiffest row in the mesh, where ``omega`` is of
+        order 1e8. Measured on a NACA 0012 at ``y+ = 1``, 99.6% of the reported
+        imbalance came from that one row: the figure printed was 9.2e-2 while the
+        system actually being solved stood at 1.9e-4.
+
+        :attr:`Residuals.worst` includes ``omega``, so this alone put a floor of
+        order 1e-1 under every run, whatever the physics was doing. It is exactly
+        the residual plateau the model was blamed for.
+        """
+        from fluidsolver.solver.linalg import Coefficients
+
+        model, state, faces, _, _ = rig
+        _, wall_omega = model.boundaries.wall_turbulence()
+        state.omega = np.full(faces.shape, 1.0e3)
+        state.omega[:, 0] = wall_omega
+
+        # An interior that is satisfied exactly, and a wall row that is not:
+        # a large diagonal against a source that has nothing to do with it.
+        coefficients = Coefficients.zeros(faces.shape)
+        coefficients.centre[:] = 1.0
+        coefficients.source[:] = state.omega
+        coefficients.centre[:, 0] = 1.0e6
+        coefficients.source[:, 0] = 0.0
+
+        before = coefficients.residual(state.omega)
+        residual = model._solve_and_clip(
+            coefficients, state, "omega", model._omega_floor, fixed_wall=wall_omega
+        )
+
+        assert before > 0.5, "the unsubstituted wall row should dominate"
+        assert residual < 1e-10, f"reported {residual:g} for a satisfied system"
+
 
 class TestLaminar:
     def test_eddy_viscosity_is_exactly_zero(self, rig):

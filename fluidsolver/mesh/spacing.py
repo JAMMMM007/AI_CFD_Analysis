@@ -3,7 +3,7 @@
 The first cell height is not a free meshing parameter. Integrating k-omega SST to
 the wall requires the first cell centre to sit at ``y+ ~ 1``, inside the viscous
 sublayer, because that is where the model's wall boundary condition
-``omega_w = 60 nu / (beta1 d1^2)`` is asymptotically valid. Put the first cell at
+``omega_w = 6 nu / (beta1 d1^2)`` is asymptotically valid. Put the first cell at
 ``y+ = 30`` instead and the model is being asked to resolve a sublayer it never
 sees, which shows up as wrong skin friction and, on an aerofoil, a wrong
 separation point.

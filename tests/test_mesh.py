@@ -150,6 +150,76 @@ class TestMarchingAgainstTheExactSolution:
         )
         assert 0 < guarded < unguarded
 
+    def test_no_marched_layer_hides_a_sawtooth(self, bodies, first_layer):
+        """The width check must be blind to nothing the metric is blind to.
+
+        Regression. The check measured widths with :func:`_d_xi`, the same
+        central difference the metric uses -- and a central difference skips the
+        point it is centred on, so it cannot see a mode alternating between
+        neighbours. That is the failure mode the whole fourth-difference term
+        exists to suppress, and the guard against it was measuring with an
+        operator that could not detect it.
+
+        Measured on a NACA 0012: the central-difference ratio drifted up to 3.16
+        and stayed there, while the true adjacent-cell ratio went 5.6, 12.6, 123
+        over three layers as the points collided. Asserting the property on the
+        true widths is what makes the guard mean something.
+        """
+        limit = 8.0
+        layers = spacing.geometric_layers(first_layer, 1.0, 1.15)
+        for name, body in bodies.items():
+            nodes, completed = hyperbolic_grid(
+                body, layers, allow_partial=True, max_width_ratio=limit
+            )
+            for j in range(1, completed + 1):
+                width = np.linalg.norm(
+                    np.roll(nodes[:, j], -1, axis=0) - nodes[:, j], axis=1
+                )
+                ratio = np.maximum(
+                    np.roll(width, -1) / width, width / np.roll(width, -1)
+                ).max()
+                assert ratio <= limit, f"{name}: layer {j} ratio {ratio:.1f}"
+
+    def test_the_march_stops_for_cause_and_not_before(self, bodies, first_layer):
+        """If it stopped early, the layer it refused must actually breach the limit.
+
+        Regression, and the one that matters most: stretching is not a failure,
+        and stopping on it costs the far field. The check measured the
+        central-difference ratio, which drifts smoothly upward on an aerofoil and
+        crossed a limit of 3 while the true adjacent-cell ratio was still only
+        5.6 against a limit of 8. That ended the NACA 0012 march at a wall
+        distance of 0.099 chord where it had another four layers in it -- and
+        handing that much extra of the mesh to the analytic blend is what made
+        the blend's seam violent enough to stop the solver converging.
+
+        Stated as a property rather than a distance, because the distance depends
+        on the surface resolution. For the record, at 240 surface points the
+        march now reaches 0.172 chord against 0.099 before.
+        """
+        limit = 8.0
+        layers = spacing.geometric_layers(first_layer, 1.0, 1.15)
+        for name, body in bodies.items():
+            nodes, completed = hyperbolic_grid(
+                body, layers, allow_partial=True, max_width_ratio=limit
+            )
+            if completed == len(layers):
+                continue
+            free, reached = hyperbolic_grid(
+                body, layers, allow_partial=True, max_width_ratio=1e9
+            )
+            assert reached > completed, f"{name}: nothing to compare against"
+            refused = free[:, completed + 1]
+            width = np.linalg.norm(
+                np.roll(refused, -1, axis=0) - refused, axis=1
+            )
+            ratio = np.maximum(
+                np.roll(width, -1) / width, width / np.roll(width, -1)
+            ).max()
+            assert ratio > limit, (
+                f"{name}: stopped at layer {completed} on a layer whose true "
+                f"width ratio was only {ratio:.2f}"
+            )
+
     def test_bad_layer_specifications_are_refused(self):
         with pytest.raises(MeshError, match="positive"):
             hyperbolic_grid(circle(1.0, 64), np.array([1e-3, -1e-3]))
@@ -250,7 +320,7 @@ class TestMetrics:
         assert metrics.total_volume == pytest.approx(exact, rel=1e-4)
 
     def test_wall_distance_of_the_first_cell_is_half_its_height(self):
-        """The SST wall condition is omega = 60 nu / (beta1 d1^2), so a wrong d1
+        """The SST wall condition is omega = 6 nu / (beta1 d1^2), so a wrong d1
         goes straight into the turbulence at the wall as an inverse square."""
         first = spacing.first_layer_thickness(1.0, **AIR)
         grid = build_ogrid(circle(1.0, 360), first_layer=first, far_field_radius=40.0)
@@ -304,3 +374,44 @@ class TestQuality:
         text = assess(compute_metrics(grid.nodes), grid.nodes).summary()
         for heading in ("cells", "volume", "non-orthogonality", "skewness", "aspect"):
             assert heading in text
+
+    def test_the_far_field_is_not_a_skewed_region_on_a_real_body(
+        self, bodies, first_layer
+    ):
+        """The single most expensive defect this code has had.
+
+        A circle hides it completely, because the marched grid line and the
+        radius the analytic far field follows are the same direction there. On
+        anything else they are not, and the mesh that resulted carried a *mean*
+        non-orthogonality of 8.3 degrees with a 99th percentile of 64.6 across
+        the outer half of the domain -- while its peak, 69.69, sat just under the
+        70-degree threshold that would have warned about it.
+
+        That mesh could not be converged on at any Reynolds number. With a
+        constant eddy viscosity and an effective Reynolds number of 20, where
+        nothing physical can go wrong, the solver diverged at iteration 230 on
+        the aerofoil and converged monotonically on the circle.
+
+        So this asserts on the *region*, not the peak.
+        """
+        for name, body in bodies.items():
+            grid = build_ogrid(
+                body, first_layer=first_layer, far_field_radius=40.0
+            )
+            report = assess(compute_metrics(grid.nodes), grid.nodes)
+            assert report.mean_non_orthogonality_deg < 6.0, name
+            assert report.non_orthogonal_fraction < 0.02, name
+
+    def test_a_widely_skewed_mesh_is_reported_as_a_region(self):
+        """A peak is one cell; a fraction is a region. The report says both."""
+        grid = build_ogrid(circle(1.0, 120), first_layer=1e-4, far_field_radius=30.0)
+        nodes = grid.nodes.copy()
+        # Shear every outer layer along i, which tilts the j faces away from the
+        # centroid-to-centroid line without inverting anything.
+        drift = np.linspace(0.0, 1.0, nodes.shape[1]) ** 2
+        nodes[:, :, 0] += 6.0 * drift[None, :] * np.sin(
+            np.linspace(0.0, 2.0 * np.pi, nodes.shape[0], endpoint=False)
+        )[:, None]
+        report = assess(compute_metrics(nodes), nodes)
+        assert report.non_orthogonal_fraction > 0.02
+        assert any("of faces are more than" in w for w in report.warnings)

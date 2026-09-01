@@ -41,7 +41,7 @@ class State:
         smooth thing to correct and the momentum equations resolve it within a few
         iterations.
 
-        ``omega`` may not. Its wall condition is ``60 nu / (beta1 d1^2)``, which on
+        ``omega`` may not. Its wall condition is ``6 nu / (beta1 d1^2)``, which on
         a ``y+ = 1`` mesh is of order ``1e8``, while its freestream value is of
         order ``1e2``. Starting it uniform therefore opens the run with a
         six-order discontinuity across the first cell -- and ``omega`` is the one
