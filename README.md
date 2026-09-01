@@ -4,13 +4,30 @@ A 2-D incompressible RANS solver with a Qt front end. Everything is solved from
 first principles -- a finite-volume discretisation of the RANS equations on a
 body-fitted mesh -- rather than by wrapping an existing CFD package.
 
-```bash
-py -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
+Set up, one command at a time. On Windows (PowerShell):
+
+```
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m fluidsolver
 ```
 
-```bash
-.venv/Scripts/python -m fluidsolver
+On macOS or Linux:
+
 ```
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m fluidsolver
+```
+
+These are listed separately rather than chained with `&&` on purpose: Windows
+PowerShell 5.1, which is what ships with Windows 10 and 11, has no `&&` operator
+and fails with a parser error. Its separator is `;`, or `A; if ($?) { B }` to
+continue only on success.
+
+Python 3.11 to 3.14 is the tested range; 3.10 is the floor, set by numpy and
+scipy rather than by anything in this code. The front end is a desktop window, so
+it needs a real graphical session -- it will not run over plain SSH.
 
 The window walks through five steps: **fluid and flow**, **body**, **mesh**,
 **model and numerics**, **solve**. The last runs the case in a background thread
@@ -57,8 +74,8 @@ path is a different matter, and is validated below.
 `validation/cylinder.py` solves steady flow past a circular cylinder and compares
 against the published benchmarks. Nothing is tuned to hit these.
 
-```bash
-.venv/Scripts/python -m validation.cylinder
+```
+.\.venv\Scripts\python.exe -m validation.cylinder
 ```
 
 | | computed | published |
@@ -104,8 +121,8 @@ the sign of `u . n`, whether it fixes velocity or pressure.
 
 ## Testing
 
-```bash
-.venv/Scripts/python -m pytest -q
+```
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
 180 tests. The centrepiece is a method-of-manufactured-solutions check on the
