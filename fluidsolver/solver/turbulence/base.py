@@ -1,0 +1,77 @@
+"""The interface every turbulence closure implements."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+import numpy as np
+
+from fluidsolver.solver.bc import Boundaries
+from fluidsolver.solver.faces import FaceGeometry
+from fluidsolver.solver.fields import State
+from fluidsolver.solver.fluid import Fluid
+
+
+class TurbulenceModel(ABC):
+    """A closure supplying the eddy viscosity to the momentum equations.
+
+    The contract is narrow on purpose. A model is handed the current state and
+    must leave ``state.eddy_viscosity`` consistent with it; whether it does that
+    by solving transport equations or by returning zero is its own business.
+    """
+
+    name = "turbulence"
+
+    def __init__(
+        self,
+        faces: FaceGeometry,
+        fluid: Fluid,
+        boundaries: Boundaries,
+        numerics,
+    ):
+        self.faces = faces
+        self.fluid = fluid
+        self.boundaries = boundaries
+        self.numerics = numerics
+
+    @abstractmethod
+    def update(self, state: State) -> tuple[float, float]:
+        """Advance the model one outer iteration and refresh the eddy viscosity.
+
+        Returns the residuals of whatever equations were solved, as a
+        ``(k, omega)`` pair; a model with no transport equations returns zeros.
+        """
+
+    def strain_rate(self, state: State, gradient) -> np.ndarray:
+        """``S = sqrt(2 S_ij S_ij)``, the invariant both production terms use.
+
+        In two dimensions
+
+            2 S_ij S_ij = 2[(du/dx)^2 + (dv/dy)^2] + (du/dy + dv/dx)^2
+        """
+        far_flux = state.flux_j[:, -1]
+        wall_u, wall_v = self.boundaries.wall_velocity()
+        far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
+
+        grad_u = gradient(state.u, wall_u, far_u)
+        grad_v = gradient(state.v, wall_v, far_v)
+
+        return np.sqrt(
+            2.0 * (grad_u[..., 0] ** 2 + grad_v[..., 1] ** 2)
+            + (grad_u[..., 1] + grad_v[..., 0]) ** 2
+        )
+
+    def vorticity(self, state: State, gradient) -> np.ndarray:
+        """``Omega = sqrt(2 W_ij W_ij)``, which in two dimensions is |dv/dx - du/dy|.
+
+        Needed alongside the strain rate because the two differ in exactly the
+        place that matters: at a stagnation point the strain is large while the
+        rotation is nearly zero.
+        """
+        far_flux = state.flux_j[:, -1]
+        wall_u, wall_v = self.boundaries.wall_velocity()
+        far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
+
+        grad_u = gradient(state.u, wall_u, far_u)
+        grad_v = gradient(state.v, wall_v, far_v)
+        return np.abs(grad_v[..., 0] - grad_u[..., 1])

@@ -1,0 +1,21 @@
+# Core numerics
+numpy>=2.0
+scipy>=1.14
+
+# Geometry / CAD import
+ezdxf>=1.3
+shapely>=2.0
+
+# GUI + visualisation
+PySide6>=6.7
+matplotlib>=3.9
+
+# NOTE: pyamg (algebraic multigrid) would accelerate the pressure-correction solve,
+# but it has no cp314 wheel and needs MSVC to build, which is not present here.
+# It is an optional extra: install it and the solver picks it up automatically,
+# otherwise ILU-preconditioned BiCGSTAB is used.  See docs/optional-deps.md
+# pyamg>=5.2
+
+# Testing
+pytest>=8.0
+pytest-qt>=4.4
