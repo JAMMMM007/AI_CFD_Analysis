@@ -95,16 +95,19 @@ class State:
     def speed(self) -> np.ndarray:
         return np.hypot(self.u, self.v)
 
+    #: The arrays that make up the state, in one place, so that copying it and
+    #: measuring it cannot drift apart from each other.
+    ARRAYS = (
+        "u", "v", "pressure", "k", "omega", "eddy_viscosity", "flux_i", "flux_j",
+    )
+
     def copy(self) -> "State":
-        return State(
-            **{
-                name: getattr(self, name).copy()
-                for name in (
-                    "u", "v", "pressure", "k", "omega",
-                    "eddy_viscosity", "flux_i", "flux_j",
-                )
-            }
-        )
+        return State(**{name: getattr(self, name).copy() for name in self.ARRAYS})
+
+    @property
+    def nbytes(self) -> int:
+        """What one copy of this state costs, for callers that keep several."""
+        return sum(getattr(self, name).nbytes for name in self.ARRAYS)
 
     def is_finite(self) -> bool:
         return all(

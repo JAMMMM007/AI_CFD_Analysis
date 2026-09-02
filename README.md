@@ -33,6 +33,27 @@ The window walks through five steps: **fluid and flow**, **body**, **mesh**,
 **model and numerics**, **solve**. The last runs the case in a background thread
 and updates the field, the residuals and the force coefficients as it converges.
 
+On the solve page the field plot is the whole point, so it gets the room:
+
+* **Zoom and pan.** The wheel zooms about the cursor, a left-drag pans, a
+  double-click goes back to the preset view, and `+` / `-` / **Reset view** do
+  the same from the keyboard-free route. The preset views (body, near field,
+  wake, far field) are still there as a starting point. Whatever view you are
+  looking at survives the redraws, so you can zoom into a wake and watch it
+  develop rather than being thrown back to the preset every twenty iterations.
+* **Fill window** hides the residuals and results panel and gives the whole page
+  to the field.
+* **Colour map.** *Automatic* uses a red-blue map for the signed fields and
+  viridis for the rest; red-blue, cool-warm, plasma, turbo and greyscale can be
+  chosen explicitly for any field.
+* **Replay.** Snapshots taken during the run are kept, and when the solver stops
+  the run plays back: play/pause, a slider to scrub with, a speed control and a
+  loop. The colour range is pinned to the final frame during a replay, so what
+  moves is the solution rather than the colour bar. The buffer is capped by
+  memory, and thins itself by dropping every second frame, so a long run on a
+  fine mesh replays the whole run at a coarser interval instead of exhausting
+  memory.
+
 ## Status, honestly
 
 | Part | State |
