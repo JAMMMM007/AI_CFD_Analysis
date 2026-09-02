@@ -41,33 +41,63 @@ and updates the field, the residuals and the force coefficients as it converges.
 | Body-fitted O-grid mesher | working, tested |
 | Finite-volume discretisation | working, second order (verified by manufactured solution) |
 | Laminar Navier-Stokes | **validated** against published cylinder benchmarks |
-| k-omega SST | implemented and unit-tested, but **does not converge** -- see below |
+| k-omega SST | runs, and no longer diverges, but **does not fully converge** -- see below |
 | Qt front end | working, tested |
 
-**The turbulence model is the honest gap.** Its algebra is implemented and
-checked against the analytic properties it is derived from: the log-layer eddy
-viscosity, the blending functions, the constants' defining relation. For the
-first few hundred iterations it produces sensible results on a NACA 0012 at
-Re = 2e6 -- skin friction within a few per cent of the flat-plate correlation, a
-y+ distribution near 1, an eddy-viscosity peak in the trailing-edge boundary
-layer, `Cd` around 0.010 against a published 0.008.
+**The turbulence model was blamed for four bugs that were not in it.** The
+symptom used to be a NACA 0012 at Re = 2e6 diverging around iteration 350, with
+`k` growing outside the boundary layer, and it looked exactly like a turbulence
+closure failing. It was not. The test that settled it: freeze the eddy viscosity
+at a *constant* 1e5 times molecular, so there is no turbulence model in the loop
+at all and the effective Reynolds number is 20 -- creeping flow, where nothing
+physical can go wrong. On a circle the solver converged monotonically. On the
+aerofoil, same mesher, same spacing, same everything, it diverged at iteration
+230 with velocities reaching 1e12. The difference was the mesh.
 
-It then stops improving. Around iteration 350 the residuals stall and the
-solution enters a limit cycle; sometimes it diverges outright. This was measured
-across four configurations -- NACA 0012 at Re = 2e6 and at 2e5, a cylinder at
-Re = 2e6, and a coarser y+ = 30 mesh -- and **none of them converged**, the best
-residual reached being about 1e-2. It is a general failure of the coupled
-iteration, not something peculiar to one geometry or Reynolds number.
+What was actually wrong, in the order it mattered:
 
-The symptom is a slow growth of `k` outside the boundary layer, which raises the
-eddy viscosity, which raises turbulent diffusion, which spreads `k` further. The
-stagnation-point anomaly at the leading edge feeds it. Menter's production
-limiter, the Kato-Launder production form, under-relaxation of the eddy viscosity
-and a conservation-consistent convective term each helped, and none was
-sufficient.
+1. **The O-grid had a 68-degree kink in it.** The hyperbolic march hands over to
+   an analytic polar far field, and the handover matched position but not
+   direction: the march arrives along the surface normal and the polar
+   construction leaves along a ray from the body centroid. On a circle those are
+   the same direction, so every test passed. On an aerofoil the face normal
+   rotated 68 degrees across one layer and the outer half of the mesh carried 18
+   degrees of non-orthogonality on average.
+2. **The march stopped two thirds of a chord early**, which is what put so much
+   of the mesh into that far field. Its guard against sawtooth cell collapse
+   measured widths with the same central difference the metric uses -- and a
+   central difference cannot see a sawtooth, which is the entire reason the
+   fourth-difference smoothing term exists. It tripped on smooth stretching at
+   layer 48 and would have sailed past the real collision at layer 54.
+3. **The `omega` residual was measured on a row that is thrown away.** `omega` in
+   the wall cell is prescribed, not solved, and its row is replaced with the
+   identity before the solve -- but after the residual was taken. That row is the
+   stiffest in the mesh and carried 99.6% of the reported imbalance: the number
+   printed was 9.2e-2 while the system being solved stood at 1.9e-4. Since the
+   convergence test takes the worst of all residuals, **no run could ever report
+   convergence**, whatever the physics was doing.
+4. **The far-field flux correction was assembled and never applied.** The
+   pressure equation put a diagonal entry on every outflow face asserting a flux
+   correction through it; the flux update did not make it. 62% of all the mass
+   imbalance left after each pressure correction sat in that one row of cells.
 
-Do not use the turbulence model for numbers you intend to rely on. The laminar
-path is a different matter, and is validated below.
+With those fixed, the constant-viscosity cases converge -- Re_eff = 20
+monotonically, Re_eff = 2000 to 1.6e-5 -- and the NACA 0012 at Re = 2e6 with SST
+reaches 2.9e-4 continuity by iteration 250 with `Cd` = 0.0090 against a published
+0.008, `Cl` within 1e-3 of the zero symmetry requires, and a peak eddy-viscosity
+ratio of 100 where the flat-plate estimate is 84.
+
+**It then stops improving.** From about iteration 260, as the eddy-viscosity
+ratio passes 100, the solution drifts into a bounded limit cycle at around 1e-2.
+It no longer diverges, and the forces stay in the right place, but it does not
+settle. That remaining oscillation *is* in the turbulence coupling -- it tracks
+`mu_t`, and it is absent from the frozen-viscosity runs on the same mesh -- and
+it has not been diagnosed yet.
+
+So: the turbulence model's algebra checks out against every analytic property it
+is derived from, and the coupled iteration is now stable rather than divergent,
+but the numbers are not yet converged ones. The laminar path is a different
+matter, and is validated below.
 
 ## Validation
 
@@ -101,11 +131,20 @@ detected corners so they survive exactly.
 **Meshing** (`fluidsolver/mesh/`) marches an O-grid outward from the wall by
 imposing orthogonality and a prescribed cell area, solved implicitly as a
 periodic block-banded system. On a circle it reproduces the exact concentric
-answer to machine precision. The march is stopped once cell quality starts to
-degrade, and the far field is completed analytically by interpolating to a circle
-in polar coordinates -- a construction that cannot fold. The first cell height is
-set from the target y+, because that is what the turbulence model's wall
-condition requires.
+answer to machine precision. The march is stopped once neighbouring cells within
+a layer start to collide, and the far field is completed analytically by
+interpolating to a circle in polar coordinates -- a construction that cannot
+fold. The first cell height is set from the target y+, because that is what the
+turbulence model's wall condition requires.
+
+The handover between the two is the delicate part, and getting it wrong cost this
+project the whole turbulence model. Polar interpolation matches the marched
+layer's position but not the direction it was travelling, and on any body that is
+not a circle those differ. The mitigation is to march as far as the grid stays
+clean and to relax the angular distribution on log radius, so the turn is spread
+evenly over the layers rather than crammed into the seam. Some non-orthogonality
+at the transition is inherent; the quality report now says how much of the mesh
+carries it, not just how bad the single worst face is.
 
 **Discretisation** (`fluidsolver/solver/`) is cell-centred finite volume.
 Convection uses deferred correction: upwind in the matrix for stability, the
@@ -125,7 +164,7 @@ the sign of `u . n`, whether it fixes velocity or pressure.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-180 tests. The centrepiece is a method-of-manufactured-solutions check on the
+188 tests. The centrepiece is a method-of-manufactured-solutions check on the
 discrete operators, which measures their *order of accuracy* rather than their
 error: diffusion and the high-order convection schemes come out second order,
 upwind first, which is what each is by construction. A scheme that is second

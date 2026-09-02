@@ -391,6 +391,78 @@ class TestBoundaries:
         assert abs(balanced.sum()) < 1e-10 * np.abs(balanced).sum()
 
 
+class TestPressureCorrection:
+    """That the matrix and the flux update describe the same operator."""
+
+    @pytest.fixture
+    def case(self):
+        from fluidsolver.solver.case import MeshSettings, build_case
+
+        return build_case(
+            circle(1.0, 96),
+            Fluid(density=1.0, viscosity=1.0 / 200.0),
+            Freestream(velocity=1.0),
+            mesh_settings=MeshSettings(surface_points=96, far_field_radius_ratio=20.0),
+            model_name="laminar",
+        )
+
+    def test_the_corrected_fluxes_satisfy_the_equation_that_produced_them(self, case):
+        """``div(F) after correction == A p' - b``, on every cell, boundary included.
+
+        This is an identity, not an approximation: the pressure equation is built
+        so that ``div(F')`` *is* ``A p'``, and ``b`` is ``-div(F*)``. It holds only
+        if every flux correction the matrix accounts for is actually applied to a
+        face.
+
+        Regression. :meth:`pressure_correction` put a diagonal entry on every
+        far-field face holding the pressure -- asserting a correction of
+        ``rho D g p'`` leaving through it -- and :meth:`apply_correction` never
+        applied it. The outer ring of cells was therefore left holding exactly
+        that imbalance after every iteration, for ever: on a NACA 0012 it was 62%
+        of all the mass error left in the domain, correlating with the missing
+        term at -0.9996. It never showed up as a wrong answer, only as a
+        continuity residual that would not go below about 1e-3.
+        """
+        for _ in range(5):
+            case.step()
+
+        coupling = case.coupling
+        state = case.state
+        _, _, diagonal = coupling.momentum(state)
+        flux_i, flux_j, d_i, d_j = coupling.face_fluxes(state, diagonal)
+        correction, coefficients = coupling.pressure_correction(
+            state, flux_i, flux_j, d_i, d_j, diagonal
+        )
+        coupling.apply_correction(
+            state, correction, flux_i, flux_j, d_i, d_j, diagonal
+        )
+
+        after = ops.divergence(state.flux_i, state.flux_j, case.faces)
+        expected = coefficients.apply(correction) - coefficients.source
+        scale = np.abs(coefficients.source).max()
+        assert np.abs(after - expected).max() < 1e-10 * scale
+
+    def test_the_outer_row_is_not_where_the_mass_error_lives(self, case):
+        """The symptom the identity above explains, stated in the terms it was seen in."""
+        for _ in range(20):
+            case.step()
+        imbalance = np.abs(
+            ops.divergence(case.state.flux_i, case.state.flux_j, case.faces)
+        )
+        assert imbalance[:, -1].sum() < 0.25 * imbalance.sum()
+
+    def test_the_pressure_residual_is_a_measurement(self, case):
+        """It must depend on the solution. Reporting 1.0 for ever is not a residual.
+
+        Regression. The residual was evaluated at ``phi = 0``, where the
+        expression reduces to ``sum|b| / sum|b|``, so every line of every log
+        read ``p 1.000e+00``.
+        """
+        values = [case.step().pressure for _ in range(6)]
+        assert not any(v == pytest.approx(1.0) for v in values)
+        assert len(set(values)) > 1
+
+
 # ----------------------------------------------------------------------
 # Forces
 # ----------------------------------------------------------------------

@@ -8,8 +8,13 @@ wrong, so the report is worth reading rather than glancing at:
 * **Non-orthogonality** -- the angle between a face normal and the line joining
   the two cell centroids across it. The diffusion term splits into an implicit
   orthogonal part and an explicit cross-diffusion correction, and the correction
-  grows with this angle. Past roughly 70 degrees it starts to dominate and the
-  outer iteration stops converging.
+  grows with this angle, as ``tan``: at 45 degrees the two are equal, and past
+  roughly 70 the lagged half dominates and the outer iteration stops converging.
+  Reported three ways -- peak, mean, and the share of faces past the warning
+  angle -- because they say different things. A peak is one cell; a mean is a
+  region. It was a *mean* of 8 degrees with a 99th percentile of 65, under a peak
+  that sat just below the old 70-degree threshold, that stopped this solver
+  converging at any Reynolds number.
 * **Skewness** -- how far the face midpoint sits from where the centroid-to-centroid
   line crosses the face, as a fraction of the face length. Face values are
   interpolated at the crossing point, so skewness is a direct error in every
@@ -32,8 +37,20 @@ from fluidsolver.mesh.metrics import Metrics
 
 # Above this the non-orthogonal correction stops being a correction. Meshes are
 # not rejected for it -- plenty of useful grids have a few bad cells -- but the
-# report says so, and the solver raises its number of correctors to compensate.
-_ORTHOGONALITY_WARNING_DEG = 70.0
+# report says so.
+#
+# Set at 60 rather than the 70 where the correction formally overtakes the
+# implicit part, because a threshold at the failure point does not warn about
+# anything until it is too late. The mesh that stopped this solver converging
+# peaked at 69.69 degrees and passed silently, while carrying a *mean* of 8.3 and
+# a 99th percentile of 64.6 -- the peak was never the interesting number.
+_ORTHOGONALITY_WARNING_DEG = 60.0
+
+# Non-orthogonality is not a defect of one cell but of a region, and a peak can
+# be one cell in fifty thousand. This is the share of faces allowed past
+# ``_ORTHOGONALITY_WARNING_DEG`` before the report says the mesh has a bad
+# *region* rather than a bad cell.
+_ORTHOGONALITY_WARNING_FRACTION = 0.02
 _SKEWNESS_WARNING = 0.5
 
 
@@ -47,6 +64,7 @@ class QualityReport:
     negative_volumes: int
     max_non_orthogonality_deg: float
     mean_non_orthogonality_deg: float
+    non_orthogonal_fraction: float
     max_skewness: float
     max_aspect_ratio: float
     max_expansion_ratio: float
@@ -66,11 +84,21 @@ class QualityReport:
                 f"{self.negative_volumes} inverted cells (negative volume). "
                 "The mesh cannot be solved on; regenerate it."
             )
-        if self.max_non_orthogonality_deg > _ORTHOGONALITY_WARNING_DEG:
+        if self.non_orthogonal_fraction > _ORTHOGONALITY_WARNING_FRACTION:
+            issues.append(
+                f"{self.non_orthogonal_fraction:.1%} of faces are more than "
+                f"{_ORTHOGONALITY_WARNING_DEG:.0f} deg non-orthogonal "
+                f"(peak {self.max_non_orthogonality_deg:.1f}, mean "
+                f"{self.mean_non_orthogonality_deg:.1f}). Cross-diffusion is "
+                "explicit, so the outer iteration will be slow and may not "
+                "converge at all."
+            )
+        elif self.max_non_orthogonality_deg > _ORTHOGONALITY_WARNING_DEG:
             issues.append(
                 f"peak non-orthogonality {self.max_non_orthogonality_deg:.1f} deg "
-                f"(above {_ORTHOGONALITY_WARNING_DEG:.0f}). Cross-diffusion is "
-                "explicit, so convergence will be slow and may stall."
+                f"(above {_ORTHOGONALITY_WARNING_DEG:.0f}), on "
+                f"{self.non_orthogonal_fraction:.2%} of faces. Localised, so "
+                "probably survivable, but it is where trouble will start."
             )
         if self.max_skewness > _SKEWNESS_WARNING:
             issues.append(
@@ -86,7 +114,9 @@ class QualityReport:
             f"volume                {self.min_volume:.4g} .. {self.max_volume:.4g}",
             f"inverted cells        {self.negative_volumes}",
             f"non-orthogonality     {self.mean_non_orthogonality_deg:.1f} deg mean, "
-            f"{self.max_non_orthogonality_deg:.1f} deg peak",
+            f"{self.max_non_orthogonality_deg:.1f} deg peak, "
+            f"{self.non_orthogonal_fraction:.2%} of faces above "
+            f"{_ORTHOGONALITY_WARNING_DEG:.0f}",
             f"skewness              {self.max_skewness:.3f} peak",
             f"aspect ratio          {self.max_aspect_ratio:.4g} peak",
             f"expansion ratio       {self.max_expansion_ratio:.3f} peak",
@@ -108,6 +138,9 @@ def assess(metrics: Metrics, nodes: np.ndarray) -> QualityReport:
         negative_volumes=int((volume <= 0.0).sum()),
         max_non_orthogonality_deg=float(orthogonality.max()),
         mean_non_orthogonality_deg=float(orthogonality.mean()),
+        non_orthogonal_fraction=float(
+            (orthogonality > _ORTHOGONALITY_WARNING_DEG).mean()
+        ),
         max_skewness=float(skewness.max()),
         max_aspect_ratio=float(_aspect_ratio(nodes).max()),
         max_expansion_ratio=float(_expansion_ratio(volume).max()),

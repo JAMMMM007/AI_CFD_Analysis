@@ -67,7 +67,7 @@ class Boundaries:
         return zero, zero.copy()
 
     def wall_turbulence(self) -> tuple[np.ndarray, np.ndarray]:
-        """``k = 0`` and Menter's ``omega_w = 60 nu / (beta1 d1^2)``.
+        """``k = 0`` and Wilcox's ``omega_w = 6 nu / (beta1 d1^2)``.
 
         Turbulence cannot survive at a solid surface, so ``k`` vanishes there.
         ``omega`` does the opposite -- it is singular at the wall, growing like

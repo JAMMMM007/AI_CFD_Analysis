@@ -254,13 +254,16 @@ def _add_boundary_diffusion(
     if value is None:
         return
     coupling = diffusivity * face.diffusion_factor
+    cross = diffusivity * np.sum(cell_gradient * face.cross, axis=-1)
     if active is not None:
+        # Both halves of the flux, not just the implicit one. A face switched off
+        # by ``active`` is zero-gradient, and a zero-gradient face carries no
+        # diffusive flux at all -- leaving the non-orthogonal correction behind
+        # puts one there anyway.
         coupling = np.where(active, coupling, 0.0)
+        cross = np.where(active, cross, 0.0)
     coefficients.centre[:, column] += coupling
-    coefficients.source[:, column] += coupling * value
-    coefficients.source[:, column] += diffusivity * np.sum(
-        cell_gradient * face.cross, axis=-1
-    )
+    coefficients.source[:, column] += coupling * value + cross
 
 
 def add_convection(

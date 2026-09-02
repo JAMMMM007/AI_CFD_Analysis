@@ -292,15 +292,7 @@ class PressureVelocityCoupling:
         # contributes a coupling to a known value -- diagonal only. Where it
         # holds the velocity instead, the flux there is already fixed and the
         # correction through that face is zero.
-        fixed = self.boundaries.far_pressure_is_fixed(flux_j[:, -1])
-        boundary_coupling = np.where(
-            fixed,
-            density
-            * (self.volume[:, -1] / diagonal[:, -1])
-            * self.faces.far_field.diffusion_factor,
-            0.0,
-        )
-        coefficients.centre[:, -1] += boundary_coupling
+        coefficients.centre[:, -1] += self._far_field_coupling(flux_j, diagonal)
 
         coefficients.source = -ops.divergence(flux_i, flux_j, self.faces)
 
@@ -314,6 +306,30 @@ class PressureVelocityCoupling:
             preconditioner=incomplete_lu_preconditioner(matrix),
         )
         return correction, coefficients
+
+    def _far_field_coupling(
+        self, flux_j: np.ndarray, diagonal: np.ndarray
+    ) -> np.ndarray:
+        """``rho D g`` on the far-field faces that hold the pressure, zero elsewhere.
+
+        This is the one term that appears in both halves of the pressure step: it
+        is the diagonal entry :meth:`pressure_correction` adds for an outflow
+        face, and it is the flux correction :meth:`apply_correction` has to apply
+        through that same face for the two to describe the same thing. It lives
+        here so they cannot disagree -- which they did. The matrix asserted a
+        correction of ``rho D g p'`` leaving through every fixed-pressure face and
+        the flux update never made it, so the outer ring of cells was left holding
+        exactly that imbalance after every iteration. Measured on a NACA 0012:
+        62% of all the mass imbalance left after the pressure correction sat in
+        that single row of cells, correlating with the missing term at -0.9996.
+        """
+        return np.where(
+            self.boundaries.far_pressure_is_fixed(flux_j[:, -1]),
+            self.fluid.density
+            * (self.volume[:, -1] / diagonal[:, -1])
+            * self.faces.far_field.diffusion_factor,
+            0.0,
+        )
 
     def apply_correction(
         self,
@@ -329,9 +345,10 @@ class PressureVelocityCoupling:
 
         The fluxes are corrected with the same compact operator that built the
         pressure equation, so continuity is satisfied to solver tolerance
-        immediately. The cell velocities are corrected with the smooth gradient
-        instead -- they are cell quantities, and using the compact form on them
-        would reintroduce the decoupling Rhie-Chow just removed.
+        immediately -- the far-field faces that hold the pressure included, via
+        :meth:`_far_field_coupling`. The cell velocities are corrected with the
+        smooth gradient instead: they are cell quantities, and using the compact
+        form on them would reintroduce the decoupling Rhie-Chow just removed.
         """
         density = self.fluid.density
         fixed = self.boundaries.far_pressure_is_fixed(flux_j[:, -1])
@@ -357,6 +374,13 @@ class PressureVelocityCoupling:
             * self.faces.j_faces.diffusion_factor
             * (correction[:, 1:] - correction[:, :-1])
         )
+        # The far field holds p' at zero where it holds the pressure, so the
+        # correction through that face is outward and proportional to p' in the
+        # cell inside it. Where it holds the velocity instead the coupling is
+        # zero, and the flux there stays exactly what the boundary condition set.
+        state.flux_j[:, -1] = flux_j[:, -1] + self._far_field_coupling(
+            flux_j, diagonal
+        ) * correction[:, -1]
 
     # ------------------------------------------------------------------
     # One outer iteration
@@ -389,7 +413,13 @@ class PressureVelocityCoupling:
         correction, pressure_coefficients = self.pressure_correction(
             state, flux_i, flux_j, d_i, d_j, diagonal
         )
-        residual_p = pressure_coefficients.residual(np.zeros(self.faces.shape))
+        # Measured at the correction that was obtained, not at zero. At zero the
+        # expression collapses to sum|b| / sum|b| and reports 1.000e+00 on every
+        # iteration of every run -- which it did, for as long as this line read
+        # ``residual(np.zeros(...))``. What is wanted here is how well the
+        # pressure equation was solved; how far continuity still is from being
+        # satisfied is the separate ``continuity`` figure below.
+        residual_p = pressure_coefficients.residual(correction)
 
         self.apply_correction(
             state, correction, flux_i, flux_j, d_i, d_j, diagonal

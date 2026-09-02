@@ -197,9 +197,19 @@ def _blend_to_circle(
     every cell comes out positive without a single tuning parameter.
 
     The angular distribution relaxes from the marched layer's towards a uniform
-    one, using a smoothstep in the radial coordinate. Its zero derivative at both
-    ends means the far field joins the marched grid without a kink in cell
-    aspect ratio, and arrives at the outer boundary evenly spaced.
+    one, using a smoothstep in *log* radius -- the variable that advances evenly
+    per layer on a geometrically graded mesh. Its zero derivative at both ends
+    means the far field joins the marched grid without a kink in cell aspect
+    ratio, and arrives at the outer boundary evenly spaced.
+
+    What this construction cannot do is match the *direction* the march arrived
+    on. It leaves the seam along a ray from the body centroid; the march arrives
+    along the surface normal. On a circle those coincide and the join is exact,
+    which is why a circle mesh comes out perfectly orthogonal and an aerofoil
+    does not. Some non-orthogonality at the transition layer is therefore
+    inherent to a polar far field, and the way to keep it small is to hand over
+    where the marched layer is already close to circular -- which is what the
+    marcher's ``max_width_ratio`` governs, and why it is set loosely.
     """
     offset = inner - centre
     r_inner = np.hypot(offset[:, 0], offset[:, 1])
@@ -218,12 +228,25 @@ def _blend_to_circle(
     sweep = 2.0 * np.pi * np.sign(angle[-1] - angle[0])
     uniform = angle[0] + sweep * np.arange(len(angle)) / len(angle)
 
-    # Fraction of the remaining radial gap covered by each layer.
+    # Fraction of the remaining radial gap covered by each layer. This has to
+    # place the radii, because it is what carries the requested thicknesses.
     fraction = np.concatenate(([0.0], np.cumsum(thicknesses) / thicknesses.sum()))
-    weight = fraction**2 * (3.0 - 2.0 * fraction)  # smoothstep
-
     r = r_inner[:, None] + (radius - r_inner[:, None]) * fraction[None, :]
-    theta = angle[:, None] + (uniform - angle)[:, None] * weight[None, :]
+
+    # The angular relaxation is driven by log radius instead, which is the
+    # variable that advances evenly from layer to layer once the thicknesses grow
+    # geometrically. Driving it by ``fraction`` -- as this did -- concentrates the
+    # whole relaxation into the outermost handful of layers, because with a growth
+    # ratio of 1.15 the cumulative thickness is still under a tenth of the total
+    # two thirds of the way out. Everything inside that keeps the marched angular
+    # distribution while its radii have already been forced towards a circle, and
+    # the two disagree: the grid line is no longer perpendicular to the layer it
+    # crosses. On a NACA 0012 that left a mean non-orthogonality of 15 degrees
+    # across the far field, decaying only in the last few layers; spreading the
+    # relaxation evenly brings it to 4.5 and confines what remains to the seam.
+    progress = np.log(r / r_inner[:, None]) / np.log(radius / r_inner[:, None])
+    weight = progress**2 * (3.0 - 2.0 * progress)  # smoothstep
+    theta = angle[:, None] + (uniform - angle)[:, None] * weight
 
     return centre + np.stack((r * np.cos(theta), r * np.sin(theta)), axis=-1)
 
