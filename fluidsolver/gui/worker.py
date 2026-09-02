@@ -26,7 +26,7 @@ class SolverWorker(QObject):
     """Drives a :class:`~fluidsolver.solver.case.Case` and reports progress."""
 
     progressed = Signal(object)  # Residuals
-    snapshot = Signal(object)  # State (a copy)
+    snapshot = Signal(int, object)  # iteration, State (a copy)
     finished = Signal(str)  # why it stopped
     failed = Signal(str)
 
@@ -57,7 +57,7 @@ class SolverWorker(QObject):
             self.failed.emit(f"{type(error).__name__}: {error}")
             return
 
-        self.snapshot.emit(self.case.state.copy())
+        self._emit_snapshot(self.case.iteration)
         self.finished.emit(self._reason())
 
     def _report(self, residuals: Residuals) -> bool:
@@ -66,9 +66,19 @@ class SolverWorker(QObject):
 
         self.progressed.emit(residuals)
         if residuals.iteration % self.snapshot_every == 0:
-            self.snapshot.emit(self.case.state.copy())
+            self._emit_snapshot(residuals.iteration)
 
         return not self._stop
+
+    def _emit_snapshot(self, iteration: int) -> None:
+        """Hand the GUI a copy of the field, tagged with the iteration it is.
+
+        The iteration travels with the snapshot rather than being read off the
+        case afterwards. The solver keeps iterating, so by the time the GUI
+        handles the signal ``case.iteration`` is a different number and the
+        replay would be labelled with iterations its frames do not belong to.
+        """
+        self.snapshot.emit(iteration, self.case.state.copy())
 
     def _reason(self) -> str:
         history = self.case.history

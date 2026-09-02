@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QMargins
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QListWidget,
     QListWidgetItem,
@@ -40,7 +41,7 @@ class MainWindow(QMainWindow):
         self.session = Session()
 
         self.setWindowTitle(f"fluidsolver {__version__}  -  2-D RANS")
-        self.resize(1500, 950)
+        self._size_to_the_screen()
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -86,6 +87,31 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
 
+    def _size_to_the_screen(self) -> None:
+        """Open nearly full screen, and centred.
+
+        The field plot is what this application is for, and a fixed default size
+        leaves most of a modern monitor empty around it. The available geometry
+        is used rather than the whole screen so the window does not open under
+        the task bar, and a floor keeps it usable if no screen is reported --
+        which is the case under a headless test run.
+        """
+        self.setMinimumSize(1100, 720)
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1600, 1000)
+            return
+
+        available = screen.availableGeometry()
+        width = max(1100, int(available.width() * 0.94))
+        height = max(720, int(available.height() * 0.94))
+        self.resize(width, height)
+        self.move(
+            available.x() + (available.width() - width) // 2,
+            available.y() + (available.height() - height) // 2,
+        )
+
     def _go(self, row: int) -> None:
         if 0 <= row < self.steps.count():
             self.steps.setCurrentRow(row)
@@ -105,13 +131,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self.session.description())
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
-        """Stop a running solve before the window goes away.
+        """Stop a running solve, and the replay, before the window goes away.
 
         A QThread still running when its Python objects are collected takes the
-        interpreter down with it, and the crash looks nothing like its cause.
+        interpreter down with it, and the crash looks nothing like its cause. A
+        replay timer left armed is the milder version of the same problem: it
+        fires into a half-deleted page.
         """
         run_page = self.page_widgets[-1]
-        if getattr(run_page, "thread", None) is not None:
-            run_page._stop()
-            run_page._shut_down()
+        if hasattr(run_page, "halt"):
+            run_page.halt()
         event.accept()

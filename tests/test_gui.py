@@ -19,7 +19,15 @@ import matplotlib  # noqa: E402
 matplotlib.use("QtAgg")
 
 from fluidsolver.gui.main_window import MainWindow  # noqa: E402
-from fluidsolver.gui.plot_canvas import FIELDS, close_seam, field_values  # noqa: E402
+from fluidsolver.gui.pages.run import ReplayBuffer  # noqa: E402
+from fluidsolver.gui.plot_canvas import (  # noqa: E402
+    COLOURMAPS,
+    FIELDS,
+    close_seam,
+    field_limits,
+    field_style,
+    field_values,
+)
 from fluidsolver.gui.worker import SolverWorker  # noqa: E402
 
 
@@ -240,3 +248,218 @@ class TestPlotHelpers:
         closed = close_seam(array)
         assert closed.shape == (5, 3)
         assert np.array_equal(closed[-1], array[0])
+
+
+class TestFieldColouring:
+    def test_a_signed_field_defaults_to_a_diverging_map(self):
+        colourmap, symmetric = field_style("vorticity")
+        assert colourmap == "RdBu_r"
+        assert symmetric
+
+    def test_an_unsigned_field_defaults_to_a_sequential_map(self):
+        colourmap, symmetric = field_style("speed")
+        assert colourmap == "viridis"
+        assert not symmetric
+
+    def test_an_explicit_map_wins_but_does_not_change_the_range(self):
+        colourmap, symmetric = field_style("speed", COLOURMAPS["Red-blue"])
+        assert colourmap == "RdBu_r"
+        assert not symmetric
+
+    def test_a_symmetric_range_is_centred_on_zero(self):
+        values = np.linspace(-2.0, 8.0, 1000)
+        low, high = field_limits(values, symmetric=True)
+        assert low == pytest.approx(-high)
+
+    def test_a_field_with_nothing_finite_has_no_range(self):
+        assert field_limits(np.full(10, np.nan)) is None
+
+
+class TestReplayBuffer:
+    def _state(self, nbytes=1024):
+        return type("Fake", (), {"nbytes": nbytes})()
+
+    def test_frames_are_kept_in_order(self):
+        buffer = ReplayBuffer()
+        for iteration in (20, 40, 60):
+            buffer.append(iteration, self._state())
+        assert [it for it, _ in buffer] == [20, 40, 60]
+
+    def test_a_repeated_iteration_replaces_rather_than_duplicates(self):
+        buffer = ReplayBuffer()
+        buffer.append(20, self._state())
+        final = self._state()
+        buffer.append(20, final)
+        assert len(buffer) == 1
+        assert buffer[-1][1] is final
+
+    def test_the_buffer_thins_instead_of_growing_without_bound(self):
+        buffer = ReplayBuffer(limit=8)
+        for iteration in range(1, 41):
+            buffer.append(iteration, self._state())
+
+        assert len(buffer) <= 8
+        iterations = [it for it, _ in buffer]
+        # Thinning has to keep the whole span of the run, not just its start,
+        # and it must never drop the newest frame.
+        assert iterations[0] == 1
+        assert iterations[-1] == 40
+        assert iterations == sorted(iterations)
+
+    def test_an_odd_capacity_still_keeps_the_newest_frame(self):
+        for limit in range(5, 12):
+            buffer = ReplayBuffer(limit=limit)
+            for iteration in range(1, 60):
+                buffer.append(iteration, self._state())
+            assert buffer[-1][0] == 59, f"lost the newest frame at limit {limit}"
+
+    def test_a_heavy_state_buys_fewer_frames(self):
+        buffer = ReplayBuffer(budget=10_000, limit=1000)
+        for iteration in range(1, 200):
+            buffer.append(iteration, self._state(nbytes=1000))
+        assert len(buffer) <= 10
+
+
+def _small_laminar_case(window):
+    """A cheap circle case, built and ready for the run page to draw."""
+    window.page_widgets[0].velocity.setValue(1.0)
+    window.page_widgets[1].kind.setCurrentIndex(1)  # circle
+    window.page_widgets[3].model.setCurrentIndex(1)  # laminar
+    session = window.session
+    session.fluid = type(session.fluid)(density=1.0, viscosity=0.05, name="test")
+    session.mesh_settings.surface_points = 48
+    session.mesh_settings.far_field_radius_ratio = 10.0
+    return session.build_case()
+
+
+class TestRunPageView:
+    """Panning and zooming, and the view surviving a redraw."""
+
+    @pytest.fixture
+    def run_page(self, window):
+        _small_laminar_case(window)
+        run = window.page_widgets[4]
+        run._draw_field()
+        return run
+
+    def test_zooming_in_narrows_the_view(self, run_page):
+        before = run_page.field_canvas.current_bounds()
+        run_page._zoom_by(0.5)
+        after = run_page.field_canvas.current_bounds()
+        assert (after[1] - after[0]) == pytest.approx(0.5 * (before[1] - before[0]))
+        assert (after[3] - after[2]) == pytest.approx(0.5 * (before[3] - before[2]))
+
+    def test_a_redraw_keeps_the_view_the_user_chose(self, run_page):
+        run_page._zoom_by(0.25)
+        zoomed = run_page.field_canvas.current_bounds()
+        run_page._draw_field()
+        assert run_page.field_canvas.current_bounds() == pytest.approx(zoomed)
+
+    def test_resetting_returns_to_the_preset(self, run_page):
+        preset = run_page.field_canvas.current_bounds()
+        run_page._zoom_by(0.25)
+        run_page._reset_view()
+        assert run_page.field_canvas.current_bounds() == pytest.approx(preset)
+
+    def test_changing_the_preset_moves_the_view(self, run_page):
+        run_page.zoom.setCurrentText("Body")
+        body = run_page.field_canvas.current_bounds()
+        run_page.zoom.setCurrentText("Far field")
+        far = run_page.field_canvas.current_bounds()
+        assert (far[1] - far[0]) > (body[1] - body[0])
+
+    def test_the_colour_map_choice_reaches_the_plot(self, run_page):
+        run_page.field.setCurrentText("Velocity magnitude")
+        run_page.colourmap.setCurrentText("Red-blue")
+        mesh = run_page.field_canvas.figure.axes[0].collections[0]
+        assert mesh.get_cmap().name == "RdBu_r"
+
+        run_page.colourmap.setCurrentText("Automatic")
+        mesh = run_page.field_canvas.figure.axes[0].collections[0]
+        assert mesh.get_cmap().name == "viridis"
+
+    def test_filling_the_window_hides_the_side_panel(self, run_page):
+        run_page.fill_window.setChecked(True)
+        assert not run_page.side_panel.isVisibleTo(run_page)
+        run_page.fill_window.setChecked(False)
+        assert run_page.side_panel.isVisibleTo(run_page)
+
+
+class TestReplayOnTheRunPage:
+    @pytest.fixture
+    def replayed(self, window):
+        case = _small_laminar_case(window)
+        run = window.page_widgets[4]
+        run.auto_replay.setChecked(False)
+        # Stand in for the worker: two snapshots, as it would have emitted them.
+        for iteration in (10, 20):
+            case.run(max_iterations=2)
+            run._snapshot(iteration, case.state.copy())
+        run._arm_replay()
+        return run, case
+
+    def test_the_snapshots_are_kept_as_frames(self, replayed):
+        run, _ = replayed
+        assert [it for it, _ in run.replay] == [10, 20]
+        assert run.replay_panel.isEnabled()
+        assert "(2/2)" in run.frame_label.text()
+
+    def test_drawing_a_snapshot_does_not_disturb_the_solver_state(self, replayed):
+        run, case = replayed
+        live = case.state
+        run._snapshot(30, case.state.copy())
+        assert case.state is live
+
+    def test_scrubbing_the_slider_shows_that_frame(self, replayed):
+        run, _ = replayed
+        run.frame_slider.setValue(0)
+        assert "iteration 10" in run.field_canvas.figure.axes[0].get_title()
+        assert "(1/2)" in run.frame_label.text()
+
+        run.frame_slider.setValue(1)
+        assert "iteration 20" in run.field_canvas.figure.axes[0].get_title()
+
+    def test_the_colour_range_is_pinned_across_frames(self, replayed):
+        run, _ = replayed
+        run.frame_slider.setValue(0)
+        first = run.field_canvas.figure.axes[0].collections[0].get_clim()
+        run.frame_slider.setValue(1)
+        assert run.field_canvas.figure.axes[0].collections[0].get_clim() == first
+
+    def test_playing_advances_and_stops_at_the_end(self, replayed):
+        run, _ = replayed
+        run.frame_slider.setValue(0)
+        run.play.setChecked(True)
+        assert run.play.text() == "Pause"
+
+        run._advance_replay()
+        assert run.frame_slider.value() == 1
+
+        run._advance_replay()  # past the end, and looping is off
+        assert not run.play.isChecked()
+        assert run.play.text() == "Play"
+
+    def test_pressing_play_at_the_end_starts_again(self, replayed):
+        run, _ = replayed
+        run.frame_slider.setValue(1)  # the last frame
+        run.play.setChecked(True)
+        assert run.frame_slider.value() == 0
+        run.halt()
+
+    def test_looping_wraps_back_to_the_start(self, replayed):
+        run, _ = replayed
+        run.loop.setChecked(True)
+        run.play.setChecked(True)
+        run.frame_slider.setValue(1)  # the last frame, while playing
+
+        run._advance_replay()
+        assert run.frame_slider.value() == 0
+        assert run.play.isChecked()
+        run.halt()
+
+    def test_halting_stops_the_replay(self, replayed):
+        run, _ = replayed
+        run.play.setChecked(True)
+        run.halt()
+        assert not run.play.isChecked()
+        assert not run._replay_timer.isActive()
