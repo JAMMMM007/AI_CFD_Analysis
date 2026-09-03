@@ -546,3 +546,35 @@ class TestReplayOnTheRunPage:
         run.halt()
         assert not run.play.isChecked()
         assert not run._replay_timer.isActive()
+
+
+class TestHealthInTheGui:
+    def test_a_refused_case_is_advice_rather_than_a_crash(self, window, monkeypatch):
+        """A hopeless case is well formed, not malformed. It must not read as a bug."""
+        from fluidsolver.solver.health import UnsolvableCase
+
+        run = window.page_widgets[4]
+        shown = {}
+
+        def fake_warning(_parent, title, message):
+            shown["title"], shown["message"] = title, message
+
+        def fake_critical(_parent, title, message):  # must not be used
+            shown["critical"] = title
+
+        monkeypatch.setattr(
+            "fluidsolver.gui.pages.run.QMessageBox.warning", fake_warning
+        )
+        monkeypatch.setattr(
+            "fluidsolver.gui.pages.run.QMessageBox.critical", fake_critical
+        )
+        monkeypatch.setattr(
+            window.session,
+            "build_case",
+            lambda: (_ for _ in ()).throw(UnsolvableCase("the median cell Peclet")),
+        )
+
+        run._start()
+        assert "critical" not in shown
+        assert shown["title"] == "This case cannot be solved"
+        assert "Peclet" in shown["message"]

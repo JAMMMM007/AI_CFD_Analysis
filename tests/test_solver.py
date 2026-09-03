@@ -688,3 +688,148 @@ class TestFluid:
     def test_turbulence_intensity_must_be_a_fraction(self):
         with pytest.raises(ValueError, match="fraction"):
             Freestream(velocity=10.0, turbulence_intensity=5.0)
+
+
+# ----------------------------------------------------------------------
+# Guardrails
+# ----------------------------------------------------------------------
+
+
+class TestSolutionLimits:
+    @staticmethod
+    def _state_and_limits(shape=(8, 4)):
+        from fluidsolver.solver.guard import SolutionLimits
+
+        freestream = Freestream(velocity=10.0)
+        state = State(
+            u=np.full(shape, 10.0),
+            v=np.zeros(shape),
+            pressure=np.zeros(shape),
+            k=np.zeros(shape),
+            omega=np.ones(shape),
+            eddy_viscosity=np.zeros(shape),
+            flux_i=np.zeros(shape),
+            flux_j=np.zeros((shape[0], shape[1] + 1)),
+        )
+        limits = SolutionLimits(AIR_15C, freestream, cells=int(np.prod(shape)))
+        return state, limits
+
+    def test_an_ordinary_field_is_left_alone(self):
+        state, limits = self._state_and_limits()
+        before = state.u.copy()
+        report = limits.apply(state)
+        assert report.is_quiet
+        assert np.array_equal(state.u, before)
+
+    def test_a_runaway_speed_is_held_and_counted(self):
+        state, limits = self._state_and_limits()
+        state.u[3, 2] = 1.0e6
+        report = limits.apply(state)
+        assert report.speed == 1
+        assert np.hypot(state.u, state.v).max() == pytest.approx(100.0)
+
+    def test_a_cold_start_pressure_spike_passes_through_untouched(self):
+        """Regression: the first cap was set inside the healthy band.
+
+        Starting a case puts a uniform field against a no-slip wall, and the
+        first pressure correction to that discontinuity is enormous before
+        decaying away. Measured peaks over the opening iterations are |Cp| of
+        123.5 on the Re 40 cylinder, 50.4 on the cylinder at Re 2e6 and 30.3 on
+        a NACA 2412 at 15 degrees -- all of which a cap of 100 dynamic heads
+        clipped. A backstop that fires on a run which was always going to
+        converge is shaping the answer, which is the one thing it must not do.
+        """
+        state, limits = self._state_and_limits()
+        q = Freestream(velocity=10.0).dynamic_pressure(AIR_15C)
+        state.pressure[:] = 150.0 * q  # above the old cap, inside the real one
+        report = limits.apply(state)
+        assert report.pressure == 0
+        assert state.pressure.max() == pytest.approx(150.0 * q)
+
+    def test_clipping_preserves_direction(self):
+        """Scale the vector, do not clip the components: the flow still goes
+        where it was going, it merely stops accelerating without bound."""
+        state, limits = self._state_and_limits()
+        state.u[1, 1], state.v[1, 1] = 3.0e5, 4.0e5
+        limits.apply(state)
+        assert state.v[1, 1] / state.u[1, 1] == pytest.approx(4.0 / 3.0)
+        assert np.hypot(state.u[1, 1], state.v[1, 1]) == pytest.approx(100.0)
+
+    def test_activity_accumulates_across_iterations(self):
+        state, limits = self._state_and_limits()
+        for _ in range(3):
+            state.u[0, 0] = 1.0e6
+            report = limits.apply(state)
+        assert report.iterations_active == 3
+        assert "3 iterations" in report.summary()
+
+
+class TestDivergenceMonitor:
+    @staticmethod
+    def _monitor():
+        from fluidsolver.solver.guard import DivergenceMonitor
+
+        return DivergenceMonitor()
+
+    def test_a_falling_residual_never_trips(self):
+        monitor = self._monitor()
+        residual = 1.0
+        for _ in range(400):
+            residual *= 0.98
+            assert not monitor.update(residual)
+
+    def test_a_sustained_climb_trips(self):
+        monitor = self._monitor()
+        residual = 1.0e-2
+        tripped = False
+        for _ in range(400):
+            residual *= 1.05
+            if monitor.update(residual):
+                tripped = True
+                break
+        assert tripped
+
+    def test_the_slow_grind_that_the_first_version_missed(self):
+        """Regression, and the reason the trigger is 1.5 rather than 10.
+
+        The laminar cylinder at Re = 2e6 does not blow up; it climbs about 1.3%
+        per iteration for hundreds of iterations. That is only 1.9x over a
+        fifty-iteration window, so a detector demanding a tenfold rise inside one
+        window sees nothing. Measured end to end, the first version of this let
+        that case run 900 iterations to a residual of 7.7 without objecting --
+        the exact failure it had been written to catch.
+        """
+        monitor = self._monitor()
+        residual = 1.0e-4
+        tripped_at = None
+        for i in range(900):
+            residual *= 1.013
+            if monitor.update(residual):
+                tripped_at = i
+                break
+        assert tripped_at is not None
+        # And it must object early enough to be worth having.
+        assert tripped_at < 500
+
+    def test_a_spike_alone_does_not_trip(self):
+        monitor = self._monitor()
+        for i in range(300):
+            assert not monitor.update(50.0 if i == 150 else 1.0e-2)
+
+    def test_a_converged_run_drifting_in_the_ninth_decimal_is_left_alone(self):
+        """A rise of ten from 1e-9 is not a divergence, whatever the ratio says."""
+        monitor = self._monitor()
+        residual = 1.0e-10
+        for _ in range(400):
+            residual *= 1.02
+            assert not monitor.update(residual)
+
+    def test_a_noisy_plateau_is_left_alone(self):
+        """Never much better than it is now, so it has not lost ground."""
+        monitor = self._monitor()
+        rng = np.random.default_rng(3)
+        for _ in range(400):
+            assert not monitor.update(1.0e-2 * float(np.exp(rng.normal(0.0, 0.4))))
+
+    def test_a_non_finite_residual_trips_immediately(self):
+        assert self._monitor().update(float("nan"))
