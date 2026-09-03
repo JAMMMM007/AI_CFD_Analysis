@@ -357,12 +357,37 @@ def build_case(
         pivot = np.array([contour.bounds[0], contour.centroid[1]])
         body = contour.rotated(-freestream.angle_of_attack_deg, about=pivot)
 
-    surface = body.resample(mesh_settings.surface_points)
     reference_length = contour.reference_length
 
+    # The first layer is sized before the surface is resampled, not after,
+    # because the two are not independent. Curvature clustering finer than the
+    # wall-normal spacing produces wall cells taller than they are wide, and that
+    # is what stops the hyperbolic march: at y+ 100 on 240 points the march
+    # reaches 2 layers of 30, and on 120 points -- where the trailing-edge
+    # cluster is no longer finer than the first layer -- it reaches 29.
     first_layer = mesh_settings.resolve_first_layer(
         fluid, freestream, reference_length, laminar=model_name == "laminar"
     )
+
+    # Clustering can be thinned to respect the first layer, but only down to the
+    # uniform spacing. Once even that is finer than the wall-normal step, every
+    # wall cell is taller than it is wide and no redistribution rescues it -- the
+    # march folds and the mesh comes back with inverted cells. That is a
+    # contradiction between two settings rather than a meshing failure, so it is
+    # reported as one, before any time is spent.
+    uniform_spacing = body.perimeter / mesh_settings.surface_points
+    if first_layer > uniform_spacing:
+        raise UnsolvableCase(
+            f"{mesh_settings.surface_points} surface points put the wall spacing "
+            f"at {uniform_spacing:.3e}, finer than the first layer of "
+            f"{first_layer:.3e} that y+ = {mesh_settings.target_y_plus:g} asks "
+            f"for. Every wall cell would be taller than it is wide and the mesh "
+            f"cannot be built.\n\n"
+            f"Use at most {int(body.perimeter / first_layer)} surface points at "
+            f"this y+, or lower the y+ target."
+        )
+    surface = body.resample(mesh_settings.surface_points, min_spacing=first_layer)
+
     grid = build_ogrid(
         surface,
         first_layer=first_layer,

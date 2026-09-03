@@ -234,6 +234,7 @@ class Contour:
         corner_angle_deg: float = 25.0,
         max_spacing_ratio: float = 1.2,
         smoothing_passes: int = 6,
+        min_spacing: float | None = None,
     ) -> "Contour":
         """Redistribute to ``n`` points, clustering them where the contour curves.
 
@@ -286,6 +287,31 @@ class Contour:
         smoothing_passes
             Diffusion passes applied to the sizing field, in log space, before it
             is integrated.
+        min_spacing
+            Floor on the wall spacing, normally the wall-normal first-layer
+            thickness. Curvature clustering below this buys nothing and costs a
+            great deal.
+
+            Tangential and wall-normal spacing are chosen independently -- one
+            from the point budget, the other from a ``y+`` target -- and nothing
+            otherwise stops them contradicting each other. Cluster the surface
+            below the first layer thickness and the wall cells come out taller
+            than they are wide, which is where the hyperbolic marcher fails:
+            measured on a NACA 2412 trailing edge, where the outward normal turns
+            through 42 degrees between adjacent points, the march completes
+            whenever the first layer is no larger than the tightest spacing and
+            collapses once it is several times larger.
+
+                first layer / tightest spacing      layers marched (of 30)
+                                    0.97                        30
+                                    2.19                        29
+                                    5.80                         2
+                                   12.58                         3
+
+            The same request -- 240 points at ``y+`` 100 -- goes from an unusable
+            mesh to a complete one on 120 points, purely because the trailing-edge
+            cluster thins out. So the floor is not a tuning parameter; it is the
+            missing constraint between two settings that were never coupled.
         """
         corners_s = self._corner_arclengths(corner_angle_deg)
         if n < max(3, len(corners_s)):
@@ -300,6 +326,14 @@ class Contour:
         n_dense = max(20 * n, 2000)
         u_dense = np.linspace(0.0, self.perimeter, n_dense, endpoint=False)
         dense = self._interpolate_at(offset + u_dense)
+
+        if min_spacing is not None and min_spacing > 0.0:
+            # Expressed through the refinement cap the sizing field already has,
+            # so there is one mechanism limiting clustering rather than two.
+            # Never *coarsens* below what was asked for: a body whose uniform
+            # spacing is already at the floor is left alone.
+            max_refinement = min(max_refinement, self.perimeter / n / min_spacing)
+            max_refinement = max(max_refinement, 1.0)
 
         h = self._sizing_field(
             dense, n, max_turn_deg, max_refinement, smoothing_passes, max_spacing_ratio

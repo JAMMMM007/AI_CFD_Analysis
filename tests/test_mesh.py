@@ -415,3 +415,78 @@ class TestQuality:
         report = assess(compute_metrics(nodes), nodes)
         assert report.non_orthogonal_fraction > 0.02
         assert any("of faces are more than" in w for w in report.warnings)
+
+
+class TestWallSpacingConstraint:
+    """Tangential and wall-normal spacing are not independent.
+
+    Curvature clustering finer than the first layer gives wall cells taller than
+    they are wide, and the hyperbolic march fails on them. Measured on a NACA
+    2412, whose trailing-edge normal turns through 42 degrees between adjacent
+    points: at y+ 100 on 240 points the march reached 2 layers of 30 and the mesh
+    came out with 84 degree non-orthogonality on 18% of faces; with the spacing
+    floored at the first layer it reaches 30 of 30 at 30.6 degrees peak and none
+    above 60.
+    """
+
+    @staticmethod
+    def _mesh(y_plus, points=240, body=None):
+        from fluidsolver.solver.case import MeshSettings, build_case
+        from fluidsolver.solver.fluid import AIR_15C, Freestream
+        from fluidsolver.geometry.naca import naca4
+
+        return build_case(
+            body if body is not None else naca4("2412"),
+            AIR_15C,
+            Freestream(velocity=30.0, angle_of_attack_deg=5.0),
+            mesh_settings=MeshSettings(
+                surface_points=points, target_y_plus=y_plus,
+                far_field_radius_ratio=40.0,
+            ),
+        )
+
+    def test_the_floor_stops_clustering_below_the_first_layer(self):
+        from fluidsolver.geometry.naca import naca4
+
+        body = naca4("2412")
+        floor = 2.0e-3
+        spacing = np.linalg.norm(
+            np.diff(body.resample(240, min_spacing=floor).points, axis=0, append=
+                    body.resample(240, min_spacing=floor).points[:1]), axis=1
+        )
+        # Allowed a little slack: the floor binds on the continuous sizing field,
+        # and each corner-to-corner segment takes a whole number of points.
+        assert spacing.min() > 0.75 * floor
+
+    def test_a_coarse_wall_mesh_is_now_well_conditioned(self):
+        quality = self._mesh(100.0).quality
+        assert quality.non_orthogonal_fraction == 0.0
+        assert quality.max_non_orthogonality_deg < 45.0
+
+    def test_a_fine_wall_mesh_is_unaffected(self):
+        """The floor must not bind where it was never the problem.
+
+        A y+ ~ 1 mesh already satisfied the constraint -- first layer 2.4e-5
+        against a tightest spacing of 4.2e-4 -- so these are the numbers it had
+        before the floor existed. One face in forty thousand sits at 60.07
+        degrees; that is the pre-existing seam, not something introduced here.
+        """
+        quality = self._mesh(1.0).quality
+        assert quality.mean_non_orthogonality_deg < 5.0
+        assert quality.non_orthogonal_fraction < 1.0e-4
+
+    def test_a_smooth_body_stays_perfectly_orthogonal(self):
+        """The regression that matters: a circle must not pay for a fix aimed
+        at trailing edges."""
+        from fluidsolver.geometry.primitives import circle
+
+        for y_plus in (1.0, 100.0):
+            quality = self._mesh(y_plus, body=circle(1.0, 240)).quality
+            assert quality.max_non_orthogonality_deg < 1.0e-4
+
+    def test_an_impossible_combination_is_refused_with_the_remedy(self):
+        """Finer than the first layer even uniformly: no redistribution helps."""
+        from fluidsolver.solver.health import UnsolvableCase
+
+        with pytest.raises(UnsolvableCase, match="surface points"):
+            self._mesh(100.0, points=960)
