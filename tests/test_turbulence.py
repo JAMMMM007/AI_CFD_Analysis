@@ -193,10 +193,21 @@ class TestWallConditions:
         _, wall_omega = model.boundaries.wall_turbulence()
         assert state.omega[:, 0] == pytest.approx(wall_omega, rel=0.05)
 
-    def test_k_vanishes_at_the_wall(self, rig):
+    def test_k_takes_a_zero_flux_wall_condition(self, rig):
+        """Not ``k = 0``, which is right only in the low-Reynolds limit.
+
+        Esch and Menter are explicit that zero flux is what holds in *both* the
+        viscous and the logarithmic limit, which is what a wall treatment
+        spanning the two has to satisfy. Fixing the face value to zero is correct
+        on a y+ ~ 1 mesh, where the first cell really does sit in the sublayer;
+        on a coarser one that cell centre carries a substantial turbulent kinetic
+        energy, and driving it to zero across the face removes energy the flow
+        has. ``None`` is how add_diffusion is told a boundary carries no
+        diffusive flux.
+        """
         model, _, _, _, _ = rig
         k, _ = model.boundaries.wall_turbulence()
-        assert np.all(k == 0.0)
+        assert k is None
 
     def test_the_omega_residual_measures_the_system_that_is_solved(self, rig):
         """The wall row is replaced before the solve, so it must be replaced
@@ -264,3 +275,100 @@ class TestStrainRate:
 class TestRegistry:
     def test_both_models_are_registered(self):
         assert set(MODELS) == {"laminar", "k-omega-sst"}
+
+
+class TestAutomaticWallTreatment:
+    """Esch and Menter (IGTC 2003), equations 15-18, plus the wall-cell strain.
+
+    The property worth guarding above all others is that every piece of this
+    reduces *exactly* to the low-Reynolds treatment as the first cell approaches
+    the wall. A wall model that quietly perturbs a y+ ~ 1 answer has taken
+    something away in exchange for what it gives.
+    """
+
+    @staticmethod
+    def _case(y_plus, iterations=60):
+        from fluidsolver.geometry.naca import naca4
+        from fluidsolver.solver.case import MeshSettings, build_case
+        from fluidsolver.solver.fluid import AIR_15C, Freestream
+
+        case = build_case(
+            naca4("2412"), AIR_15C,
+            Freestream(velocity=30.0, angle_of_attack_deg=5.0),
+            mesh_settings=MeshSettings(
+                surface_points=240, target_y_plus=y_plus, far_field_radius_ratio=40.0
+            ),
+        )
+        for _ in range(iterations):
+            case.step()
+        return case
+
+    def test_the_friction_velocity_recovers_the_log_law(self):
+        """Built from (U1, y1) alone, u_tau must come back out of the profile.
+
+        An earlier version seeded y+ from the viscous branch only, which
+        underestimates u_tau, shrinks ln(y+) and therefore *raises* the
+        logarithmic branch -- an overestimate that grew with coarsening, reaching
+        +21% at y+ 300. It is now iterated to a fixed point.
+        """
+        from fluidsolver.solver.bc import _KAPPA, _LOG_LAW_CONSTANT
+
+        nu, u_tau = 1.5e-5, 1.0
+        for y_plus in (30.0, 100.0, 300.0):
+            y1 = y_plus * nu / u_tau
+            u1 = u_tau * (np.log(y_plus) / _KAPPA + _LOG_LAW_CONSTANT)
+
+            viscous = np.sqrt(nu * u1 / y1)
+            friction = viscous
+            for _ in range(5):
+                yp = max(friction * y1 / nu, 1.0)
+                log = u1 / (np.log(yp) / _KAPPA + _LOG_LAW_CONSTANT)
+                friction = (viscous**4 + max(log, 0.0) ** 4) ** 0.25
+
+            assert friction == pytest.approx(u_tau, rel=0.05)
+
+    def test_the_wall_shear_is_what_the_momentum_equation_receives(self):
+        """mu_wall * g * U1 has to equal tau_w * A, or the model is decorative."""
+        case = self._case(30.0)
+        b, st = case.boundaries, case.state
+        delivered = (
+            b.wall_viscosity(st.u, st.v)
+            * case.faces.wall.diffusion_factor
+            * b.wall_tangential_velocity(st.u, st.v)
+        )
+        intended = b.wall_shear(st.u, st.v) * case.faces.wall.length
+        assert np.allclose(delivered, intended, rtol=1e-12)
+
+    def test_the_wall_strain_reduces_to_the_resolved_one_when_resolved(self):
+        """The whole treatment must be invisible on a y+ ~ 1 mesh."""
+        case = self._case(1.0)
+        b, st = case.boundaries, case.state
+        resolved = b.wall_tangential_velocity(st.u, st.v) / (
+            case.faces.wall.wall_normal_distance
+        )
+        corrected = b.wall_velocity_gradient(st.u, st.v)
+        assert np.median(corrected / resolved) == pytest.approx(1.0, rel=0.02)
+
+    def test_the_wall_strain_is_cut_hard_once_the_sublayer_is_unresolved(self):
+        """Regression: production went as the *average* gradient across the cell.
+
+        In the log layer that overstates the local gradient by kappa U+, which
+        squares into roughly thirty times too much production. Measured on a
+        NACA 2412 at y+ 30, k climbed from 4.4e-03 to 7.0e-03 and stuck on the
+        solution limiter -- 165 cells clipped on 554 of 600 iterations -- while
+        momentum, continuity and omega all converged by two orders.
+        """
+        case = self._case(30.0)
+        b, st = case.boundaries, case.state
+        resolved = b.wall_tangential_velocity(st.u, st.v) / (
+            case.faces.wall.wall_normal_distance
+        )
+        corrected = b.wall_velocity_gradient(st.u, st.v)
+        assert np.median(corrected / resolved) < 0.4
+
+    def test_a_coarse_wall_mesh_converges_and_leaves_the_limiter_alone(self):
+        """Both halves matter. A run that converges onto the limiter is not a run."""
+        case = self._case(30.0, iterations=400)
+        last = case.history.entries[-1]
+        assert last.k < 1.0e-4
+        assert case.limiter.is_quiet

@@ -503,7 +503,8 @@ class TestBoundaries:
             / (0.075 * faces.wall.wall_normal_distance**2)
         )
         assert np.allclose(omega, expected)
-        assert np.all(k == 0.0)
+        # Zero flux for k, not a fixed zero: see test_turbulence.py.
+        assert k is None
 
     def test_far_field_splits_on_the_sign_of_the_flux(self, setup):
         faces, boundaries, freestream = setup

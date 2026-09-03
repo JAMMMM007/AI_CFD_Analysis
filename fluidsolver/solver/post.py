@@ -89,26 +89,38 @@ class Forces:
 
 
 def wall_shear_stress(
-    state: State, faces: FaceGeometry, fluid: Fluid
+    state: State, faces: FaceGeometry, fluid: Fluid, boundaries=None
 ) -> tuple[np.ndarray, np.ndarray]:
     """Wall shear traction vector and its magnitude.
 
-    ``tau_w = mu du_t/dn`` at the surface, evaluated from the first cell: the wall
-    velocity is zero, so the tangential velocity there divided by the
-    perpendicular distance is the near-wall gradient. That one-sided difference is
-    only accurate if the first cell sits inside the viscous sublayer, which is
-    the reason the mesher targets ``y+`` of order one.
+    With ``boundaries`` supplied the magnitude is ``tau_w = rho u_tau^2`` from the
+    blended wall treatment, and the direction is taken from the tangential
+    velocity in the first cell. That is the only formulation valid across the
+    whole range of near-wall spacings: the alternative below assumes a linear
+    profile through the first cell, which is the truth inside the viscous
+    sublayer and an overestimate anywhere else.
 
-    Molecular viscosity is used, not the effective one. At the wall ``k`` is zero
-    and so is the eddy viscosity; the whole stress there is viscous.
+    Without it the linear form is used, ``tau_w = mu U1 / y1``, which is what
+    this did unconditionally and is still what a laminar case wants -- there the
+    profile through a well-resolved first cell really is linear and there is no
+    friction velocity to speak of.
+
+    Molecular viscosity in that branch, not the effective one: at the wall ``k``
+    vanishes and so does the eddy viscosity, so the whole stress is viscous.
     """
     normal = faces.wall.normal
     velocity = state.velocity[:, 0]
     tangential = velocity - np.sum(velocity * normal, axis=-1)[:, None] * normal
-
     distance = faces.wall.wall_normal_distance
-    traction = fluid.viscosity * tangential / distance[:, None]
-    return traction, np.linalg.norm(traction, axis=-1)
+
+    if boundaries is None:
+        traction = fluid.viscosity * tangential / distance[:, None]
+        return traction, np.linalg.norm(traction, axis=-1)
+
+    speed = np.linalg.norm(tangential, axis=-1)
+    direction = tangential / np.maximum(speed, 1e-30)[:, None]
+    magnitude = boundaries.wall_shear(state.u, state.v)
+    return direction * magnitude[:, None], magnitude
 
 
 def compute_forces(
@@ -118,6 +130,7 @@ def compute_forces(
     freestream: Freestream,
     reference_length: float,
     moment_reference: np.ndarray,
+    boundaries=None,
 ) -> Forces:
     """Integrate pressure and friction over the body."""
     area = faces.wall.area
@@ -127,7 +140,7 @@ def compute_forces(
     wall_pressure = state.pressure[:, 0]
     pressure_force = np.sum(wall_pressure[:, None] * area, axis=0)
 
-    traction, _ = wall_shear_stress(state, faces, fluid)
+    traction, _ = wall_shear_stress(state, faces, fluid, boundaries)
     viscous_force = np.sum(traction * length[:, None], axis=0)
 
     lever = faces.wall.centre - moment_reference
@@ -144,13 +157,14 @@ def compute_forces(
 
 
 def surface_data(
-    state: State, faces: FaceGeometry, fluid: Fluid, freestream: Freestream
+    state: State, faces: FaceGeometry, fluid: Fluid, freestream: Freestream,
+    boundaries=None,
 ) -> SurfaceData:
     """Pressure coefficient, skin friction and ``y+`` along the surface."""
     dynamic = freestream.dynamic_pressure(fluid)
     centre = faces.wall.centre
 
-    _, shear = wall_shear_stress(state, faces, fluid)
+    _, shear = wall_shear_stress(state, faces, fluid, boundaries)
     friction_velocity = np.sqrt(shear / fluid.density)
     y_plus = (
         fluid.density * friction_velocity * faces.wall.wall_normal_distance
@@ -178,7 +192,7 @@ def vorticity(state: State, gradient) -> np.ndarray:
 
 
 def separation_points(
-    state: State, faces: FaceGeometry, fluid: Fluid
+    state: State, faces: FaceGeometry, fluid: Fluid, boundaries=None
 ) -> np.ndarray:
     """Surface positions where the wall shear changes sign.
 
@@ -186,7 +200,7 @@ def separation_points(
     of the wall traction along the surface passes through zero. Interpolating
     between the two faces either side locates it to better than one cell.
     """
-    traction, _ = wall_shear_stress(state, faces, fluid)
+    traction, _ = wall_shear_stress(state, faces, fluid, boundaries)
     centre = faces.wall.centre
 
     tangent = np.roll(centre, -1, axis=0) - np.roll(centre, 1, axis=0)
