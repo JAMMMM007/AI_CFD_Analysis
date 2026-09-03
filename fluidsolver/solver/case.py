@@ -19,9 +19,18 @@ from fluidsolver.mesh.quality import QualityReport, assess
 from fluidsolver.solver import post
 from fluidsolver.solver.bc import Boundaries
 from fluidsolver.solver.faces import build_faces
+from fluidsolver.solver.guard import (
+    DivergenceMonitor,
+    LimiterReport,
+    SolutionLimits,
+    SolverDiverged,
+    diagnose,
+)
+from fluidsolver.solver.health import HealthReport, UnsolvableCase
+from fluidsolver.solver.health import assess as assess_health
 from fluidsolver.solver.fields import History, Residuals, State
 from fluidsolver.solver.fluid import Fluid, Freestream
-from fluidsolver.solver.simple import Numerics, PressureVelocityCoupling
+from fluidsolver.solver.simple import CflRamp, Numerics, PressureVelocityCoupling
 from fluidsolver.solver.turbulence import MODELS
 
 # Under-relaxation is eased in over the opening iterations. A cold start puts a
@@ -80,6 +89,11 @@ class Case:
     numerics: Numerics = field(default_factory=Numerics)
     model_name: str = "k-omega-sst"
     moment_reference: np.ndarray | None = None
+    #: Run even when the health check says the answer cannot mean anything. There
+    #: are legitimate reasons -- reproducing a known failure, or deliberately
+    #: taking a laminar solution at a Reynolds number where the real flow is not
+    #: -- so the door is not locked, only closed.
+    allow_unhealthy: bool = False
 
     def __post_init__(self):
         if self.model_name not in MODELS:
@@ -96,13 +110,40 @@ class Case:
                 + self.quality.summary()
             )
 
+        # Whether the mesh, the fluid and the model can produce an answer between
+        # them -- a separate question from whether the mesh is well formed, and
+        # the one that would have caught a laminar cylinder at Re = 2e6 before it
+        # spent 459 iterations on its way to a lift coefficient of 37525.
+        self.health: HealthReport = assess_health(
+            self.metrics,
+            self.grid.nodes,
+            self.fluid,
+            self.freestream,
+            self.model_name,
+            self.reference_length,
+        )
+        if not self.health.is_runnable and not self.allow_unhealthy:
+            raise UnsolvableCase(
+                "this case cannot produce a meaningful answer:\n\n"
+                + "\n\n".join(self.health.blockers)
+                + "\n\nSet allow_unhealthy=True to run it anyway."
+            )
+
         self.faces = build_faces(self.metrics)
         self.boundaries = Boundaries(self.faces, self.fluid, self.freestream)
         self.coupling = PressureVelocityCoupling(
-            self.faces, self.fluid, self.boundaries, self.numerics
+            self.faces,
+            self.fluid,
+            self.boundaries,
+            self.numerics,
+            reference_length=self.reference_length,
         )
         self.model = MODELS[self.model_name](
-            self.faces, self.fluid, self.boundaries, self.numerics
+            self.faces,
+            self.fluid,
+            self.boundaries,
+            self.numerics,
+            reference_length=self.reference_length,
         )
 
         if self.moment_reference is None:
@@ -111,6 +152,12 @@ class Case:
         self.state = State.uniform(self.faces, self.fluid, self.freestream)
         self.history = History()
         self.iteration = 0
+        self.cfl_ramp = CflRamp(self.numerics)
+        self.limits = SolutionLimits(
+            self.fluid, self.freestream, cells=int(self.metrics.volume.size)
+        )
+        self.limiter = LimiterReport(cells=int(self.metrics.volume.size))
+        self.divergence = DivergenceMonitor()
 
         # Laminar runs carry no eddy viscosity; establish that before the first
         # momentum assembly rather than leaving the freestream estimate in place.
@@ -127,7 +174,15 @@ class Case:
         return self.fluid.reynolds(self.freestream.velocity, self.reference_length)
 
     def _relaxation_scale(self) -> float:
-        """Ramp factor applied to every relaxation factor early on."""
+        """Ramp factor applied to every relaxation factor early on.
+
+        Off when pseudo-transient continuation is running: the CFL ramp already
+        eases the opening iterations, and easing the same thing twice from two
+        controllers that cannot see each other is how a run ends up crawling for
+        reasons nobody can attribute.
+        """
+        if self.numerics.pseudo_transient:
+            return 1.0
         if self.iteration >= _RAMP_ITERATIONS:
             return 1.0
         progress = self.iteration / _RAMP_ITERATIONS
@@ -135,6 +190,9 @@ class Case:
 
     def step(self) -> Residuals:
         """Advance one SIMPLE outer iteration."""
+        if self.numerics.pseudo_transient:
+            self.coupling.cfl = self.cfl_ramp.value
+            self.model.cfl = self.cfl_ramp.value
         scale = self._relaxation_scale()
         original = (
             self.numerics.relax_velocity,
@@ -158,10 +216,17 @@ class Case:
                 self.numerics.relax_turbulence,
             ) = original
 
+        # Bound the state before anything reads it -- the forces below included,
+        # so a runaway cell cannot produce a lift coefficient of 37525 on its way
+        # out. This is a backstop, not part of the discretisation: if it is doing
+        # anything on more than a handful of cells, the report says so.
+        self.limiter = self.limits.apply(self.state)
+
         if not self.state.is_finite():
-            raise FloatingPointError(
-                f"the solution went non-finite at iteration {self.iteration}. "
-                "Reduce the relaxation factors, or check the mesh quality report."
+            raise SolverDiverged(
+                f"the solution went non-finite at iteration {self.iteration}, "
+                "which the divergence monitor should have caught first. Check "
+                "the mesh quality report for inverted or highly skewed cells."
             )
 
         forces = self.forces()
@@ -178,6 +243,19 @@ class Case:
             drag_coefficient=forces.drag_coefficient,
         )
         self.history.append(residuals)
+        self.cfl_ramp.update(residuals.worst)
+
+        if self.divergence.update(residuals.worst):
+            raise SolverDiverged(
+                diagnose(
+                    self.state,
+                    residuals,
+                    self.metrics.centroid,
+                    self.fluid,
+                    self.freestream,
+                    self.limiter,
+                )
+            )
         return residuals
 
     def run(
@@ -244,6 +322,11 @@ class Case:
         ]
         if self.history.entries:
             lines.append(f"final residual  {self.history.entries[-1].worst:.3e}")
+        # Only when it has something to say. A limiter that never fired is the
+        # normal case and does not need a line; one that did is the first thing
+        # to know about the numbers above it.
+        if self.limiter.iterations_active:
+            lines.append(self.limiter.summary())
         return "\n".join(lines)
 
 
@@ -256,6 +339,7 @@ def build_case(
     numerics: Numerics | None = None,
     model_name: str = "k-omega-sst",
     moment_reference: np.ndarray | None = None,
+    allow_unhealthy: bool = False,
 ) -> Case:
     """Mesh a body and assemble a case around it.
 
@@ -294,4 +378,5 @@ def build_case(
         numerics=numerics,
         model_name=model_name,
         moment_reference=moment_reference,
+        allow_unhealthy=allow_unhealthy,
     )

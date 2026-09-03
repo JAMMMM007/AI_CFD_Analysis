@@ -34,6 +34,7 @@ from fluidsolver.gui.plot_canvas import (
 )
 from fluidsolver.gui.session import Session
 from fluidsolver.gui.worker import SolverWorker
+from fluidsolver.solver.health import UnsolvableCase
 
 # How often the field plot is redrawn, in solver iterations. Redrawing is far
 # slower than an iteration, so doing it every time would leave the GUI thread
@@ -350,12 +351,21 @@ class RunPage(QWidget):
     def _start(self) -> None:
         try:
             case = self.session.build_case()
+        except UnsolvableCase as refusal:
+            # Not a crash and not a bug report: the case is well formed and
+            # cannot produce a meaningful answer, and the message says why and
+            # what to change. Titled and styled accordingly.
+            QMessageBox.warning(self, "This case cannot be solved", str(refusal))
+            self.status.setText(str(refusal).splitlines()[0])
+            return
         except Exception as error:  # noqa: BLE001 - shown to the user verbatim
             QMessageBox.critical(self, "Could not set the case up", str(error))
             return
 
-        for warning in case.quality.warnings:
-            self.status.setText(f"mesh warning: {warning}")
+        # Health first: it is about whether the answer will mean anything, which
+        # matters more than whether the mesh is tidy.
+        for warning in case.health.warnings + case.quality.warnings:
+            self.status.setText(warning)
 
         # A new run invalidates the old replay and the colour ranges taken from
         # it. The view is deliberately left alone: it is in metres, and someone

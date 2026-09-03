@@ -206,6 +206,150 @@ class TestUnderRelaxation:
         assert np.allclose(again, exact)
 
 
+class TestPseudoTime:
+    """Local time stepping: the damping must be non-uniform and must not bias."""
+
+    def test_the_pseudo_time_term_leaves_the_converged_solution_unchanged(self):
+        """Same guarantee as relaxation: it vanishes where phi equals phi_old."""
+        rng = np.random.default_rng(7)
+        shape = (12, 6)
+        coefficients = Coefficients(*(0.2 * rng.normal(size=shape) for _ in range(6)))
+        coefficients.centre += 4.0
+        coefficients.south[:, 0] = 0.0
+        coefficients.north[:, -1] = 0.0
+        coefficients.source = rng.normal(size=shape)
+
+        matrix = StructuredMatrix(shape)
+        exact = spla.spsolve(
+            matrix.build(coefficients).tocsc(), coefficients.source.ravel()
+        ).reshape(shape)
+
+        stepped = Coefficients(
+            *(getattr(coefficients, f).copy() for f in
+              ("centre", "west", "east", "south", "north", "source"))
+        )
+        stepped.add_pseudo_time(exact, 3.0 + rng.random(shape))
+        again = spla.spsolve(
+            matrix.build(stepped).tocsc(), stepped.source.ravel()
+        ).reshape(shape)
+
+        assert np.allclose(again, exact)
+
+    def test_the_diagonal_is_the_cell_outflow_over_the_cfl(self):
+        """A uniform rightward flux gives each cell one face's worth of outflow."""
+        _, metrics, faces = uniform_mesh(32)
+        flux_i = np.full(faces.shape, 2.0)
+        flux_j = np.zeros((faces.shape[0], faces.shape[1] + 1))
+
+        diagonal = ops.pseudo_time_diagonal(
+            flux_i, flux_j, metrics.volume,
+            density=1.0, velocity=1.0, reference_length=1.0, cfl=4.0,
+        )
+        # Every i face carries +2, so each cell sees 2 out of its east face and
+        # nothing out of its west; the floor is far below that.
+        assert np.allclose(diagonal, 2.0 / 4.0)
+
+    def test_a_stagnant_cell_is_floored_rather_than_left_undamped(self):
+        _, metrics, faces = uniform_mesh(32)
+        zero_i = np.zeros(faces.shape)
+        zero_j = np.zeros((faces.shape[0], faces.shape[1] + 1))
+
+        diagonal = ops.pseudo_time_diagonal(
+            zero_i, zero_j, metrics.volume,
+            density=2.0, velocity=5.0, reference_length=10.0, cfl=1.0,
+        )
+        assert np.all(diagonal > 0.0)
+        assert np.allclose(diagonal, 2.0 * metrics.volume * 5.0 / 10.0)
+
+    def test_the_damping_is_not_uniform_across_the_mesh(self):
+        """The whole point. A convective step damps the far field and not the wall.
+
+        Pair the step with the full spectral radius instead -- convection *and*
+        diffusion -- and ``rho V / dtau`` becomes ``a_P / CFL``, whereupon the
+        effective relaxation is ``CFL/(1+CFL)`` in every cell and the mechanism
+        is global under-relaxation wearing a different hat. This test is what
+        stops that regression going unnoticed.
+        """
+        from fluidsolver.solver.case import MeshSettings, build_case
+        from fluidsolver.solver.simple import Numerics
+
+        case = build_case(
+            circle(1.0, 96),
+            Fluid(density=1.0, viscosity=1.0 / 5000.0),
+            Freestream(velocity=1.0),
+            mesh_settings=MeshSettings(surface_points=96, far_field_radius_ratio=20.0),
+            numerics=Numerics(
+                pseudo_transient=True, relax_velocity=1.0, relax_turbulence=1.0
+            ),
+            model_name="laminar",
+        )
+        for _ in range(20):
+            case.step()
+
+        coupling = case.coupling
+        pseudo_time = coupling.pseudo_time_diagonal(case.state)
+        coupling.numerics.pseudo_transient = False
+        _, _, diagonal = coupling.momentum(case.state)
+        coupling.numerics.pseudo_transient = True
+
+        alpha = diagonal / (diagonal + pseudo_time)
+        wall = case.metrics.wall_distance
+        near = np.median(alpha[wall < np.percentile(wall, 5)])
+        far = np.median(alpha[wall > np.percentile(wall, 80)])
+
+        # Barely damped at the wall, damped in the far field, and the two must
+        # differ by a wide margin rather than by rounding.
+        assert near > 0.9
+        assert far < 0.75
+        assert near - far > 0.15
+
+    def test_it_is_off_by_default_and_then_costs_nothing(self):
+        """Shipped off: it measurably does not help a steady segregated solver."""
+        from fluidsolver.solver.simple import Numerics
+
+        assert Numerics().pseudo_transient is False
+
+
+class TestCflRamp:
+    def _ramp(self, **kwargs):
+        from fluidsolver.solver.simple import CflRamp, Numerics
+
+        return CflRamp(Numerics(**kwargs))
+
+    def test_it_grows_while_the_residual_falls_and_stops_at_the_ceiling(self):
+        ramp = self._ramp(cfl=1.0, cfl_max=4.0, cfl_growth=1.5)
+        residual = 1.0
+        for _ in range(200):
+            residual *= 0.95
+            ramp.update(residual)
+        assert ramp.value == pytest.approx(4.0)
+        assert ramp.backoffs == 0
+
+    def test_it_backs_off_when_the_residual_turns_and_climbs(self):
+        ramp = self._ramp(cfl=8.0, cfl_max=64.0, cfl_growth=1.0)
+        residual = 1e-6
+        for _ in range(400):
+            residual *= 1.05
+            ramp.update(residual)
+        assert ramp.backoffs > 0
+        assert ramp.value < 8.0
+
+    def test_a_single_spike_does_not_trigger_a_back_off(self):
+        """Residuals rattle. Only a sustained rise counts."""
+        ramp = self._ramp(cfl=2.0, cfl_max=2.0, cfl_growth=1.0)
+        for i in range(120):
+            ramp.update(100.0 if i == 60 else 1e-5)
+        assert ramp.backoffs == 0
+
+    def test_a_non_finite_residual_is_ignored_rather_than_poisoning_the_history(self):
+        ramp = self._ramp(cfl=2.0, cfl_max=8.0)
+        ramp.update(float("nan"))
+        ramp.update(float("inf"))
+        ramp.update(0.0)
+        assert ramp.value > 0.0
+        assert ramp.backoffs == 0
+
+
 # ----------------------------------------------------------------------
 # Operators
 # ----------------------------------------------------------------------
@@ -544,3 +688,148 @@ class TestFluid:
     def test_turbulence_intensity_must_be_a_fraction(self):
         with pytest.raises(ValueError, match="fraction"):
             Freestream(velocity=10.0, turbulence_intensity=5.0)
+
+
+# ----------------------------------------------------------------------
+# Guardrails
+# ----------------------------------------------------------------------
+
+
+class TestSolutionLimits:
+    @staticmethod
+    def _state_and_limits(shape=(8, 4)):
+        from fluidsolver.solver.guard import SolutionLimits
+
+        freestream = Freestream(velocity=10.0)
+        state = State(
+            u=np.full(shape, 10.0),
+            v=np.zeros(shape),
+            pressure=np.zeros(shape),
+            k=np.zeros(shape),
+            omega=np.ones(shape),
+            eddy_viscosity=np.zeros(shape),
+            flux_i=np.zeros(shape),
+            flux_j=np.zeros((shape[0], shape[1] + 1)),
+        )
+        limits = SolutionLimits(AIR_15C, freestream, cells=int(np.prod(shape)))
+        return state, limits
+
+    def test_an_ordinary_field_is_left_alone(self):
+        state, limits = self._state_and_limits()
+        before = state.u.copy()
+        report = limits.apply(state)
+        assert report.is_quiet
+        assert np.array_equal(state.u, before)
+
+    def test_a_runaway_speed_is_held_and_counted(self):
+        state, limits = self._state_and_limits()
+        state.u[3, 2] = 1.0e6
+        report = limits.apply(state)
+        assert report.speed == 1
+        assert np.hypot(state.u, state.v).max() == pytest.approx(100.0)
+
+    def test_a_cold_start_pressure_spike_passes_through_untouched(self):
+        """Regression: the first cap was set inside the healthy band.
+
+        Starting a case puts a uniform field against a no-slip wall, and the
+        first pressure correction to that discontinuity is enormous before
+        decaying away. Measured peaks over the opening iterations are |Cp| of
+        123.5 on the Re 40 cylinder, 50.4 on the cylinder at Re 2e6 and 30.3 on
+        a NACA 2412 at 15 degrees -- all of which a cap of 100 dynamic heads
+        clipped. A backstop that fires on a run which was always going to
+        converge is shaping the answer, which is the one thing it must not do.
+        """
+        state, limits = self._state_and_limits()
+        q = Freestream(velocity=10.0).dynamic_pressure(AIR_15C)
+        state.pressure[:] = 150.0 * q  # above the old cap, inside the real one
+        report = limits.apply(state)
+        assert report.pressure == 0
+        assert state.pressure.max() == pytest.approx(150.0 * q)
+
+    def test_clipping_preserves_direction(self):
+        """Scale the vector, do not clip the components: the flow still goes
+        where it was going, it merely stops accelerating without bound."""
+        state, limits = self._state_and_limits()
+        state.u[1, 1], state.v[1, 1] = 3.0e5, 4.0e5
+        limits.apply(state)
+        assert state.v[1, 1] / state.u[1, 1] == pytest.approx(4.0 / 3.0)
+        assert np.hypot(state.u[1, 1], state.v[1, 1]) == pytest.approx(100.0)
+
+    def test_activity_accumulates_across_iterations(self):
+        state, limits = self._state_and_limits()
+        for _ in range(3):
+            state.u[0, 0] = 1.0e6
+            report = limits.apply(state)
+        assert report.iterations_active == 3
+        assert "3 iterations" in report.summary()
+
+
+class TestDivergenceMonitor:
+    @staticmethod
+    def _monitor():
+        from fluidsolver.solver.guard import DivergenceMonitor
+
+        return DivergenceMonitor()
+
+    def test_a_falling_residual_never_trips(self):
+        monitor = self._monitor()
+        residual = 1.0
+        for _ in range(400):
+            residual *= 0.98
+            assert not monitor.update(residual)
+
+    def test_a_sustained_climb_trips(self):
+        monitor = self._monitor()
+        residual = 1.0e-2
+        tripped = False
+        for _ in range(400):
+            residual *= 1.05
+            if monitor.update(residual):
+                tripped = True
+                break
+        assert tripped
+
+    def test_the_slow_grind_that_the_first_version_missed(self):
+        """Regression, and the reason the trigger is 1.5 rather than 10.
+
+        The laminar cylinder at Re = 2e6 does not blow up; it climbs about 1.3%
+        per iteration for hundreds of iterations. That is only 1.9x over a
+        fifty-iteration window, so a detector demanding a tenfold rise inside one
+        window sees nothing. Measured end to end, the first version of this let
+        that case run 900 iterations to a residual of 7.7 without objecting --
+        the exact failure it had been written to catch.
+        """
+        monitor = self._monitor()
+        residual = 1.0e-4
+        tripped_at = None
+        for i in range(900):
+            residual *= 1.013
+            if monitor.update(residual):
+                tripped_at = i
+                break
+        assert tripped_at is not None
+        # And it must object early enough to be worth having.
+        assert tripped_at < 500
+
+    def test_a_spike_alone_does_not_trip(self):
+        monitor = self._monitor()
+        for i in range(300):
+            assert not monitor.update(50.0 if i == 150 else 1.0e-2)
+
+    def test_a_converged_run_drifting_in_the_ninth_decimal_is_left_alone(self):
+        """A rise of ten from 1e-9 is not a divergence, whatever the ratio says."""
+        monitor = self._monitor()
+        residual = 1.0e-10
+        for _ in range(400):
+            residual *= 1.02
+            assert not monitor.update(residual)
+
+    def test_a_noisy_plateau_is_left_alone(self):
+        """Never much better than it is now, so it has not lost ground."""
+        monitor = self._monitor()
+        rng = np.random.default_rng(3)
+        for _ in range(400):
+            assert not monitor.update(1.0e-2 * float(np.exp(rng.normal(0.0, 0.4))))
+
+    def test_a_non_finite_residual_trips_immediately(self):
+        assert self._monitor().update(float("nan"))

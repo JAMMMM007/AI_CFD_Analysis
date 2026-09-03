@@ -75,6 +75,27 @@ class Coefficients:
         self.centre /= factor
         self.source += (1.0 - factor) * self.centre * field
 
+    def add_pseudo_time(self, field: np.ndarray, diagonal: np.ndarray) -> None:
+        """Add a pseudo-time derivative ``rho V (phi - phi_old) / dtau``, in place.
+
+        ``diagonal`` is ``rho V / dtau``; the caller owns the choice of time step.
+        Structurally this is the same trade as :meth:`under_relax` -- a term on the
+        diagonal and the matching one on the source, both vanishing at convergence
+        where ``phi = phi_old``, so the fixed point is untouched. What differs is
+        *what the added diagonal is proportional to*, and that difference is the
+        whole point:
+
+            under-relaxation   adds  a_P (1 - alpha) / alpha        -- scales a_P
+            pseudo-time        adds  rho V / dtau                   -- independent
+
+        Relaxation therefore damps every cell by the same fraction whatever the
+        local physics; a pseudo-time step damps by a fraction that follows the
+        local flow. See :meth:`PressureVelocityCoupling.pseudo_time_diagonal` for
+        why that distinction is not automatic and is easy to throw away.
+        """
+        self.centre += diagonal
+        self.source += diagonal * field
+
     def residual(self, field: np.ndarray) -> float:
         """Scaled residual of the current field, in the usual finite-volume sense.
 

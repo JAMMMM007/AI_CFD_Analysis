@@ -20,6 +20,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from fluidsolver.solver.case import Case
 from fluidsolver.solver.fields import Residuals
+from fluidsolver.solver.guard import SolverDiverged
 
 
 class SolverWorker(QObject):
@@ -50,7 +51,10 @@ class SolverWorker(QObject):
     def run(self) -> None:
         try:
             self.case.run(callback=self._report, report_every=1)
-        except FloatingPointError as error:
+        except (SolverDiverged, FloatingPointError) as error:
+            # Already a diagnosis rather than an exception message -- it names
+            # the equation, the cells and the limiter activity -- so it goes to
+            # the user as written, without a type name in front of it.
             self.failed.emit(str(error))
             return
         except Exception as error:  # noqa: BLE001 - surfaced to the user verbatim
