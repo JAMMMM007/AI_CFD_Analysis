@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from fluidsolver.solver import operators as ops
 from fluidsolver.solver.bc import Boundaries
 from fluidsolver.solver.faces import FaceGeometry
 from fluidsolver.solver.fields import State
@@ -28,11 +29,36 @@ class TurbulenceModel(ABC):
         fluid: Fluid,
         boundaries: Boundaries,
         numerics,
+        reference_length: float = 1.0,
     ):
         self.faces = faces
         self.fluid = fluid
         self.boundaries = boundaries
         self.numerics = numerics
+        self.reference_length = reference_length
+        #: Current CFL number, kept in step with the pressure-velocity coupling's
+        #: by whoever owns the run. See
+        #: :func:`fluidsolver.solver.operators.pseudo_time_diagonal`.
+        self.cfl = numerics.cfl
+
+    def pseudo_time_diagonal(self, state: State) -> np.ndarray | None:
+        """``rho V / dtau`` for the transported turbulence quantities.
+
+        The same local step the momentum equations use, so that k and omega are
+        damped consistently with the velocity field driving them. ``None`` when
+        pseudo-transient continuation is switched off.
+        """
+        if not self.numerics.pseudo_transient:
+            return None
+        return ops.pseudo_time_diagonal(
+            state.flux_i,
+            state.flux_j,
+            self.faces.metrics.volume,
+            density=self.fluid.density,
+            velocity=self.boundaries.freestream.velocity,
+            reference_length=self.reference_length,
+            cfl=self.cfl,
+        )
 
     @abstractmethod
     def update(self, state: State) -> tuple[float, float]:

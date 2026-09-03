@@ -424,6 +424,74 @@ def _face_correction(
     return np.where(np.abs(jump) > 1e-300, 0.5 * limiter * jump, 0.0)
 
 
+def pseudo_time_diagonal(
+    flux_i: np.ndarray,
+    flux_j: np.ndarray,
+    volume: np.ndarray,
+    *,
+    density: float,
+    velocity: float,
+    reference_length: float,
+    cfl: float,
+) -> np.ndarray:
+    """``rho V / dtau`` for local time stepping.
+
+    The time step is the cell's *convective* transit time and nothing else,
+
+        dtau_P  =  CFL V_P / ( sum_f max(F_f, 0) / rho )
+
+    so what comes back is the cell's total outflow divided by the CFL number.
+    Two decisions are buried in that, and both matter more than they look.
+
+    **Convection only, no viscous limit.** The obvious formula pairs the
+    convective limit with a diffusive one, ``dtau = CFL / (|u|/h + 2 nu/h^2)``.
+    That is right for an *explicit* scheme, where diffusion restricts the step.
+    Here diffusion is implicit -- it is in the matrix -- so it imposes no
+    stability limit at all, and including it does active harm. Write the step
+    with the full spectral radius and it becomes ``dtau = CFL rho V / a_P``,
+    whereupon
+
+        rho V / dtau  =  a_P / CFL      and      alpha_eff = CFL / (1 + CFL)
+
+    in *every* cell. That is global under-relaxation with a renamed knob: the
+    mechanism collapses into the thing it was meant to improve on. Dropping the
+    viscous term is what keeps the two distinct.
+
+    **What the surviving form does.** With ``rho V / dtau = a_P^conv / CFL``,
+
+        alpha_eff  =  a_P / (a_P + a_P^conv / CFL)
+
+    so in the far field, where ``a_P`` is all convection, the damping is the
+    familiar ``CFL/(1+CFL)``; inside the boundary layer, where ``a_P`` is
+    dominated by diffusion and the convective part is a small fraction of it,
+    ``alpha_eff`` approaches one and those cells are barely damped. Measured on a
+    NACA 2412 at CFL 1, the effective factor runs from 0.99 in the viscous
+    sublayer to 0.50 outside the boundary layer -- where a single relaxation
+    factor, by construction, would read 0.50 everywhere.
+
+    That asymmetry is the point -- and it is also the limitation. Leaving the
+    near-wall cells undamped is what stops this standing on its own: with
+    ``relax_velocity = 1.0`` the run diverges at every CFL ceiling tried, down to
+    2, because the steepest velocity gradients in the mesh are in exactly the
+    cells this mechanism declines to touch. It is a complement to relaxation, not
+    a replacement for it, and on a steady segregated solver it does not
+    measurably improve convergence at all. See :class:`Numerics.pseudo_transient`
+    for the numbers and for why it is off by default.
+
+    The floor stops a stagnant cell acquiring an unbounded step: with no flux
+    through any face it is damped as though the freestream crossed one reference
+    length.
+    """
+    outflow = (
+        np.maximum(-flux_i, 0.0)
+        + np.maximum(np.roll(flux_i, -1, axis=0), 0.0)
+        + np.maximum(-flux_j[:, :-1], 0.0)
+        + np.maximum(flux_j[:, 1:], 0.0)
+    )
+    floor = density * volume * velocity / reference_length
+    return np.maximum(outflow, floor) / cfl
+
+
 def divergence(
     flux_i: np.ndarray, flux_j: np.ndarray, faces: FaceGeometry
 ) -> np.ndarray:

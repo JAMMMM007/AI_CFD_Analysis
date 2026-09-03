@@ -77,6 +77,38 @@ class Numerics:
     max_iterations: int = 3000
     tolerance: float = 1e-6
 
+    # Pseudo-transient continuation: a local time step damping each cell by its
+    # own convective transit time instead of by a global relaxation factor.
+    #
+    # Off by default, on the evidence. It was added expecting a robustness win
+    # and does not deliver one for a *steady* segregated solver. Measured:
+    #
+    #   NACA 2412, 5 deg attached, iterations to reach 1e-6
+    #       relaxation only 0.7/0.3                    1010
+    #       pseudo-transient, cfl_max 10 / 30 / 100 / 300   1155 / 1060 / 1032 / 1023
+    #
+    #   cylinder Re 2.03e6, SST, 800 iterations, final residual
+    #       relaxation only 0.7/0.3                    3.47e-02
+    #       relaxation only 0.5/0.2 (hand-tuned)       1.57e-02
+    #       pseudo-transient 0.7/0.3                   4.00e-02
+    #
+    # It converges towards plain relaxation as the ceiling rises and never past
+    # it, and on the bluff body it is worse than doing nothing. The reason is
+    # structural rather than a tuning miss: the step is convective only (see
+    # ops.pseudo_time_diagonal for why it must be), which leaves the near-wall
+    # cells essentially undamped -- and on a cylinder the trouble is the shedding
+    # mode working through the boundary layer, precisely the region this declines
+    # to touch. Nor can it stand alone: relax_velocity = 1.0 diverged at every
+    # ceiling tried, down to cfl_max = 2.
+    #
+    # It is kept because Stage 4 needs exactly this term with a global physical
+    # time step in place of the local pseudo one, and because it is verified: the
+    # fixed point is preserved to 0.0055% in Cl at a residual of 1e-9.
+    pseudo_transient: bool = False
+    cfl: float = 1.0
+    cfl_max: float = 100.0
+    cfl_growth: float = 1.03
+
     def __post_init__(self):
         for name in ("scheme", "turbulence_scheme"):
             value = getattr(self, name)
@@ -91,6 +123,80 @@ class Numerics:
             value = getattr(self, name)
             if not 0.0 < value <= 1.0:
                 raise ValueError(f"{name} must be in (0, 1], got {value}")
+        for name in ("cfl", "cfl_max"):
+            if getattr(self, name) <= 0.0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.cfl_growth < 1.0:
+            raise ValueError(f"cfl_growth must be at least 1, got {self.cfl_growth}")
+        if self.cfl > self.cfl_max:
+            raise ValueError(
+                f"cfl {self.cfl:g} already exceeds cfl_max {self.cfl_max:g}"
+            )
+
+
+#: Iterations averaged over when deciding whether the run is still settling. One
+#: iteration says nothing -- residuals rattle by a factor of two on a healthy run
+#: -- so the comparison is between the geometric means of two adjacent windows.
+_RAMP_WINDOW = 25
+#: How far the trailing mean may rise before the step is judged too large.
+_BACKOFF_TRIGGER = 2.0
+#: What a back-off does to the CFL, and how low it may go before the run is
+#: simply not converging and something other than the step size is wrong.
+_BACKOFF_FACTOR = 0.5
+_CFL_MIN = 0.05
+
+
+class CflRamp:
+    """Raises the pseudo-time CFL while the run settles; drops it when it stops.
+
+    This is the part that replaces the user guessing a relaxation factor. The
+    step starts small, because the opening iterations of a cold start are the
+    least representative -- a uniform freestream against a no-slip wall is a
+    discontinuity, and the first corrections to it are large and meaningless --
+    and grows geometrically while the residual keeps falling. If the residual
+    turns and climbs, the step was too big and is halved.
+
+    Nothing here changes the converged answer. Every CFL only scales a term that
+    vanishes at convergence, so the ramp changes the path taken and cannot move
+    the fixed point.
+    """
+
+    def __init__(self, numerics: Numerics):
+        self.numerics = numerics
+        self.value = numerics.cfl
+        self.backoffs = 0
+        self._history: list[float] = []
+        self._hold = 0
+
+    def update(self, residual: float) -> None:
+        """Fold in one iteration's worst residual and adjust the step."""
+        if not np.isfinite(residual) or residual <= 0.0:
+            return
+        self._history.append(residual)
+        if len(self._history) > 2 * _RAMP_WINDOW:
+            self._history.pop(0)
+
+        if self._hold > 0:
+            self._hold -= 1
+        elif self._rising():
+            self.value = max(self.value * _BACKOFF_FACTOR, _CFL_MIN)
+            self.backoffs += 1
+            # Let the run answer the smaller step before judging it again.
+            self._hold = 2 * _RAMP_WINDOW
+            self._history.clear()
+            return
+
+        self.value = min(
+            self.value * self.numerics.cfl_growth, self.numerics.cfl_max
+        )
+
+    def _rising(self) -> bool:
+        """Whether the trailing window is worse than the one before it."""
+        if len(self._history) < 2 * _RAMP_WINDOW:
+            return False
+        recent = np.log(self._history[-_RAMP_WINDOW:]).mean()
+        earlier = np.log(self._history[:_RAMP_WINDOW]).mean()
+        return recent - earlier > np.log(_BACKOFF_TRIGGER)
 
 
 class PressureVelocityCoupling:
@@ -102,11 +208,16 @@ class PressureVelocityCoupling:
         fluid: Fluid,
         boundaries: Boundaries,
         numerics: Numerics,
+        reference_length: float = 1.0,
     ):
         self.faces = faces
         self.fluid = fluid
         self.boundaries = boundaries
         self.numerics = numerics
+        self.reference_length = reference_length
+        #: Current CFL number. Ramped by the owner of the run, so that it can be
+        #: raised as the solution settles and dropped again if it stops settling.
+        self.cfl = numerics.cfl
         self.gradient = ops.Gradient(faces)
         self.matrix = StructuredMatrix(faces.shape)
         self.volume = faces.metrics.volume
@@ -159,12 +270,38 @@ class PressureVelocityCoupling:
             ) * self.volume
             components.append(coefficients)
 
+        # Pseudo-time first, then relaxation. The two are alternatives rather
+        # than partners -- relaxation defaults to 1 when pseudo-transient is on --
+        # but the order matters if both are used: relaxing afterwards scales the
+        # pseudo-time term with everything else, which keeps the effective step
+        # consistent instead of leaving two damping mechanisms disagreeing.
+        pseudo_time = self.pseudo_time_diagonal(state)
         for coefficients, field in zip(components, (state.u, state.v)):
+            if pseudo_time is not None:
+                coefficients.add_pseudo_time(field, pseudo_time)
             coefficients.under_relax(field, self.numerics.relax_velocity)
 
         # The relaxed diagonal is what the matrix actually contains, so it is the
         # one the velocity correction must divide by for the two to be consistent.
         return components[0], components[1], components[0].centre
+
+    def pseudo_time_diagonal(self, state: State) -> np.ndarray | None:
+        """``rho V / dtau`` at the current CFL, or ``None`` if switched off.
+
+        See :func:`fluidsolver.solver.operators.pseudo_time_diagonal` for why the
+        step is convective only.
+        """
+        if not self.numerics.pseudo_transient:
+            return None
+        return ops.pseudo_time_diagonal(
+            state.flux_i,
+            state.flux_j,
+            self.volume,
+            density=self.fluid.density,
+            velocity=self.boundaries.freestream.velocity,
+            reference_length=self.reference_length,
+            cfl=self.cfl,
+        )
 
     def _transpose_stress(self, viscosity, grad_u, grad_v) -> tuple[np.ndarray, np.ndarray]:
         """``div(mu_eff grad(u)^T)``, the second half of the viscous stress.

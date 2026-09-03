@@ -96,8 +96,8 @@ class KOmegaSST(TurbulenceModel):
 
     name = "k-omega-sst"
 
-    def __init__(self, faces, fluid, boundaries, numerics):
-        super().__init__(faces, fluid, boundaries, numerics)
+    def __init__(self, faces, fluid, boundaries, numerics, reference_length=1.0):
+        super().__init__(faces, fluid, boundaries, numerics, reference_length)
         self.gradient = ops.Gradient(faces)
         self.matrix = StructuredMatrix(faces.shape)
         self.volume = faces.metrics.volume
@@ -368,6 +368,14 @@ class KOmegaSST(TurbulenceModel):
 
         residual = coefficients.residual(current)
 
+        # Damped with the same local step the momentum equations use, so that k
+        # and omega move at the pace of the velocity field driving them. The
+        # wall row is pinned again afterwards either way: it is a prescribed
+        # value, not a transported one, and must not be relaxed or time-stepped
+        # away from what the boundary condition sets.
+        pseudo_time = self.pseudo_time_diagonal(state)
+        if pseudo_time is not None:
+            coefficients.add_pseudo_time(current, pseudo_time)
         coefficients.under_relax(current, self.numerics.relax_turbulence)
         if fixed_wall is not None:
             self._pin_wall_row(coefficients, fixed_wall)

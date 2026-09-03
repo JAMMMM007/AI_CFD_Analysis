@@ -206,6 +206,150 @@ class TestUnderRelaxation:
         assert np.allclose(again, exact)
 
 
+class TestPseudoTime:
+    """Local time stepping: the damping must be non-uniform and must not bias."""
+
+    def test_the_pseudo_time_term_leaves_the_converged_solution_unchanged(self):
+        """Same guarantee as relaxation: it vanishes where phi equals phi_old."""
+        rng = np.random.default_rng(7)
+        shape = (12, 6)
+        coefficients = Coefficients(*(0.2 * rng.normal(size=shape) for _ in range(6)))
+        coefficients.centre += 4.0
+        coefficients.south[:, 0] = 0.0
+        coefficients.north[:, -1] = 0.0
+        coefficients.source = rng.normal(size=shape)
+
+        matrix = StructuredMatrix(shape)
+        exact = spla.spsolve(
+            matrix.build(coefficients).tocsc(), coefficients.source.ravel()
+        ).reshape(shape)
+
+        stepped = Coefficients(
+            *(getattr(coefficients, f).copy() for f in
+              ("centre", "west", "east", "south", "north", "source"))
+        )
+        stepped.add_pseudo_time(exact, 3.0 + rng.random(shape))
+        again = spla.spsolve(
+            matrix.build(stepped).tocsc(), stepped.source.ravel()
+        ).reshape(shape)
+
+        assert np.allclose(again, exact)
+
+    def test_the_diagonal_is_the_cell_outflow_over_the_cfl(self):
+        """A uniform rightward flux gives each cell one face's worth of outflow."""
+        _, metrics, faces = uniform_mesh(32)
+        flux_i = np.full(faces.shape, 2.0)
+        flux_j = np.zeros((faces.shape[0], faces.shape[1] + 1))
+
+        diagonal = ops.pseudo_time_diagonal(
+            flux_i, flux_j, metrics.volume,
+            density=1.0, velocity=1.0, reference_length=1.0, cfl=4.0,
+        )
+        # Every i face carries +2, so each cell sees 2 out of its east face and
+        # nothing out of its west; the floor is far below that.
+        assert np.allclose(diagonal, 2.0 / 4.0)
+
+    def test_a_stagnant_cell_is_floored_rather_than_left_undamped(self):
+        _, metrics, faces = uniform_mesh(32)
+        zero_i = np.zeros(faces.shape)
+        zero_j = np.zeros((faces.shape[0], faces.shape[1] + 1))
+
+        diagonal = ops.pseudo_time_diagonal(
+            zero_i, zero_j, metrics.volume,
+            density=2.0, velocity=5.0, reference_length=10.0, cfl=1.0,
+        )
+        assert np.all(diagonal > 0.0)
+        assert np.allclose(diagonal, 2.0 * metrics.volume * 5.0 / 10.0)
+
+    def test_the_damping_is_not_uniform_across_the_mesh(self):
+        """The whole point. A convective step damps the far field and not the wall.
+
+        Pair the step with the full spectral radius instead -- convection *and*
+        diffusion -- and ``rho V / dtau`` becomes ``a_P / CFL``, whereupon the
+        effective relaxation is ``CFL/(1+CFL)`` in every cell and the mechanism
+        is global under-relaxation wearing a different hat. This test is what
+        stops that regression going unnoticed.
+        """
+        from fluidsolver.solver.case import MeshSettings, build_case
+        from fluidsolver.solver.simple import Numerics
+
+        case = build_case(
+            circle(1.0, 96),
+            Fluid(density=1.0, viscosity=1.0 / 5000.0),
+            Freestream(velocity=1.0),
+            mesh_settings=MeshSettings(surface_points=96, far_field_radius_ratio=20.0),
+            numerics=Numerics(
+                pseudo_transient=True, relax_velocity=1.0, relax_turbulence=1.0
+            ),
+            model_name="laminar",
+        )
+        for _ in range(20):
+            case.step()
+
+        coupling = case.coupling
+        pseudo_time = coupling.pseudo_time_diagonal(case.state)
+        coupling.numerics.pseudo_transient = False
+        _, _, diagonal = coupling.momentum(case.state)
+        coupling.numerics.pseudo_transient = True
+
+        alpha = diagonal / (diagonal + pseudo_time)
+        wall = case.metrics.wall_distance
+        near = np.median(alpha[wall < np.percentile(wall, 5)])
+        far = np.median(alpha[wall > np.percentile(wall, 80)])
+
+        # Barely damped at the wall, damped in the far field, and the two must
+        # differ by a wide margin rather than by rounding.
+        assert near > 0.9
+        assert far < 0.75
+        assert near - far > 0.15
+
+    def test_it_is_off_by_default_and_then_costs_nothing(self):
+        """Shipped off: it measurably does not help a steady segregated solver."""
+        from fluidsolver.solver.simple import Numerics
+
+        assert Numerics().pseudo_transient is False
+
+
+class TestCflRamp:
+    def _ramp(self, **kwargs):
+        from fluidsolver.solver.simple import CflRamp, Numerics
+
+        return CflRamp(Numerics(**kwargs))
+
+    def test_it_grows_while_the_residual_falls_and_stops_at_the_ceiling(self):
+        ramp = self._ramp(cfl=1.0, cfl_max=4.0, cfl_growth=1.5)
+        residual = 1.0
+        for _ in range(200):
+            residual *= 0.95
+            ramp.update(residual)
+        assert ramp.value == pytest.approx(4.0)
+        assert ramp.backoffs == 0
+
+    def test_it_backs_off_when_the_residual_turns_and_climbs(self):
+        ramp = self._ramp(cfl=8.0, cfl_max=64.0, cfl_growth=1.0)
+        residual = 1e-6
+        for _ in range(400):
+            residual *= 1.05
+            ramp.update(residual)
+        assert ramp.backoffs > 0
+        assert ramp.value < 8.0
+
+    def test_a_single_spike_does_not_trigger_a_back_off(self):
+        """Residuals rattle. Only a sustained rise counts."""
+        ramp = self._ramp(cfl=2.0, cfl_max=2.0, cfl_growth=1.0)
+        for i in range(120):
+            ramp.update(100.0 if i == 60 else 1e-5)
+        assert ramp.backoffs == 0
+
+    def test_a_non_finite_residual_is_ignored_rather_than_poisoning_the_history(self):
+        ramp = self._ramp(cfl=2.0, cfl_max=8.0)
+        ramp.update(float("nan"))
+        ramp.update(float("inf"))
+        ramp.update(0.0)
+        assert ramp.value > 0.0
+        assert ramp.backoffs == 0
+
+
 # ----------------------------------------------------------------------
 # Operators
 # ----------------------------------------------------------------------
