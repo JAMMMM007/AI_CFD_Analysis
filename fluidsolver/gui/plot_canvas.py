@@ -47,6 +47,16 @@ COLOURMAPS = {
     "Greyscale": "gray",
 }
 
+# How the field is painted. See :func:`draw_field` for why this is a control the
+# user gets rather than a decision made for them: "Per cell" is the only honest
+# view of what the solver holds, and it is the one that answers "is that
+# oscillation real?", but on a graded polar mesh it renders a perfectly smooth
+# field as concentric rings and radial spokes that are not in the solution.
+SHADING = {
+    "Smooth": "gouraud",
+    "Per cell": "flat",
+}
+
 # Fields whose zero is meaningful rather than incidental. These are drawn on a
 # range symmetric about zero so that the sign reads off the colour directly; on
 # an autoscaled range a field that never changes sign looks identical to one that
@@ -336,6 +346,39 @@ def field_limits(
     return float(low), float(high)
 
 
+def _cell_centred_grid(
+    nodes: np.ndarray, values: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Coordinates and values co-located at the data points, for gouraud shading.
+
+    Gouraud wants one coordinate per value rather than the corners of each cell,
+    so the cell centres are used. Two things have to be put back or the picture
+    develops holes where the mesh does not:
+
+    * The wall and far-field rows are re-added from the boundary face centres,
+      carrying the adjacent cell's value. Without them the plot stops half a cell
+      short of each boundary -- invisible at the wall, where the first cell is
+      microns thick, but a bare ring a dozen reference lengths wide at the far
+      field.
+    * The ``i`` seam is closed, as it is for flat shading. Leaving it open
+      strands a wedge one cell wide, and since ``i = 0`` sits on the downstream
+      axis for a circle, that wedge lands straight down the wake.
+    """
+    corners = close_seam(nodes)
+    centres = 0.25 * (
+        corners[:-1, :-1] + corners[1:, :-1] + corners[:-1, 1:] + corners[1:, 1:]
+    )
+    wall = 0.5 * (corners[:-1, 0] + corners[1:, 0])
+    far_field = 0.5 * (corners[:-1, -1] + corners[1:, -1])
+
+    points = np.concatenate((wall[:, None], centres, far_field[:, None]), axis=1)
+    field = np.concatenate((values[:, :1], values, values[:, -1:]), axis=1)
+
+    points = close_seam(points)
+    field = close_seam(field)
+    return points[..., 0], points[..., 1], field
+
+
 def draw_field(
     axes,
     nodes: np.ndarray,
@@ -347,35 +390,49 @@ def draw_field(
     symmetric: bool = False,
     limits: tuple[float, float] | None = None,
     colourbar_axes=None,
+    shading: str = "gouraud",
 ):
     """Filled contours of a cell field on the curvilinear mesh.
 
-    ``pcolormesh`` takes node coordinates and cell values directly, which is
-    exactly the finite-volume data layout, and unlike a contour routine it does
-    not interpolate the field onto a triangulation first -- so what is shown is
-    what the solver actually holds.
+    ``pcolormesh`` takes the finite-volume data directly, without interpolating
+    it onto a triangulation first, so what is shown is what the solver holds.
+
+    ``shading`` chooses how it is painted, and the choice matters more than it
+    looks. ``"flat"`` gives every cell one solid colour -- honest, in that no
+    value on screen was invented, but on a polar O-grid whose radial cells grow
+    15% per layer it draws a smooth field as a set of concentric rings, and a
+    smooth wake as a fan of radial spokes, one per surface point. Those are
+    entirely an artefact of the painting: measured on a cylinder at Re = 2e6, the
+    cell-to-cell alternating content of ``|U|`` is 0.001 to 0.01% of freestream,
+    while the rings read as several m/s. ``"gouraud"`` interpolates between cell
+    centres and shows the same data smooth, so it is the default; ``"flat"``
+    stays available because seeing the actual cells is exactly what is wanted
+    when the question is whether an oscillation is real.
 
     ``limits`` fixes the colour range instead of taking it from these values.
     Replaying a run needs that: a range recomputed per frame rescales as the
     solution develops, so the colours shift under a field that is not changing
     and nothing can be compared between one frame and the next.
     """
-    # Only the *nodes* get the seam closed. Adding a row of nodes turns the Ni
-    # node rows into Ni+1, which is exactly the one-more-than-the-cells that
-    # pcolormesh wants; closing the value array too would add a cell that does
-    # not exist.
-    x = close_seam(nodes[..., 0])
-    y = close_seam(nodes[..., 1])
-    field = values
-
     if limits is None:
-        limits = field_limits(field, symmetric=symmetric)
+        limits = field_limits(values, symmetric=symmetric)
     if limits is None:
         return None
     low, high = limits
 
+    if shading == "gouraud":
+        x, y, field = _cell_centred_grid(nodes, values)
+    else:
+        # Only the *nodes* get the seam closed. Adding a row of nodes turns the
+        # Ni node rows into Ni+1, which is exactly the one-more-than-the-cells
+        # that pcolormesh wants; closing the value array too would add a cell
+        # that does not exist.
+        x = close_seam(nodes[..., 0])
+        y = close_seam(nodes[..., 1])
+        field = values
+
     mesh = axes.pcolormesh(
-        x, y, field, cmap=colourmap, vmin=low, vmax=high, shading="flat", rasterized=True
+        x, y, field, cmap=colourmap, vmin=low, vmax=high, shading=shading, rasterized=True
     )
     if label:
         if colourbar_axes is not None:

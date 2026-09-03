@@ -64,9 +64,13 @@ class TurbulenceModel(ABC):
     def vorticity(self, state: State, gradient) -> np.ndarray:
         """``Omega = sqrt(2 W_ij W_ij)``, which in two dimensions is |dv/dx - du/dy|.
 
-        Needed alongside the strain rate because the two differ in exactly the
-        place that matters: at a stagnation point the strain is large while the
-        rotation is nearly zero.
+        No closure here uses it: SST takes its production from the strain rate,
+        as Menter's equation (5) specifies. It is kept because it is the other
+        invariant of the velocity gradient and a rotation-curvature correction or
+        a vorticity-based limiter would need it, and because it is measured with
+        the same boundary treatment as :meth:`strain_rate`, which is the part
+        that is easy to get wrong. :func:`fluidsolver.solver.post.vorticity` is
+        the *signed* version, for plotting.
         """
         far_flux = state.flux_j[:, -1]
         wall_u, wall_v = self.boundaries.wall_velocity()

@@ -14,11 +14,15 @@ MODEL_LABELS = {
 }
 
 SCHEME_LABELS = {
-    "linear (second order, recommended)": "linear",
+    "limited linear (bounded second order, recommended)": "limited_linear",
+    "linear (second order, unbounded)": "linear",
     "linear upwind (second order)": "linear_upwind",
-    "limited linear (bounded second order)": "limited_linear",
     "upwind (first order, most robust)": "upwind",
 }
+
+#: Reverse lookup, so the controls can be set from whatever the session holds
+#: rather than from a hardcoded position in the list above.
+SCHEME_NAMES = {value: label for label, value in SCHEME_LABELS.items()}
 
 
 class NumericsPage(QWidget):
@@ -53,12 +57,18 @@ class NumericsPage(QWidget):
         left.addWidget(self.model_note)
 
         scheme_box, scheme_form = widgets.group("Discretisation")
+        # Both start from what the session already holds rather than from a
+        # position in the list. A hardcoded index silently disagrees with the
+        # dataclass the moment either default moves, and the disagreement is
+        # invisible: the combo shows one scheme while the solver uses another.
         self.scheme = QComboBox()
         self.scheme.addItems(SCHEME_LABELS.keys())
-        self.scheme.setCurrentIndex(0)
+        self.scheme.setCurrentText(SCHEME_NAMES[session.numerics.scheme])
         self.turbulence_scheme = QComboBox()
         self.turbulence_scheme.addItems(SCHEME_LABELS.keys())
-        self.turbulence_scheme.setCurrentIndex(3)  # upwind
+        self.turbulence_scheme.setCurrentText(
+            SCHEME_NAMES[session.numerics.turbulence_scheme]
+        )
         scheme_form.addRow("Momentum convection", self.scheme)
         scheme_form.addRow("Turbulence convection", self.turbulence_scheme)
         left.addWidget(scheme_box)

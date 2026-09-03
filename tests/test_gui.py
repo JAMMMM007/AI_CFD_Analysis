@@ -19,16 +19,19 @@ import matplotlib  # noqa: E402
 matplotlib.use("QtAgg")
 
 from fluidsolver.gui.main_window import MainWindow  # noqa: E402
+from fluidsolver.gui.pages.numerics import SCHEME_LABELS  # noqa: E402
 from fluidsolver.gui.pages.run import ReplayBuffer  # noqa: E402
 from fluidsolver.gui.plot_canvas import (  # noqa: E402
     COLOURMAPS,
     FIELDS,
+    _cell_centred_grid,
     close_seam,
     field_limits,
     field_style,
     field_values,
 )
 from fluidsolver.gui.worker import SolverWorker  # noqa: E402
+from fluidsolver.solver.simple import Numerics  # noqa: E402
 
 
 @pytest.fixture
@@ -156,6 +159,21 @@ class TestNumericsPage:
         numerics.relax_velocity.setValue(0.45)
         assert window.session.numerics.relax_velocity == pytest.approx(0.45)
 
+    def test_the_scheme_controls_start_on_the_solver_defaults(self, window):
+        """A hardcoded combo index would silently disagree with Numerics()."""
+        numerics = window.page_widgets[3]
+        defaults = Numerics()
+        assert SCHEME_LABELS[numerics.scheme.currentText()] == defaults.scheme
+        assert (
+            SCHEME_LABELS[numerics.turbulence_scheme.currentText()]
+            == defaults.turbulence_scheme
+        )
+
+    def test_momentum_convection_defaults_to_a_bounded_scheme(self, window):
+        """Unbounded central differencing must not be what a new case gets."""
+        assert Numerics().scheme == "limited_linear"
+        assert "recommended" in window.page_widgets[3].scheme.currentText()
+
 
 class TestSolvingThroughTheGui:
     """The wiring end to end: session -> case -> a few iterations -> plots."""
@@ -248,6 +266,51 @@ class TestPlotHelpers:
         closed = close_seam(array)
         assert closed.shape == (5, 3)
         assert np.array_equal(closed[-1], array[0])
+
+
+class TestCellCentredGrid:
+    """The co-located grid gouraud shading needs, built from an annulus."""
+
+    @staticmethod
+    def _annulus(n_i=16, n_j=5, inner=1.0, outer=4.0):
+        theta = np.linspace(0.0, 2.0 * np.pi, n_i, endpoint=False)
+        radius = np.linspace(inner, outer, n_j + 1)
+        return np.stack(
+            (np.outer(np.cos(theta), radius), np.outer(np.sin(theta), radius)), axis=-1
+        )
+
+    def test_coordinates_and_values_are_co_located(self):
+        nodes = self._annulus()
+        values = np.arange(16 * 5, dtype=float).reshape(16, 5)
+        x, y, field = _cell_centred_grid(nodes, values)
+        # gouraud needs one coordinate per value, with the seam closed and a row
+        # added at each boundary.
+        assert x.shape == y.shape == field.shape == (17, 7)
+
+    def test_the_seam_closes(self):
+        nodes = self._annulus()
+        values = np.random.default_rng(0).random((16, 5))
+        x, y, field = _cell_centred_grid(nodes, values)
+        for array in (x, y, field):
+            assert np.array_equal(array[0], array[-1])
+
+    def test_the_boundaries_are_reached(self):
+        """Without the added rows the paint stops half a cell short of each edge."""
+        nodes = self._annulus(inner=1.0, outer=4.0)
+        values = np.ones((16, 5))
+        x, y, _ = _cell_centred_grid(nodes, values)
+        radius = np.hypot(x, y)
+        # Chord-versus-arc on the polygonal boundary is the only shortfall.
+        assert radius.min() == pytest.approx(1.0, rel=0.03)
+        assert radius.max() == pytest.approx(4.0, rel=0.03)
+
+    def test_the_boundary_rows_carry_the_adjacent_cell_value(self):
+        nodes = self._annulus()
+        values = np.arange(16 * 5, dtype=float).reshape(16, 5)
+        _, _, field = _cell_centred_grid(nodes, values)
+        assert np.array_equal(field[:-1, 0], values[:, 0])
+        assert np.array_equal(field[:-1, -1], values[:, -1])
+        assert np.array_equal(field[:-1, 1:-1], values)
 
 
 class TestFieldColouring:
@@ -377,6 +440,26 @@ class TestRunPageView:
         run_page.colourmap.setCurrentText("Automatic")
         mesh = run_page.field_canvas.figure.axes[0].collections[0]
         assert mesh.get_cmap().name == "viridis"
+
+    def test_the_shading_choice_reaches_the_plot(self, run_page):
+        """Smooth carries one colour per cell centre, per cell one per cell."""
+        case = run_page.session.case
+        cells = case.grid.shape[0] * case.grid.shape[1]
+
+        run_page.shading.setCurrentText("Per cell")
+        mesh = run_page.field_canvas.figure.axes[0].collections[0]
+        assert mesh.get_array().size == cells
+
+        run_page.shading.setCurrentText("Smooth")
+        mesh = run_page.field_canvas.figure.axes[0].collections[0]
+        # One value per cell centre, plus the closed seam and a row at each
+        # boundary: (Ni + 1) x (Nj + 2).
+        assert mesh.get_array().size == (case.grid.shape[0] + 1) * (
+            case.grid.shape[1] + 2
+        )
+
+    def test_smooth_is_the_default(self, run_page):
+        assert run_page.shading.currentText() == "Smooth"
 
     def test_filling_the_window_hides_the_side_panel(self, run_page):
         run_page.fill_window.setChecked(True)
