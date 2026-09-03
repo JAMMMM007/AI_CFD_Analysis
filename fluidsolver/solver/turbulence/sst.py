@@ -56,11 +56,15 @@ KAPPA = 0.41
 SIGMA_K1, SIGMA_W1, BETA_1 = 0.85, 0.5, 0.075
 SIGMA_K2, SIGMA_W2, BETA_2 = 1.0, 0.856, 0.0828
 
-# gamma is not independent: it follows from requiring the model to reproduce the
-# log layer, gamma = beta/beta* - sigma_w kappa^2 / sqrt(beta*). The familiar
-# 5/9 and 0.44 are these numbers rounded.
-GAMMA_1 = BETA_1 / BETA_STAR - SIGMA_W1 * KAPPA**2 / np.sqrt(BETA_STAR)
-GAMMA_2 = BETA_2 / BETA_STAR - SIGMA_W2 * KAPPA**2 / np.sqrt(BETA_STAR)
+# gamma (Menter's alpha) is not independent: it follows from requiring the model
+# to reproduce the log layer, gamma = beta/beta* - sigma_w kappa^2 / sqrt(beta*),
+# which gives 0.5532 and 0.4404. Menter 2003 states the rounded 5/9 and 0.44
+# instead, and those are the numbers the model was calibrated and published with,
+# so they are what is used here. The derivation is left above because it is where
+# they come from and because it is what fixes them if any of beta, sigma_w or
+# kappa is ever changed.
+GAMMA_1 = 5.0 / 9.0
+GAMMA_2 = 0.44
 
 # Menter's production limiter, which stops k running away at a stagnation point
 # where the strain rate is large but the turbulence is not.
@@ -119,10 +123,8 @@ class KOmegaSST(TurbulenceModel):
         blend = self._blending_f1(state, grad_k, grad_omega)
         cross_diffusion = self._cross_diffusion(state, grad_k, grad_omega, blend)
 
-        vorticity = self.vorticity(state, self.gradient)
-
         residual_k = self._solve_k(
-            state, strain, vorticity, blend, grad_k, wall_k, far_k, inflow
+            state, strain, blend, grad_k, wall_k, far_k, inflow
         )
         residual_omega = self._solve_omega(
             state, strain, blend, cross_diffusion, grad_omega, wall_omega, far_omega, inflow
@@ -233,29 +235,31 @@ class KOmegaSST(TurbulenceModel):
     # ------------------------------------------------------------------
 
     def _solve_k(
-        self, state, strain, vorticity, blend, grad_k, wall_k, far_k, inflow
+        self, state, strain, blend, grad_k, wall_k, far_k, inflow
     ) -> float:
         """Turbulent kinetic energy."""
         density = self.fluid.density
         omega = np.maximum(state.omega, self._omega_floor)
 
-        # Kato-Launder production: mu_t S Omega in place of mu_t S^2.
+        # Menter's equation (5): P_k = mu_t dU_i/dx_j (dU_i/dx_j + dU_j/dx_i),
+        # which for incompressible flow is identically mu_t S^2, capped at ten
+        # times the destruction.
         #
-        # The two are identical in a shear layer, where S = Omega, so nothing is
-        # lost where the model is calibrated. They differ at a stagnation point,
-        # where the strain rate is large but the flow barely rotates. The
-        # unmodified form reads that pure strain as turbulence production and
-        # manufactures k out of nothing on the stagnation streamline -- and since
-        # more k means more mu_t means more turbulent diffusion carrying it
-        # further upstream, it feeds itself. Measured on a NACA 0012, this put a
-        # plume of 15% turbulence intensity a quarter of a chord *ahead* of the
-        # leading edge, in a freestream of 0.1%, and it grew without bound.
-        #
-        # Menter's limiter below caps production at ten times the destruction,
-        # which bounds the stagnation anomaly but does not remove it; using the
-        # rotation rate removes its source.
+        # The stagnation-point build-up this model is famous for is what the cap
+        # is *for*. The obvious alternative is Kato-Launder, mu_t S Omega, which
+        # this used to do: it agrees in a shear layer, where S = Omega, and it
+        # suppresses the anomaly at its source, because a stagnation point has
+        # large strain and almost no rotation. It was the wrong trade. Omega is
+        # exactly zero on a stagnation streamline by symmetry, so Kato-Launder
+        # puts a line of exactly zero production along it -- measured on a
+        # cylinder, k on the stagnation ray came out five orders of magnitude
+        # below its value eighteen degrees away, and mu_t through the whole
+        # stagnation region sat 50 to 200 times low. The limiter, meanwhile,
+        # never activated anywhere in the field, so the mechanism Menter
+        # specifies was dead code. With the form below the limiter is active in
+        # roughly 9% of cells and does the job it was designed for.
         production = np.minimum(
-            state.eddy_viscosity * strain * vorticity,
+            state.eddy_viscosity * strain**2,
             PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega,
         )
 

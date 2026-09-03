@@ -22,6 +22,7 @@ from fluidsolver.gui import widgets
 from fluidsolver.gui.plot_canvas import (
     COLOURMAPS,
     FIELDS,
+    SHADING,
     Canvas,
     InteractiveCanvas,
     draw_body,
@@ -180,6 +181,17 @@ class RunPage(QWidget):
         )
         self.colourmap.currentIndexChanged.connect(self._draw_field)
 
+        self.shading = QComboBox()
+        self.shading.addItems(SHADING.keys())
+        self.shading.setToolTip(
+            "Smooth interpolates between cell centres. Per cell paints every "
+            "finite-volume cell one flat colour: it invents nothing, so it is "
+            "the view that answers whether an oscillation is real -- but on a "
+            "mesh that grades outwards it draws a perfectly smooth field as "
+            "concentric rings and radial spokes that are not in the solution."
+        )
+        self.shading.currentIndexChanged.connect(self._draw_field)
+
         self.streamlines = QCheckBox("Streamlines")
         self.streamlines.toggled.connect(self._draw_field)
 
@@ -190,6 +202,8 @@ class RunPage(QWidget):
         row.addWidget(self.field)
         row.addWidget(widgets.readout("Colour map"))
         row.addWidget(self.colourmap)
+        row.addWidget(widgets.readout("Shading"))
+        row.addWidget(self.shading)
         row.addWidget(self.streamlines)
         row.addStretch(1)
         return row
@@ -681,6 +695,7 @@ class RunPage(QWidget):
             symmetric=symmetric,
             limits=self._colour_limits(case, name, symmetric),
             colourbar_axes=colourbar_axes,
+            shading=SHADING[self.shading.currentText()],
         )
 
         if self._view is None:

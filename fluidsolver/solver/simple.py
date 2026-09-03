@@ -55,7 +55,18 @@ from fluidsolver.solver.linalg import (
 class Numerics:
     """Discretisation and iteration settings."""
 
-    scheme: str = "linear"
+    # Bounded second order, not plain central differencing.
+    #
+    # Central differencing is unbounded above a cell Peclet number of 2, and an
+    # external aerodynamics mesh is nowhere near that outside the boundary
+    # layer: measured on a 240x99 cylinder mesh at Re = 2e6 the median cell
+    # Peclet number is 3.2e4 and the peak 2.6e7. With ``linear`` the deferred
+    # correction there has nothing holding it, and a sawtooth seeded at the
+    # marched-to-analytic mesh seam grows until the run dies -- on that case, at
+    # iteration 459, having already passed through Cl = 37525. The van Leer
+    # limiter costs a little accuracy where the flow is smooth and well resolved,
+    # and is the difference between an answer and a NaN everywhere else.
+    scheme: str = "limited_linear"
     turbulence_scheme: str = "upwind"
     relax_velocity: float = 0.7
     relax_pressure: float = 0.3
