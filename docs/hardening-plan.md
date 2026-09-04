@@ -15,15 +15,19 @@ of the record is to stop the same ground being covered twice.
 | 0 | Land the SST correction, shading, bounded scheme | **done**, merged (#3) |
 | 1 | Pseudo-transient continuation | **done**, merged (#4) — negative result, shipped off |
 | 2 | Refuse, bound, diagnose | **done**, merged (#4) |
-| 3 | y+-insensitive wall treatment | **parked** — written and verified, awaiting validation |
+| 3 | A wall treatment that works above y+ 1 | **done** — validated range measured, see below |
 | 4 | URANS and vortex shedding | not started |
 | 5 | Turbulence and transition models | not started |
-| 6 | Meshing | **part done** — spacing constraint in review (#5); seam and wake remain |
+| 6 | Meshing | **part done** — spacing constraint merged (#5); seam, wake and C-grid remain |
 | 7 | Verification, validation and speed | not started |
 
-247 tests. Regression gate: cylinder at Re 40 gives Cd 1.5142, wake 2.12 D,
+252 tests. Regression gate: cylinder at Re 40 gives Cd 1.5142, wake 2.12 D,
 separation 53.717 degrees, Cl -0.00000, residual 9.96e-08 — unchanged through
 every stage so far, and the first thing to check after any change.
+
+**Open defect, ahead of all of the above:** Stage 2's divergence monitor stops a
+NACA 0012 at Re 2e6 with SST at iteration 367 on a case that recovers completely
+if allowed to run. It blocks the primary use case. Details under Remaining.
 
 ---
 
@@ -129,11 +133,10 @@ window *medians* — robust to the spikes a mean would trip on — at a 1.5x
 threshold, gated behind an absolute floor and a hundredfold loss against the
 run's own best.
 
----
+**It is now known to be wrong in the other direction, and that is the first job
+on the list.** See "The divergence monitor's false positive" below.
 
-## In review
-
-### Stage 6 (part) — the surface spacing constraint · PR #5
+### Stage 6 (part) — the surface spacing constraint
 
 `surface_points` fixes the tangential spacing, `target_y_plus` fixes the
 wall-normal spacing, and nothing connected them. Ask for 240 points at y+ 100
@@ -167,39 +170,86 @@ any resolution, so refinement only raises the effective curvature, and the march
 got monotonically worse from 52 layers to 26); and tuning the width-ratio and
 alternation guards against each other, when they measure the same quantity.
 
----
+### Stage 3 — the wall treatment above y+ 1
 
-## Parked
+Esch and Menter's automatic wall treatment (IGTC 2003, eqs 15-18): omega blended
+as `sqrt(omega_vis^2 + omega_log^2)`; a friction velocity blended as the fourth
+root of the sum of fourth powers; the momentum wall shear carried by an
+effective wall viscosity `tau_w y1 / U1`, which recovers the low-Re treatment
+exactly as `y1 -> 0`; and k switched from a fixed zero to **zero flux**.
 
-### Stage 3 — y+-insensitive wall treatment
+A NACA 2412 previously diverged at iteration 137 on a y+ 30 mesh and at 101 on
+y+ 100. Both now converge, y+ 100 to 1.4e-10.
 
-Branch `claude/stage3-wall-treatment`, commit `901565f`. Written and verified in
-isolation; never validated, because until PR #5 the meshes needed to test it
-could not be built.
+The friction velocity is iterated to a fixed point rather than seeded once.
+Seeding y+ from the viscous branch alone underestimates `u_tau`, which shrinks
+`ln(y+)` and therefore *raises* the logarithmic branch — an overestimate of wall
+shear growing with coarsening, +21% at y+ 300. Iterated, +0.6% at y+ 100 and
++0.1% at y+ 300. Five passes; y+ enters only through a logarithm.
 
-Implements Esch and Menter's automatic wall treatment (IGTC 2003, eqs 15-18):
-omega blended as `sqrt(omega_vis^2 + omega_log^2)`; a friction velocity blended
-as the fourth root of the sum of fourth powers; the momentum wall shear carried
-by an effective wall viscosity `tau_w y1 / U1`, which recovers the low-Re
-treatment exactly as `y1 -> 0`; and k switched from a fixed zero to **zero
-flux**, which the paper states is what holds in both the viscous and logarithmic
-limits.
+**The part not in the paper, which the measurements demanded.** With zero-flux k
+and nothing else the case still would not converge. At y+ 30 momentum fell by 86
+to 120 times and continuity by 133, while k *rose* from 4.4e-03 to 7.0e-03 and
+stuck on the solution limiter — 165 cells clipped on 554 of 600 iterations, k
+pinned at the ceiling, mu_t/mu at 2522.
 
-Checked against the log law in isolation, the friction velocity recovers `u_tau`
-to +0.6% at y+ 100 and +0.1% at y+ 300.
+The cause is arithmetic, not modelling. The discrete strain in a wall cell is
+`U1/y1`, the *average* gradient between wall and cell centre; the local gradient
+in the log layer is `u_tau/(kappa y1)`. Their ratio is `kappa U+`, 5.5 at y+ 30,
+and production goes as the square — about thirty times too much. The wall row now
+takes its production strain from the two-layer profile
 
-**To do**
+```
+dU/dy = min( u_tau^2 / nu , u_tau / (kappa y1) )
+```
 
-1. Rebase onto `main` once PR #5 lands.
-2. Run the acceptance criterion, now testable: the same Cf within 3% across
-   first cells at y+ 0.5, 5, 30 and 100. Menter reports wall shear varying under
-   2% across y+ 0.2 to 100; that is the bar.
-3. Settle the open question. At y+ 5 the full treatment reached 2.62e-03 where
-   the same code without the zero-flux k change reached 5.61e-05 — but on a mesh
-   then carrying 59 degree peak non-orthogonality, which was not a fair test. A
-   wall-function k equation also wants its production replaced in the
-   wall-adjacent cell by the log-layer form `tau_w^2 / (rho kappa u_tau y1)`,
-   which is **not implemented** and may account for the whole difference.
+which picks the viscous branch below y+ 2.4 and the logarithmic one above.
+Standard wall-function machinery rather than an invention, and it costs nothing
+where it does not apply: 1.001 of the resolved gradient at y+ 1, 0.20 at y+ 30.
+Afterwards k falls to 6.3e-08, mu_t/mu to 166, and the limiter never fires.
+
+Note this closes the open question the parked version left. The earlier
+suspicion was that the wall-adjacent k cell wanted the log-layer production
+`tau_w^2 / (rho kappa u_tau y1)`. That form is right in the log layer but does
+not reduce to the resolved value as y+ -> 0, so it would have corrupted
+wall-resolved meshes; the `mu_t (dU/dy)^2` form above does reduce, exactly.
+
+**The stage does not meet the acceptance criterion the plan set, and that
+criterion was not well posed.** It asked for Cf within 3% across y+ 0.5 to 100,
+taking Menter's "under 2%" — which is Couette flow, where the layer is the whole
+channel and always resolved. On an aerofoil, changing the y+ target changes the
+wall condition *and* the boundary-layer resolution: 35 cells across the layer at
+y+ 0.5, 19 at y+ 5, 8 at y+ 30, 3 at y+ 100, where the first cell alone spans
+21% of it. No wall condition repairs a profile carried by three cells.
+
+```
+y+     achieved      Cl        Cd      Cd_friction   residual
+0.5   0.15..  1.18  0.75184  0.012754   0.007635     3.9e-07
+1     0.30..  2.36  0.75368  0.012501   0.007454     2.4e-07
+5     0.67.. 12.08  0.74818  0.013166   0.007896     9.7e-09
+30    5.20.. 68.15  0.77143  0.012171   0.007058     2.0e-10
+100  11.04..200.20  0.78065  0.012504   0.005581     1.4e-10
+```
+
+What can be defended, measured:
+
+| range | BL cells | Cl | Cd | Cd_friction |
+|---|---|---|---|---|
+| y+ 0.5 - 5 | >= 19 | 0.73% | 5.19% | 5.77% |
+| y+ 0.5 - 30 | >= 8 | 3.07% | 7.87% | 11.16% |
+| y+ 0.5 - 100 | >= 3 | 4.27% | 7.88% | 32.49% |
+
+Lift is insensitive to near-wall spacing below 1% where the layer is resolved,
+drag to about 5%, and the solver is stable and convergent to y+ 100 where it
+previously diverged above 5.
+
+Two cautions for anyone re-running this. The five meshes differ in more than
+their first cell — 89 wall-normal layers down to 56, peak non-orthogonality 60.2
+to 30.6 degrees — so part of the drag spread is mesh, not wall model, and this
+experiment cannot separate them. And the treatment is confined to turbulent runs:
+a laminar case has no friction velocity and no log layer, and the fourth-power
+blend always exceeds the larger of its branches, so applying it there returned
+slightly more than molecular viscosity even where the viscous branch was exact.
 
 Note for anyone comparing against sources: Esch and Menter (IGTC 2003) list
 `alpha_1 = 0.5532, alpha_2 = 0.4403`, the derived log-layer values, where Menter,
@@ -209,6 +259,38 @@ author, same year, 0.4% apart; the mismatch is deliberate.
 ---
 
 ## Remaining
+
+### The divergence monitor's false positive — do this first
+
+A NACA 0012 at Re 2e6 with SST on factory defaults raises `SolverDiverged` at
+iteration 367. It is not diverging. With the monitor disarmed the residual peaks
+at 1.8e-01 near iteration 400, as the eddy-viscosity ratio passes 100, and then
+recovers monotonically to 2.8e-05 by iteration 1100, with `Cd` = 0.009487 to a
+standard deviation of 2e-6 and `Cl` = -8e-6.
+
+```
+iterations    median residual
+ 300 -  500      2.68e-02   (peak 1.78e-01)
+ 500 -  800      2.53e-03
+ 800 - 1100      4.73e-05
+1100 - 1500      2.81e-05
+```
+
+The clause that fires is `_MONITOR_LOST`: the residual exceeds a hundred times
+the best the run had reached. The flaw is in what "best" means — a SIMPLE run's
+early residual minimum is a transient artefact, here a passing 5.6e-04 at
+iteration 200, before the turbulence field has developed, and holding the rest of
+the run to it makes a full recovery indistinguishable from a failure.
+
+This is a Stage 2 regression made visible only once Stages 0 and 3 made the case
+recoverable, which is why it was not caught then. It blocks the primary use case,
+so it comes before the meshing work.
+
+Do not simply move the threshold; that is how the monitor was mis-set the first
+time. It needs a measured answer to what excursion is recoverable, probably a
+trailing reference rather than an all-time best, and end-to-end tests on both
+this case and a genuine divergence — the laminar cylinder at Re 2e6, which grinds
+upward at about 1.3% per iteration.
 
 ### Stage 6 (rest) — meshing
 
@@ -266,7 +348,7 @@ changes mean Cd by under 1%.
   robust than SST on a poor mesh, which makes it the right default for a first
   look at a new geometry.
 - **k-epsilon with wall functions**, for bluff bodies where the boundary layer
-  is not the point. Depends on Stage 3.
+  is not the point. Stage 3 supplies the wall machinery it needs.
 - **Transition: the one-equation gamma model** (Menter et al. 2015), *not* the
   four-equation Langtry-Menter. It adds one transport equation instead of two,
   computes the transition-onset momentum-thickness Reynolds number algebraically

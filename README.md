@@ -62,7 +62,7 @@ On the solve page the field plot is the whole point, so it gets the room:
 | Body-fitted O-grid mesher | working, tested |
 | Finite-volume discretisation | working, second order (verified by manufactured solution) |
 | Laminar Navier-Stokes | **validated** against published cylinder benchmarks |
-| k-omega SST | runs, and no longer diverges, but **does not fully converge** -- see below |
+| k-omega SST | converges to 2.8e-05, but **the divergence monitor aborts it on factory defaults** -- see below |
 | Qt front end | working, tested |
 
 **The turbulence model was blamed for four bugs that were not in it.** The
@@ -104,21 +104,39 @@ What was actually wrong, in the order it mattered:
 
 With those fixed, the constant-viscosity cases converge -- Re_eff = 20
 monotonically, Re_eff = 2000 to 1.6e-5 -- and the NACA 0012 at Re = 2e6 with SST
-reaches 2.9e-4 continuity by iteration 250 with `Cd` = 0.0090 against a published
-0.008, `Cl` within 1e-3 of the zero symmetry requires, and a peak eddy-viscosity
-ratio of 100 where the flat-plate estimate is 84.
+reaches 8.3e-4 by iteration 200 with a peak eddy-viscosity ratio of 90 where the
+flat-plate estimate is 84.
 
-**It then stops improving.** From about iteration 260, as the eddy-viscosity
-ratio passes 100, the solution drifts into a bounded limit cycle at around 1e-2.
-It no longer diverges, and the forces stay in the right place, but it does not
-settle. That remaining oscillation *is* in the turbulence coupling -- it tracks
-`mu_t`, and it is absent from the frozen-viscosity runs on the same mesh -- and
-it has not been diagnosed yet.
+**It then gets worse before it gets better, and that transient is now the
+problem.** As the eddy-viscosity ratio passes 100 the residual climbs back to a
+peak of 1.8e-1 around iteration 400, then recovers monotonically and settles:
+
+```
+iterations    median residual
+ 300 -  500      2.68e-02   (peak 1.78e-01)
+ 500 -  800      2.53e-03
+ 800 - 1100      4.73e-05
+1100 - 1500      2.81e-05
+```
+
+By iteration 1100 it is converged in every sense that matters -- `Cd` = 0.009487
+with a standard deviation of 2e-6 over the last 400 iterations, `Cl` = -8e-6
+against the zero symmetry requires, eddy-viscosity ratio steady at 117. An
+earlier version of this file reported a bounded limit cycle at around 1e-2 that
+never settled; that is no longer what happens, and the change is down to the
+`mu_t S^2` production correction and the wall treatment. `Cd` = 0.0095 against a
+published 0.008 is a separate matter, and is what transition modelling is for.
+
+**The catch: on factory defaults you never see any of that.** The divergence
+monitor added in Stage 2 stops the run at iteration 367, in the middle of the
+excursion, because the residual is more than a hundred times the best the run had
+managed by then. The recovery is real and the monitor cannot see it. This is a
+false positive on the primary use case and it is the first thing to fix -- see
+`docs/handover.md`. Until then a run that trips it is not necessarily lost.
 
 So: the turbulence model's algebra checks out against every analytic property it
-is derived from, and the coupled iteration is now stable rather than divergent,
-but the numbers are not yet converged ones. The laminar path is a different
-matter, and is validated below.
+is derived from, and the coupled iteration converges when it is allowed to. The
+laminar path is a different matter, and is validated below.
 
 ## Validation
 
@@ -204,6 +222,8 @@ fluidsolver/mesh/       O-grid generation, finite-volume metrics, quality
 fluidsolver/solver/     discretisation, SIMPLE, turbulence, post-processing
 fluidsolver/gui/        PySide6 front end (imports the solver; never the reverse)
 validation/             benchmarks the solver must reproduce
+docs/handover.md        start here: scope, how to run it, and the known traps
+docs/hardening-plan.md  what is done, what was tried and failed, what is left
 docs/compressible.md    what a compressible extension would involve
 docs/optional-deps.md   pyamg, and why it is not required
 ```
