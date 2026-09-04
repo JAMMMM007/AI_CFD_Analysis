@@ -112,11 +112,18 @@ class KOmegaSST(TurbulenceModel):
     def update(self, state: State) -> tuple[float, float]:
         """Solve both transport equations and refresh the eddy viscosity."""
         far_flux = state.flux_j[:, -1]
-        wall_k, wall_omega = self.boundaries.wall_turbulence()
+        # Both wall conditions now depend on the velocity field: omega through
+        # the friction velocity in its logarithmic branch, and k by being zero
+        # flux rather than a fixed zero.
+        wall_k, wall_omega = self.boundaries.wall_turbulence(state.u, state.v)
         far_k, far_omega = self.boundaries.far_turbulence(state.k, state.omega, far_flux)
         inflow = self.boundaries.inflow_mask(far_flux)
 
-        grad_k = self.gradient(state.k, wall_k, far_k)
+        # ``wall_k`` is None, which add_diffusion reads as zero flux. The
+        # gradient operator says the same thing by being handed the adjacent
+        # cell value: the difference across the face is then zero, which is
+        # precisely what a vanishing normal gradient asserts.
+        grad_k = self.gradient(state.k, state.k[:, 0], far_k)
         grad_omega = self.gradient(state.omega, wall_omega, far_omega)
         strain = self.strain_rate(state, self.gradient)
 
@@ -258,8 +265,20 @@ class KOmegaSST(TurbulenceModel):
         # never activated anywhere in the field, so the mechanism Menter
         # specifies was dead code. With the form below the limiter is active in
         # roughly 9% of cells and does the job it was designed for.
+        # The wall-adjacent row takes its strain from the two-layer near-wall
+        # profile rather than from the discrete gradient, which is the *average*
+        # across the cell and overstates the local one by kappa U+ once the cell
+        # leaves the viscous sublayer. See Boundaries.wall_velocity_gradient: it
+        # reduces to the resolved value exactly on a wall-resolved mesh, so this
+        # changes nothing at y+ ~ 1 and is the difference between converging and
+        # not at y+ 30.
+        production_strain = strain.copy()
+        production_strain[:, 0] = self.boundaries.wall_velocity_gradient(
+            state.u, state.v
+        )
+
         production = np.minimum(
-            state.eddy_viscosity * strain**2,
+            state.eddy_viscosity * production_strain**2,
             PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega,
         )
 

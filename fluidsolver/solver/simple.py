@@ -209,12 +209,17 @@ class PressureVelocityCoupling:
         boundaries: Boundaries,
         numerics: Numerics,
         reference_length: float = 1.0,
+        wall_model: bool = True,
     ):
         self.faces = faces
         self.fluid = fluid
         self.boundaries = boundaries
         self.numerics = numerics
         self.reference_length = reference_length
+        #: Whether a turbulent wall model applies. False for a laminar run,
+        #: where the first cell is sized from the Blasius thickness rather than
+        #: a y+ target, so the profile through it really is linear.
+        self.wall_model = wall_model
         #: Current CFL number. Ramped by the owner of the run, so that it can be
         #: raised as the solution settles and dropped again if it stops settling.
         self.cfl = numerics.cfl
@@ -248,6 +253,24 @@ class PressureVelocityCoupling:
 
         transpose = self._transpose_stress(viscosity, grad_u, grad_v)
 
+        # The wall face carries a viscosity chosen to deliver the blended wall
+        # shear rather than the molecular one. On a y+ ~ 1 mesh the two coincide,
+        # so nothing changes there; on a coarser mesh the linear profile the
+        # diffusive flux assumes is wrong and this is what corrects it.
+        #
+        # ``None`` for a laminar run, which falls back to the molecular value.
+        # A friction velocity and a log law describe a turbulent boundary layer
+        # and a laminar case has neither, so applying the blend there has no
+        # basis -- and it is not harmless: the fourth-power blend always exceeds
+        # the larger of its two branches, so it returned slightly more than
+        # molecular even where the viscous branch was exact, and moved the
+        # Re 40 cylinder's converged residual in its third digit.
+        wall_viscosity = (
+            self.boundaries.wall_viscosity(state.u, state.v)
+            if self.wall_model
+            else None
+        )
+
         components = []
         for field, gradient, wall, far, index in (
             (state.u, grad_u, wall_u, far_u, 0),
@@ -262,6 +285,7 @@ class PressureVelocityCoupling:
             ops.add_diffusion(
                 coefficients, self.faces, viscosity, gradient,
                 wall_value=wall, far_field_value=far,
+                wall_diffusivity=wall_viscosity,
                 far_field_active=inflow,
             )
             # Pressure gradient and the transpose half of the viscous stress.

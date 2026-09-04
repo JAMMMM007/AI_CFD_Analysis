@@ -137,6 +137,7 @@ class Case:
             self.boundaries,
             self.numerics,
             reference_length=self.reference_length,
+            wall_model=self.model_name != "laminar",
         )
         self.model = MODELS[self.model_name](
             self.faces,
@@ -287,6 +288,19 @@ class Case:
 
     # ------------------------------------------------------------------
 
+    @property
+    def _wall_model(self):
+        """The boundary conditions, for post-processing, when a wall model applies.
+
+        ``None`` for a laminar run. There the first cell is resolved by
+        construction -- the mesher sizes it from the Blasius thickness, not from
+        a ``y+`` correlation -- so the profile through it really is linear and
+        the blended friction velocity has nothing to add. It would also be
+        meaningless: ``u_tau`` and the log law describe a turbulent boundary
+        layer, and a laminar case has neither.
+        """
+        return None if self.model_name == "laminar" else self.boundaries
+
     def forces(self) -> post.Forces:
         return post.compute_forces(
             self.state,
@@ -295,13 +309,18 @@ class Case:
             self.freestream,
             self.reference_length,
             self.moment_reference,
+            self._wall_model,
         )
 
     def surface(self) -> post.SurfaceData:
-        return post.surface_data(self.state, self.faces, self.fluid, self.freestream)
+        return post.surface_data(
+            self.state, self.faces, self.fluid, self.freestream, self._wall_model
+        )
 
     def separation_points(self) -> np.ndarray:
-        return post.separation_points(self.state, self.faces, self.fluid)
+        return post.separation_points(
+            self.state, self.faces, self.fluid, self._wall_model
+        )
 
     def summary(self) -> str:
         forces = self.forces()
