@@ -423,3 +423,93 @@ recorded rather than raised.
    source only where there is no fixed-pressure face.
 10. F10 — flip the sign to the standard nose-up-positive `Cm`, and offer a
     quarter-chord moment reference alongside the centroid default.
+
+---
+
+## 8. What happened — results, added 2026-09-07
+
+Written after the fact. The plan above is left as it was proposed, so that where
+it was wrong is visible.
+
+### The order held, and the reason it held was not the one given
+
+Instruments first was argued from "four findings are invisible to every
+measurement the project owns". That was true and it was not the half that
+mattered. What the instruments actually bought was the ability to tell a change
+that helped from a change that looked like it helped: **three of the remedies in
+this response were wrong on the first attempt, and each was caught by a
+measurement rather than by review.**
+
+- F4's correction, applied alone, made the solver diverge. The spurious flux was
+  paying for a second omission in the pressure equation.
+- F3's remedy as the audit specifies it measures order 1.13, because the
+  least-squares gradient in the wall row does not converge at all.
+- F5's remedy as the audit recommends it produced a perfect `alpha_u`
+  independence — to the wrong fixed point.
+
+None of those is visible without the measurement, and two of them look like
+successes from the inside.
+
+### The findings, and what each measured
+
+| | landed | effect, measured |
+|---|---|---|
+| F3 | wall pressure extrapolated along `n` | `Cd_pressure` +1.955e-03 on the gate, +0.129% of `Cd`; order 1.00 to 2.08 |
+| F4 | consistent Rhie-Chow + the matching corrector | NACA 2412 `Cd` −5.87%, 14.5% of it out of pressure drag, friction −0.03% |
+| F5 | damping from the unrelaxed diagonal | `alpha_u` spread 2.038e-04 to 8.7e-07, against a 1.2e-06 floor |
+| F6 | `gamma P~_k / nu_t` | the `omega` limiter goes from 0.00% to 16.80% of cells |
+| F8 | march to a residual | 54 to 63 layers at y+ 1; faces past 30 degrees 2.92% to 0.09% |
+| F10 | `Cm` nose-up positive | every reported `Cm` changes sign |
+| F12 | separation from a one-sided wall gradient | 0.253 degrees on the gate |
+| F14 | one wall distance, one definition | subsumed by F15 — see below |
+| F15 | exact point-to-segment distance | the sampled form was 285% high in the worst first-row cell |
+| F16 | the mesh page's `y+` label | no computed number |
+| F17 | `omega` residual excludes the prescribed row | that row was 56.89% of its normaliser |
+
+### Three findings about the audit itself
+
+**F11's proposed instrument would not have caught F4.** The manufactured solution
+exercises the assembled operator against a prescribed flux; F4 lives in the code
+that builds the flux.
+
+**F14 and F15 are one defect.** For a first-row cell the nearest point on the
+polyline *is* the perpendicular foot on its own wall face, so the two distances
+must agree there — and once the polyline distance is exact rather than sampled,
+they do, to nine digits. The 15% disagreement F14 reports was entirely F15's
+sampling error.
+
+**The boundary rows are zeroth order, not first.** Both this project's test
+docstring and the audit say first. Measured: order +0.001, and the derivation
+agrees.
+
+### What the gates read now
+
+Cylinder: `Cd 1.5160`, wake `2.1219`, separation `53.7183`, `Cl -0.00000`, 992
+iterations, PASS. `Cd` moved from 1.5142 by two deliberate changes — F3's
+wall-pressure term and F5's mobility — each measured separately.
+
+Aerofoil: `Cd 0.011697`, steady to five significant figures from iteration 1400,
+residual plateaued at 3.6e-06.
+
+### Open, and honest about it
+
+**The residual floor on the aerofoil.** F5's correction makes the damping
+`1/alpha_u` larger, and the NACA 2412 no longer reaches `1e-6` — it plateaus at
+3.6e-06 with the forces steady. Both routes to the corrected fixed point do this,
+so it is the larger damping and not the implementation. The gate now carries a
+measured `RESIDUAL_FLOOR` for this case, which is an admission rather than a fix.
+Diagnosing it properly is the first thing to do next, and the binding equation is
+`Uy`.
+
+**Not implemented.** F1 (the `omega` wall constant) is deliberately not touched:
+the decision needs the NASA TMR `2DZP` flat plate, which does not exist here yet,
+and adopting a 9% drag change on authority ahead of that measurement is what
+standing instruction 1 exists to prevent. F2 (the far-field vortex correction),
+F7 (`SST-sust`), F9 (`enforce_global_mass_balance`) and F13 (the zero-gradient
+condition along `d`) remain, as does K2's seam and a grid-convergence study on a
+properly refined family.
+
+**The three-mesh study has not been re-run** since any of this landed, so the
+observed order of `Cd` is still the audit's 1.261 measured on the old code. Two
+first-order terms have been removed since; whether the order moved is unmeasured,
+and `validation/convergence.py` exists to measure it.
