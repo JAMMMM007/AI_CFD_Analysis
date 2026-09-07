@@ -487,6 +487,11 @@ class PressureVelocityCoupling:
             alpha_u 0.40          1.514432805        1.516040794
             spread                 2.038e-04          8.7e-07
 
+        The two columns are from different code states -- the wall-pressure
+        reconstruction landed between them -- so read each column's *spread*, not
+        the difference between them. The spreads are what this is about, and each
+        was measured within one state.
+
             alpha_p 0.15          1.514228454
             alpha_p 0.30          1.514229041
             alpha_p 0.45          1.514229618
@@ -500,37 +505,54 @@ class PressureVelocityCoupling:
         to zero would be reporting something other than a measurement taken at a
         finite residual.
 
-        **Two rejected remedies, both measured, because the second nearly landed.**
+        **Two rejected remedies, both measured.** All figures below are cylinder
+        ``Cd`` at ``alpha_u = 0.70`` and ``tolerance = 1e-9``, each compared
+        against the relaxed-mobility baseline of *the same* code state -- which
+        matters, because the wall-pressure reconstruction landed between two of
+        these experiments and moves ``Cd`` by ``+1.95e-03`` on its own, which is
+        an order more than any of the differences being measured here.
+
+            relaxed mobility, before that landed      1.514229041
+            Choi retention, before it landed          1.514085081   shift -1.440e-04
+            relaxed mobility, after it landed         1.516313751
+            unrelaxed mobility (this)                 1.516039920   shift -2.738e-04
+            Choi retention with the lag corrected     1.516039883   shift -2.739e-04
 
         *Choi's retention*, which the audit recommends: carry the damping between
         iterations as ``X^m = -rho D_f (damping)^m + (1 - alpha_u) X^{m-1}``, whose
-        fixed point has the ``alpha_u`` cancel. Implemented, it produced an
-        ``alpha_u`` spread of 8.83e-07 -- which looked like success. It was not:
-        the value it converged *to* was 1.514085, and both the correct fixed point
-        and an independent implementation of it sit at 1.516040. It was
-        consistently converging to the wrong answer, which an
-        independence-of-``alpha_u`` test cannot detect on its own. The defect was
-        that ``X^{m-1}`` was taken as the damping ``face_fluxes`` built, not as the
-        non-convective part of the *corrected* flux, so the recursion never saw
-        what the pressure correction had done.
+        fixed point has the ``alpha_u`` cancel. Implemented, it gave an ``alpha_u``
+        spread of 8.83e-07 -- at the convergence floor, which was the acceptance
+        criterion, and it met it. But its shift is 53% of the one the unrelaxed
+        mobility produces, so it was *not* reaching the fixed point the derivation
+        promises: it was independent of ``alpha_u`` and converging somewhere else,
+        which an independence test cannot detect because every run in the family
+        is wrong by the same amount. The defect: ``X^{m-1}`` was the damping
+        ``face_fluxes`` built, not the non-convective part of the *corrected*
+        flux, so the recursion never saw what the pressure correction had done.
 
-        *Choi's retention with that lag corrected*, which does reach 1.516039883 --
-        agreeing with the line above to 4e-08, and the two together are why
-        1.516040 is believed. It was rejected anyway: the cylinder at
-        ``alpha_u = 0.40`` no longer reached 1e-9 in 8000 iterations, and the
-        NACA 2412 plateaued at 1.8e-06 through 2600 iterations. A remedy that
-        needs a state array and costs convergence, to reach a fixed point that one
-        line reaches without either, is not the one to take. Stage 4 will need
-        Rhie-Chow to be time-step independent, which is the argument the audit
-        makes for Choi's form; that is a different construction and can be built
-        when there is a time step to be independent of.
+        *Choi's retention with that lag corrected* does reach it -- 1.516039883
+        against this line's 1.516039920, agreeing to 3.7e-08, and those two
+        constructions agreeing is the reason the fixed point is believed at all.
+        It was rejected on its own measurements: the cylinder at ``alpha_u = 0.40``
+        no longer reached 1e-9 in 8000 iterations, and the NACA 2412 plateaued at
+        1.8e-06 through 2600 iterations. A remedy needing a state array and
+        costing convergence, to reach a fixed point one line reaches without
+        either, is not the one to take. Stage 4 will need Rhie-Chow to be
+        *time-step* independent, which is the audit's argument for Choi's form;
+        that is a different construction and can be built when there is a time
+        step to be independent of.
 
-        **What this costs.** The unrelaxed mobility is ``1/alpha_u`` larger, so the
-        damping is larger, and the outer iteration slows on a stiff case. The
-        NACA 2412 reaches 3.10e-06 at 1500 iterations and is still falling, where
-        the relaxed mobility converged at 1039. The cylinder is unaffected -- 1363
-        and 4214 iterations at ``alpha_u`` 0.70 and 0.40, both normal. That cost
-        is recorded as an open item rather than tuned away.
+        **What this costs, and it is not free.** The unrelaxed mobility is
+        ``1/alpha_u`` larger, so the damping is larger and the outer iteration
+        slows on a stiff case. The NACA 2412 no longer reaches ``1e-6``: it
+        plateaus at about ``3.6e-06`` from iteration 1400, with ``Cd`` steady at
+        ``0.011697`` to five significant figures through 1200 further iterations.
+        The relaxed mobility converged the same case at 1039. That is a real
+        trade -- a fixed point that does not depend on a numerical parameter,
+        against a residual that no longer reaches the tolerance on the primary
+        case -- and it is recorded as an open item rather than tuned away. The
+        cylinder is unaffected: 1363 and 4214 iterations at ``alpha_u`` 0.70 and
+        0.40, both normal.
 
         **The pressure-correction operator is deliberately *not* changed to
         match.** It stays orthogonal-only, in :meth:`pressure_correction` and in
