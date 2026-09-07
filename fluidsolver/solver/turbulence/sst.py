@@ -21,7 +21,7 @@ The transported equations:
     D(rho k)/Dt     = P~_k - beta* rho k omega
                       + div[(mu + sigma_k mu_t) grad k]
 
-    D(rho omega)/Dt = gamma rho S^2 - beta rho omega^2
+    D(rho omega)/Dt = gamma P~_k / nu_t - beta rho omega^2
                       + div[(mu + sigma_w mu_t) grad omega]
                       + 2(1 - F1) rho sigma_w2 (1/omega) grad k . grad omega
 
@@ -241,6 +241,78 @@ class KOmegaSST(TurbulenceModel):
     # Transport equations
     # ------------------------------------------------------------------
 
+    def _limited_production(self, state: State, strain: np.ndarray) -> np.ndarray:
+        """``P~_k = min(mu_t S^2, 10 beta* rho k omega)``, Menter's limited production.
+
+        Shared, because SST-2003 applies this same limited quantity to *both*
+        transport equations and the ``omega`` equation was not getting it. See
+        :meth:`_solve_omega`.
+
+        The wall-adjacent row takes its strain from the two-layer near-wall
+        profile rather than from the discrete gradient, which is the *average*
+        across the cell and overstates the local one by ``kappa U+`` once the cell
+        leaves the viscous sublayer. See ``Boundaries.wall_velocity_gradient``: it
+        reduces to the resolved value exactly on a wall-resolved mesh, so this
+        changes nothing at ``y+ ~ 1`` and is the difference between converging and
+        not at ``y+ 30``.
+        """
+        density = self.fluid.density
+        omega = np.maximum(state.omega, self._omega_floor)
+        return np.minimum(
+            state.eddy_viscosity * self._production_strain(state, strain) ** 2,
+            PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega,
+        )
+
+    def _production_strain(self, state: State, strain: np.ndarray) -> np.ndarray:
+        """The strain the production terms use, with the wall row overridden."""
+        production_strain = strain.copy()
+        production_strain[:, 0] = self.boundaries.wall_velocity_gradient(
+            state.u, state.v
+        )
+        return production_strain
+
+    def _limited_production_over_nu_t(
+        self, state: State, strain: np.ndarray
+    ) -> np.ndarray:
+        """``P~_k / nu_t``, which is ``rho S^2`` only while the limiter is inactive.
+
+        The ``omega`` production. SST-2003 specifies ``gamma P~_k / nu_t`` with the
+        *limited* ``k`` production, and the limiter applying to both equations.
+        This code had ``gamma rho S^2``, which is the erratum in Menter, Kuntz and
+        Langtry (2003) that the NASA Turbulence Modeling Resource records:
+
+            "In the omega equation (2nd part of eqn (1) in the paper), the
+            production term was incorrectly given as alpha rho S^2 ... Instead, it
+            should have read alpha P~_k / nu_t ... the Pk term has a tilde over it,
+            which refers to the limited value of the k production term
+            min(P, 10 beta* rho omega k)."
+
+        The two forms coincide wherever the limiter is inactive, because
+        ``P_k / nu_t = (mu_t S^2)/(mu_t/rho) = rho S^2`` exactly. They differ
+        precisely where ``mu_t S^2 > 10 beta* rho k omega``, and there the coded
+        form was larger by the ratio the limiter was cutting. The consequence was
+        that Menter's stagnation-point limiter -- which this project's Stage 0 went
+        to some trouble to make active at all -- was switched off for one of the
+        two equations it is specified to act on, so ``omega`` was over-produced
+        relative to ``k`` exactly where the anomaly it exists to control lives.
+
+        Written as ``min(S^2, 10 beta* rho k omega / mu_t)`` rather than as a
+        division of ``P~_k``, so that a vanishing ``mu_t`` selects ``S^2`` instead
+        of dividing by zero. That is the arrangement, not a guard bolted on: at
+        ``mu_t = 0`` the limit is ``+inf`` and the minimum is the strain term,
+        which is the correct limit and not merely a safe one.
+        """
+        density = self.fluid.density
+        omega = np.maximum(state.omega, self._omega_floor)
+        eddy = state.eddy_viscosity
+
+        limit = PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega
+        positive = eddy > 0.0
+        return np.minimum(
+            self._production_strain(state, strain) ** 2,
+            np.where(positive, limit / np.where(positive, eddy, 1.0), np.inf),
+        )
+
     def _solve_k(
         self, state, strain, blend, grad_k, wall_k, far_k, inflow
     ) -> float:
@@ -272,15 +344,7 @@ class KOmegaSST(TurbulenceModel):
         # reduces to the resolved value exactly on a wall-resolved mesh, so this
         # changes nothing at y+ ~ 1 and is the difference between converging and
         # not at y+ 30.
-        production_strain = strain.copy()
-        production_strain[:, 0] = self.boundaries.wall_velocity_gradient(
-            state.u, state.v
-        )
-
-        production = np.minimum(
-            state.eddy_viscosity * production_strain**2,
-            PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega,
-        )
+        production = self._limited_production(state, strain)
 
         coefficients = Coefficients.zeros(self.faces.shape)
         diffusivity = self.fluid.viscosity + self._blended(
@@ -335,7 +399,11 @@ class KOmegaSST(TurbulenceModel):
         # Destruction is quadratic; linearising it as beta rho omega_old * omega
         # keeps it implicit and unconditionally stable.
         coefficients.centre += beta * density * omega * self.volume
-        coefficients.source += gamma * density * strain**2 * self.volume
+        # gamma P~_k / nu_t, not gamma rho S^2. See the module docstring.
+        coefficients.source += (
+            gamma * density * self._limited_production_over_nu_t(state, strain)
+            * self.volume
+        )
 
         # Cross-diffusion changes sign. The positive part is a source; the
         # negative part is split off and made implicit, so it can never push

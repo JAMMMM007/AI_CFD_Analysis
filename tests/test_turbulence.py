@@ -111,6 +111,91 @@ class TestBlendingFunctions:
             assert blend.min() >= 0.0 and blend.max() <= 1.0
 
 
+class TestProductionTerms:
+    """That both equations get Menter's *limited* production, not just ``k``."""
+
+    def test_the_two_forms_agree_wherever_the_limiter_is_inactive(self, rig):
+        """``P_k / nu_t = (mu_t S^2)/(mu_t/rho) = rho S^2`` exactly.
+
+        The corrected form must not be a different model everywhere -- it is the
+        same model everywhere the limiter is not cutting, and that identity is
+        what makes the change a correction rather than a retuning.
+        """
+        model, state, _, _, _ = rig
+        strain = model.strain_rate(state, model.gradient)
+        used = model._limited_production_over_nu_t(state, strain)
+        unlimited = model._production_strain(state, strain) ** 2
+
+        inactive = used >= unlimited * (1.0 - 1e-12)
+        assert inactive.any()
+        assert np.allclose(used[inactive], unlimited[inactive], rtol=1e-12)
+
+    def test_the_limiter_actually_reaches_the_omega_equation(self, rig):
+        """Regression. It did not, and that made it dead code for one of two.
+
+        SST-2003 specifies ``gamma P~_k / nu_t`` with the *limited* k production,
+        the limiter applying to both equations. This code had ``gamma rho S^2``,
+        which the NASA Turbulence Modeling Resource records as an erratum in
+        Menter, Kuntz and Langtry (2003). The two forms coincide wherever the
+        limiter is inactive, so the error is invisible except exactly where the
+        limiter is meant to be doing its job.
+
+        Measured on the NACA 2412 at 5 degrees after 400 iterations, as the
+        fraction of cells where the omega production is cut:
+
+            gamma rho S^2 (as it was)      0.00%
+            gamma P~_k / nu_t (as it is)   16.80%
+
+        Zero against seventeen per cent. The audit's independent measurement of
+        the same quantity is 17.11%. Menter's stagnation-point limiter -- which
+        this project's Stage 0 went to some trouble to make active at all -- was
+        switched off for one of the two equations it is specified to act on.
+
+        The force effect on an attached aerofoil is small, +0.0089% in Cl and
+        -0.003% in Cd at 400 iterations, because the limiter fires overwhelmingly
+        in the freestream where both arguments of the minimum are near zero. It
+        would not be small on a bluff body at high Reynolds number, which is the
+        case the limiter exists for.
+        """
+        model, state, faces, metrics, _ = rig
+
+        # The bound on the omega production is 10 beta* omega^2: substituting
+        # mu_t = rho k / omega into 10 beta* rho k omega / mu_t cancels k
+        # entirely. So the limiter bites where S > sqrt(0.9) omega, and a state
+        # with a uniform freestream -- zero strain everywhere but the wall row --
+        # cannot exercise it however k is scaled. That cancellation is worth
+        # knowing: the omega limiter does not depend on k at all.
+        state.u = 30.0 * (1.0 + 0.5 * np.sin(4.0 * metrics.centroid[..., 1]))
+        state.v = 30.0 * 0.5 * np.cos(4.0 * metrics.centroid[..., 0])
+        state.omega = np.full_like(state.omega, 1.0)
+        state.eddy_viscosity = model.fluid.density * state.k / state.omega
+
+        strain = model.strain_rate(state, model.gradient)
+        used = model._limited_production_over_nu_t(state, strain)
+        unlimited = model._production_strain(state, strain) ** 2
+
+        assert (used < unlimited * (1.0 - 1e-9)).any()
+        # And where it bites, it bites at exactly the specified bound.
+        cut = used < unlimited * (1.0 - 1e-9)
+        assert np.allclose(used[cut], 10.0 * sst.BETA_STAR * state.omega[cut] ** 2)
+
+    def test_a_vanishing_eddy_viscosity_selects_the_strain_term(self, rig):
+        """The arrangement, not a guard: at ``mu_t = 0`` the limit is ``+inf``.
+
+        Writing it as ``P~_k / nu_t`` and dividing would be a division by zero
+        wherever the eddy viscosity has been floored away. Written as
+        ``min(S^2, 10 beta* rho k omega / mu_t)`` the same limit falls out
+        correctly, because an infinite bound is no bound.
+        """
+        model, state, _, _, _ = rig
+        state.eddy_viscosity = np.zeros_like(state.eddy_viscosity)
+        strain = model.strain_rate(state, model.gradient)
+
+        used = model._limited_production_over_nu_t(state, strain)
+        assert np.all(np.isfinite(used))
+        assert np.allclose(used, model._production_strain(state, strain) ** 2)
+
+
 class TestEddyViscosity:
     def test_reduces_to_k_over_omega_when_the_limiter_is_inactive(self, rig):
         """Away from strong shear the model must give the standard k-omega result."""
