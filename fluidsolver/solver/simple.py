@@ -631,7 +631,6 @@ class PressureVelocityCoupling:
             far_u * self.faces.far_field.area[:, 0]
             + far_v * self.faces.far_field.area[:, 1]
         )
-        far = self.boundaries.enforce_global_mass_balance(far)
 
         flux_j = np.concatenate(
             (wall_flux[:, None], interior_j, far[:, None]), axis=1
@@ -706,6 +705,23 @@ class PressureVelocityCoupling:
 
         imbalance = -ops.divergence(flux_i, flux_j, self.faces)
         fixed = self.boundaries.far_pressure_is_fixed(flux_j[:, -1])
+
+        # Compatibility, imposed on the source and only where it is needed.
+        #
+        # A pure Neumann Poisson problem is solvable only if its source
+        # integrates to zero. This one is not pure Neumann -- _far_field_coupling
+        # puts a Dirichlet coupling to p' = 0 behind every outflow face, and a
+        # matrix with any Dirichlet row is non-singular -- so the condition
+        # applies only when the boundary is inflow everywhere and there is no such
+        # face. Then the source is projected to zero mean, volume-weighted, which
+        # is the standard treatment and is exact.
+        #
+        # This replaces a multiplicative rescaling of every outflow face, which
+        # was justified by this compatibility condition, did not need to be, and
+        # was still doing it at convergence -- see Boundaries.far_flux_is_solvable.
+        if not self.boundaries.far_flux_is_solvable(flux_j[:, -1]):
+            total = self.volume.sum()
+            imbalance = imbalance - self.volume * (imbalance.sum() / total)
 
         matrix = self.matrix.build(coefficients)
         preconditioner = incomplete_lu_preconditioner(matrix)

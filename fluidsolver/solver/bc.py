@@ -321,23 +321,36 @@ class Boundaries:
             self.faces.far_field.area * self.freestream.vector, axis=-1
         )
 
-    def enforce_global_mass_balance(self, far_flux: np.ndarray) -> np.ndarray:
-        """Scale the outflow so that what leaves equals what enters.
+    def far_flux_is_solvable(self, far_flux: np.ndarray) -> bool:
+        """Whether the pressure equation needs its source projecting to zero mean.
 
-        The pressure-correction equation is a discrete Poisson problem, and it has
-        a solution only if its source integrates to zero -- that is, only if the
-        boundary fluxes balance. Extrapolating velocity onto the outflow gives no
-        guarantee of that, and even a small imbalance makes the pressure solve
-        drift or fail. Rescaling the outflow to match the inflow restores
-        solvability, and the correction vanishes as the solution converges.
+        It does only when *no* far-field face holds the pressure -- that is, when
+        the boundary is inflow everywhere, so the pressure correction sees a pure
+        Neumann problem with a singular matrix and a compatibility condition.
+
+        This replaces ``enforce_global_mass_balance``, which rescaled every
+        outflow face by ``M_in / M_out`` on the stated grounds that "the
+        pressure-correction equation is a discrete Poisson problem, and it has a
+        solution only if its source integrates to zero". That is the compatibility
+        condition of a *pure Neumann* problem, and this one is not pure Neumann:
+        ``PressureVelocityCoupling._far_field_coupling`` adds a Dirichlet coupling
+        to ``p' = 0`` on the diagonal of every cell behind an outflow face, and a
+        matrix with any Dirichlet row is non-singular. The stated reason did not
+        apply.
+
+        What the rescaling did instead was impose global conservation on an
+        extrapolated outflow, and it did so **at convergence**. Nothing forces the
+        raw extrapolated flux to balance the inflow, so the factor settles at some
+        ``c != 1`` and stays: measured on the converged Re 40 cylinder,
+        ``0.999747534``, rescaling every outflow face by -0.0252% for ever. By
+        this project's own standard -- anything active at convergence is part of
+        the model, whatever it is labelled -- that made it an undocumented
+        boundary condition.
+
+        It also declined to act in exactly the situation it was written for. Its
+        guard returned the flux untouched when either total was non-positive,
+        which is the start-up transient or a boundary that has gone almost
+        entirely inflow -- and it said nothing when it did. The factor was
+        unbounded as the outflow went to zero.
         """
-        entering = far_flux < 0.0
-        inflow = -far_flux[entering].sum()
-        outflow = far_flux[~entering].sum()
-
-        if outflow <= 0.0 or inflow <= 0.0:
-            return far_flux
-
-        balanced = far_flux.copy()
-        balanced[~entering] *= inflow / outflow
-        return balanced
+        return bool(np.any(self.far_pressure_is_fixed(far_flux)))

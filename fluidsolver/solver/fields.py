@@ -111,9 +111,10 @@ class State:
         )
         # No mass crosses the wall, ever.
         state.flux_j[:, 0] = 0.0
-        state.flux_j[:, -1] = boundaries.enforce_global_mass_balance(
-            boundaries.far_flux_from_freestream()
-        )
+        # A uniform freestream through a closed boundary balances exactly by the
+        # divergence theorem, to rounding, so there is nothing to correct here --
+        # and the first pressure solve would correct it if there were.
+        state.flux_j[:, -1] = boundaries.far_flux_from_freestream()
         return state
 
     @property

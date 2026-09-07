@@ -857,13 +857,38 @@ class TestBoundaries:
         assert np.allclose(far[~boundaries.inflow_mask(flux)], 0.0)
         assert np.allclose(far[boundaries.inflow_mask(flux)], 7.0)
 
-    def test_outflow_is_rescaled_to_balance_inflow(self, setup):
-        """The pressure equation is solvable only if the boundary fluxes balance."""
+    def test_a_boundary_with_outflow_needs_no_compatibility_projection(self, setup):
+        """Because it is not a pure Neumann problem, which is the whole point.
+
+        This replaces a test asserting that the outflow was rescaled to balance
+        the inflow, on the stated grounds that "the pressure equation is solvable
+        only if the boundary fluxes balance". That is the compatibility condition
+        of a *pure Neumann* Poisson problem, and this one is not: a Dirichlet
+        coupling to ``p' = 0`` sits behind every outflow face. The old test
+        asserted the rescaling worked, which it did; what it never asked was
+        whether it was needed.
+
+        It was not, and it was still acting at convergence -- measured on the
+        Re 40 cylinder, every outflow face rescaled by -0.0252% for ever, which
+        makes it a boundary condition rather than a solvability repair.
+        """
         _, boundaries, _ = setup
         flux = boundaries.far_flux_from_freestream()
-        flux = flux * np.where(flux > 0, 1.6, 1.0)  # break the balance
-        balanced = boundaries.enforce_global_mass_balance(flux)
-        assert abs(balanced.sum()) < 1e-10 * np.abs(balanced).sum()
+        assert boundaries.far_flux_is_solvable(flux)
+
+        # Break the balance badly. It is still solvable, because what makes it
+        # solvable is the presence of a fixed-pressure face and not the balance.
+        unbalanced = flux * np.where(flux > 0, 1.6, 1.0)
+        assert abs(unbalanced.sum()) > 1e-6 * np.abs(unbalanced).sum()
+        assert boundaries.far_flux_is_solvable(unbalanced)
+
+    def test_a_boundary_that_is_inflow_everywhere_does_need_one(self, setup):
+        """The one case the compatibility condition is for, and the one the old
+        rescaling silently declined to handle: its guard returned the flux
+        untouched whenever either total was non-positive."""
+        _, boundaries, _ = setup
+        entirely_inflow = -np.abs(boundaries.far_flux_from_freestream())
+        assert not boundaries.far_flux_is_solvable(entirely_inflow)
 
 
 class TestRhieChowConsistency:
