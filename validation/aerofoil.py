@@ -62,55 +62,61 @@ CHORD = 1.0
 VELOCITY = 30.0
 INCIDENCE_DEG = 5.0
 
-#: Bands, wide, for change detection. The centres are the values measured on
-#: `main` at 37fabd2 and recorded by ``BASELINE`` below; the widths are roughly
-#: +/- 10% on the force coefficients, which is larger than any single finding in
-#: the audit predicts except F1's 8.94% in `Cd` -- deliberately, so that landing
-#: one finding at a time does not require re-baselining on every commit.
+#: Bands, wide, for change detection. They are centred on the current
+#: ``BASELINE`` below and roughly +/- 10% wide on the force coefficients, which is
+#: larger than any single finding in the audit predicts except F1's 8.94% in `Cd`
+#: -- deliberately, so that landing one finding at a time does not require
+#: re-baselining on every commit. A band is re-centred only when a landed change
+#: has moved the baseline, in that change's own commit, and never to accommodate
+#: a result that was not understood first.
 #:
 #: For orientation only, not as targets: Abbott and von Doenhoff give the
 #: NACA 2412 a section `Cl` near 0.75 at 5 degrees and `Cm_ac` near -0.05.
 REFERENCE = {
     "Cl": (0.68, 0.83),
-    "Cd": (0.0112, 0.0138),
+    "Cd": (0.0106, 0.0130),
     "Cd_friction": (0.0067, 0.0082),
 }
 
-#: What this specification read on `main` at 37fabd2, before any audit finding
-#: was implemented. Printed alongside every run so that a movement is visible
-#: without going to the git history for it. These are the digits to update,
-#: deliberately and in the same commit, whenever a change is meant to move them.
+#: What this specification currently reads, and what it read before. Printed
+#: alongside every run so that a movement is visible without going to the git
+#: history for it. These are the digits to update -- deliberately, and in the same
+#: commit -- whenever a change is meant to move them.
 #:
-#: The figures are the physics audit's, which were carried to more digits than a
-#: run of this module prints. They were reproduced here by an independent run of
-#: exactly the specification above, and the two agree:
+#: History, each entry measured on this exact specification:
 #:
-#:     audit   1007 it  residual 9.9385e-07  Cl 0.7535096  Cd 0.01250649
-#:                      Cdp 0.00505258  Cdf 0.00745391  Cm -0.0825130
-#:     here    1008 it  residual 9.97e-07    Cl 0.75354    Cd 0.012506
-#:                      Cdp 0.005051    Cdf 0.007455    Cm -0.08251
+#:   37fabd2, before the audit response
+#:     1008 it  9.97e-07   Cl 0.75354  Cd 0.012506  Cdp 0.005051  Cdf 0.007455
+#:              Cm -0.08251   y+ 0.301 .. 2.301
+#:     The physics audit's independent run of the same case agrees to better than
+#:     0.03% on every force coefficient: 1007 it, Cl 0.7535096, Cd 0.01250649,
+#:     Cdp 0.00505258, Cdf 0.00745391, Cm -0.0825130. Its y+ ceiling of 2.357
+#:     against 2.301 here is 2.4% apart and is not currently explained.
 #:
-#: Every force coefficient agrees to better than 0.03%, on a run one iteration
-#: longer. The one figure that does not is the top of the `y+` range, 2.301 here
-#: against 2.357 there -- 2.4% apart, on a quantity read off the surface
-#: distribution rather than integrated, and not currently explained.
+#:   d5ef5b5, consistent Rhie-Chow flux and the matching pressure corrector
+#:     1044 it  9.91e-07   Cl 0.75894  Cd 0.011773  Cdp 0.004321  Cdf 0.007451
+#:              Cm -0.08349   y+ 0.280 .. 2.311
+#:     Cd -5.87%, and 14.5% of that out of the pressure drag while friction drag
+#:     moves 0.03%. That split is the point: the spurious flux lived in the
+#:     polar-blended far field and the marched near-wall region is orthogonal.
 #:
-#: **This run also settles the hardening plan's first open item.** It was made on
-#: factory `Numerics()` with the divergence monitor *armed*, and it converged to
-#: 9.97e-07 in 1008 iterations without raising anything. The plan, the README and
-#: the handover all describe a NACA 0012 at Re 2e6 that `SolverDiverged` stops at
-#: iteration 367, and all three call it the first thing to fix. The audit could
-#: not reproduce it and neither can this. See `docs/audit-response-plan.md`.
+#: **The first run also settled the hardening plan's first open item.** It was
+#: made on factory `Numerics()` with the divergence monitor *armed* and converged
+#: without raising anything. The plan, the README and the handover all describe a
+#: NACA 0012 at Re 2e6 that `SolverDiverged` stops at iteration 367, and all three
+#: call it the first thing to fix. The audit could not reproduce it, and neither
+#: could a direct run of that case here -- which now converges at iteration 479.
+#: See `docs/audit-response-plan.md`.
 BASELINE = {
-    "iterations": 1007,
-    "residual": 9.9385e-07,
-    "Cl": 0.7535096,
-    "Cd": 0.01250649,
-    "Cd_pressure": 0.00505258,
-    "Cd_friction": 0.00745391,
-    "Cm": -0.0825130,
-    "y_plus_min": 0.301,
-    "y_plus_max": 2.357,
+    "iterations": 1044,
+    "residual": 9.91e-07,
+    "Cl": 0.75894,
+    "Cd": 0.011773,
+    "Cd_pressure": 0.004321,
+    "Cd_friction": 0.007451,
+    "Cm": -0.08349,
+    "y_plus_min": 0.280,
+    "y_plus_max": 2.311,
 }
 
 
