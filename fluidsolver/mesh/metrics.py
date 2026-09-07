@@ -163,19 +163,71 @@ def _wall_distance(
     marching distance is larger than the real one, and feeding that to the SST
     blending functions would mis-place the switch between its two model regimes.
 
-    The polyline is sub-sampled and queried with a KD-tree. Sub-sampling matters:
-    against vertices alone, a cell opposite the middle of a long wall segment
-    reads as further away than it is.
+    **The distance to a polyline is computed to the segments, not to samples
+    along them.** This used to sub-sample each segment at ``samples`` points and
+    query a KD-tree of those, which makes the answer a function of the sampling
+    density: a centroid a distance ``y1`` off the wall, opposite the middle of a
+    gap of length ``h_s / samples``, reads ``sqrt(y1^2 + (h_s / 2 samples)^2)``
+    instead of ``y1``. At eight samples on the NACA 2412 mesh that was 17.4% too
+    large in the worst first-row cell, and 3.8% at the worst cell anywhere --
+    measured by re-running the same mesh at 32, 128 and 512 samples, where the
+    answer converges.
+
+    The error is at the *trailing* edge and along the long flat segments, not at
+    the nose: the leading-edge cells came out identical to 512 samples, because
+    that is where the surface resampler clusters points most finely. That is the
+    opposite of where it would be looked for.
+
+    Nothing measurable moved when this was corrected, and the reason is worth
+    recording rather than treating as luck. The distance enters the SST blending
+    functions through arguments like ``500 nu / (d^2 omega)``, and an 8% move in
+    that argument at the worst cell changes nothing because ``F1`` is saturated at
+    1 throughout the region where the error lives -- ``tanh(x^4)`` is 1 either
+    way. It would matter if the blending functions were ever evaluated where they
+    are not saturated, and it costs nothing to remove the question.
+
+    The KD-tree still does the searching, over one point per segment; it only no
+    longer does the *measuring*. Each centroid takes the exact perpendicular
+    distance to the nearest segment and to that segment's two neighbours, which
+    covers the case where the nearest midpoint and the nearest segment differ.
+
+    ``samples`` is retained for callers that pass it and now selects how many
+    points per segment seed the search rather than how finely the answer is
+    quantised. The answer no longer depends on it.
     """
     from scipy.spatial import cKDTree
 
     closed = np.vstack((wall, wall[:1]))
-    fractions = np.linspace(0.0, 1.0, samples, endpoint=False)
-    dense = (
-        closed[:-1, None, :] + fractions[None, :, None] * np.diff(closed, axis=0)[:, None, :]
-    ).reshape(-1, 2)
+    start = closed[:-1]
+    edge = np.diff(closed, axis=0)
+    n_segments = len(start)
 
-    distance, _ = cKDTree(dense).query(centroid.reshape(-1, 2))
+    # Seed the search with points along each segment, and remember which segment
+    # each seed came from.
+    fractions = np.linspace(0.0, 1.0, max(samples, 1), endpoint=False)
+    seeds = (start[:, None, :] + fractions[None, :, None] * edge[:, None, :]).reshape(-1, 2)
+    owner = np.repeat(np.arange(n_segments), len(fractions))
+
+    points = centroid.reshape(-1, 2)
+    _, nearest = cKDTree(seeds).query(points)
+    segment = owner[nearest]
+
+    # The nearest seed's segment, and its neighbours either side: the true
+    # nearest segment can be adjacent to the one carrying the nearest seed,
+    # which is exactly the case sub-sampling used to paper over.
+    candidates = (segment[:, None] + np.array([-1, 0, 1])[None, :]) % n_segments
+
+    a = start[candidates]
+    d = edge[candidates]
+    offset = points[:, None, :] - a
+    length_squared = np.sum(d * d, axis=-1)
+    projection = np.clip(
+        np.sum(offset * d, axis=-1) / np.where(length_squared > 0.0, length_squared, 1.0),
+        0.0,
+        1.0,
+    )
+    closest = a + projection[..., None] * d
+    distance = np.linalg.norm(points[:, None, :] - closest, axis=-1).min(axis=1)
     return distance.reshape(centroid.shape[:-1])
 
 

@@ -344,6 +344,70 @@ def grid():
     )
 
 
+class TestWallDistance:
+    """That it measures a distance to the surface, not to a sampling of it."""
+
+    def test_it_does_not_depend_on_the_sub_sampling(self, grid):
+        """Regression, and the sharpest statement of what was wrong.
+
+        The distance used to be the nearest of a set of points sprinkled along
+        each wall segment, which makes the answer a function of how many were
+        sprinkled: a centroid a distance ``y1`` off the wall opposite the middle
+        of a gap of length ``h_s / n`` reads ``sqrt(y1^2 + (h_s/2n)^2)``.
+
+        Measured on the NACA 2412 mesh against the exact answer, the old
+        construction over-estimated the worst first-row cell by 285% at eight
+        samples, 117% at 32, 18.6% at 128 and 0.35% at 512 -- so it converges, and
+        slowly. (The audit put the error at 17.4%, which is what comparing eight
+        samples against 512 gives when 512 is itself still 0.35% out.)
+
+        The error is at the *trailing* edge and along the long flat segments, not
+        at the nose: measured on the leading-edge cells alone it is 1.6e-03, since
+        that is where the resampler clusters points most finely. That is the
+        opposite of where it would be looked for.
+
+        Asserting sample-independence rather than a tolerance against a finer
+        sampling is the point: there is no longer a sampling to be independent of,
+        and any tolerance would be a claim about a construction that has been
+        removed.
+        """
+        distances = [
+            compute_metrics(grid.nodes, wall_samples=n).wall_distance
+            for n in (2, 8, 64, 256)
+        ]
+        for other in distances[1:]:
+            assert np.array_equal(distances[0], other)
+
+    def test_it_is_exact_opposite_the_middle_of_a_long_segment(self):
+        """The case sub-sampling was invented to paper over, with a known answer.
+
+        A square has four long segments and its resampled corners are far apart in
+        the middle of each side, which is exactly where a vertex-only or a
+        coarsely sampled measurement reads high. The perpendicular distance from a
+        cell centroid to a straight segment is analytic, so this needs no
+        reference implementation to compare against.
+        """
+        nodes = build_ogrid(
+            square(1.0, 240).resample(240), first_layer=2.0e-3, far_field_radius=20.0
+        ).nodes
+        metrics = compute_metrics(nodes)
+
+        wall = nodes[:, 0]
+        centroid = metrics.centroid.reshape(-1, 2)
+        closed = np.vstack((wall, wall[:1]))
+        start, edge = closed[:-1], np.diff(closed, axis=0)
+
+        offset = centroid[:, None, :] - start[None, :, :]
+        length_squared = np.sum(edge * edge, axis=-1)
+        projection = np.clip(
+            np.sum(offset * edge[None, :, :], axis=-1) / length_squared[None, :], 0.0, 1.0
+        )
+        closest = start[None, :, :] + projection[..., None] * edge[None, :, :]
+        exact = np.linalg.norm(centroid[:, None, :] - closest, axis=-1).min(axis=1)
+
+        assert np.abs(metrics.wall_distance.ravel() - exact).max() < 1e-12
+
+
 class TestMetrics:
     def test_face_normals_of_each_cell_sum_to_zero(self, grid):
         """The closure identity. Every conservation property downstream rests on it."""
