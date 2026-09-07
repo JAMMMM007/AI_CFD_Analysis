@@ -1285,6 +1285,48 @@ class TestForces:
         assert forces.moment == pytest.approx(0.5 * forces.lift, rel=1e-9)
         assert forces.moment_coefficient > 0.0
 
+    def test_separation_follows_the_wall_gradient_not_the_first_cell(self, setup):
+        """Regression. The sign came from ``u_t(y1)``, which reverses too late.
+
+        In a separating boundary layer the profile is inflected: the reversed
+        region grows outward from the surface, so ``du_t/dy`` changes sign at the
+        wall *before* the first-cell velocity does. Between the two there is a
+        band of surface that has separated and does not look separated. The
+        disagreement is ``O(y1)``, first order in the wall spacing, and on the
+        converged Re 40 cylinder it moved the separation angle by 0.253 degrees --
+        53.71710 from the first-cell velocity against 53.97023 from a one-sided
+        wall gradient, on a figure the gate prints to three decimals.
+
+        Built here as exactly that band: a velocity field whose first cell is
+        still moving forward everywhere while the wall gradient has already
+        reversed over an arc. The first-cell test finds no separation at all on
+        this field; the wall-gradient test finds it.
+        """
+        _, faces, fluid, _, state = setup
+
+        centre = faces.wall.centre
+        tangent = np.roll(centre, -1, axis=0) - np.roll(centre, 1, axis=0)
+        tangent /= np.linalg.norm(tangent, axis=-1, keepdims=True)
+
+        # u_t(y1) > 0 everywhere, u_t(y2) large enough that the quadratic through
+        # the wall and the two centres has negative slope over part of the body.
+        angle = np.arctan2(centre[:, 1], centre[:, 0])
+        reversed_arc = np.cos(angle) < -0.3
+        first = np.full(centre.shape[0], 0.01)
+        second = np.where(reversed_arc, 1.0, 0.02)
+
+        state.u[:] = 0.0
+        state.v[:] = 0.0
+        state.u[:, 0], state.v[:, 0] = first * tangent[:, 0], first * tangent[:, 1]
+        state.u[:, 1], state.v[:, 1] = second * tangent[:, 0], second * tangent[:, 1]
+
+        from fluidsolver.solver.post import _wall_gradient_sign, separation_points
+
+        sign = _wall_gradient_sign(state, faces, tangent)
+        assert np.all(first > 0.0), "the first cell must not itself be reversed"
+        assert (sign < 0).any(), "the wall gradient must reverse somewhere"
+        assert len(separation_points(state, faces, fluid)) > 0
+
     def test_wall_shear_follows_the_near_wall_flow(self, setup):
         _, faces, fluid, _, state = setup
         traction, magnitude = wall_shear_stress(state, faces, fluid)

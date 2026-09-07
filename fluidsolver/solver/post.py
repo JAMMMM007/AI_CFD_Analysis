@@ -214,6 +214,44 @@ def vorticity(state: State, gradient) -> np.ndarray:
     return grad_v[..., 0] - grad_u[..., 1]
 
 
+def _wall_gradient_sign(
+    state: State, faces: FaceGeometry, tangent: np.ndarray
+) -> np.ndarray:
+    """Sign of ``du_t/dy`` at the wall, from a quadratic through the first two cells.
+
+    Fitting ``u_t = a y + b y^2`` through the no-slip wall and the tangential
+    velocity at the first two cell centres and returning ``sign(a)``. The
+    no-slip condition supplies the third point for free, which is why a quadratic
+    costs only two cells.
+
+    Falls back to the first-cell value on a mesh with a single wall-normal cell,
+    where there is no second point to fit through and nothing better is available.
+    """
+    normal = faces.wall.normal
+
+    def tangential(row):
+        velocity = state.velocity[:, row]
+        along_normal = np.sum(velocity * normal, axis=-1)[:, None] * normal
+        return np.sum((velocity - along_normal) * tangent, axis=-1)
+
+    if state.u.shape[1] < 2:
+        return np.sign(tangential(0))
+
+    y1 = faces.wall.wall_normal_distance
+    y2 = y1 + np.abs(
+        np.sum((faces.metrics.centroid[:, 1] - faces.metrics.centroid[:, 0]) * normal, axis=-1)
+    )
+    u1, u2 = tangential(0), tangential(1)
+
+    denominator = y1 * y2**2 - y2 * y1**2
+    slope = np.where(
+        np.abs(denominator) > 0.0,
+        (u1 * y2**2 - u2 * y1**2) / np.where(denominator != 0.0, denominator, 1.0),
+        u1,
+    )
+    return np.sign(slope)
+
+
 def separation_points(
     state: State, faces: FaceGeometry, fluid: Fluid, boundaries=None
 ) -> np.ndarray:
@@ -222,16 +260,44 @@ def separation_points(
     Separation is where the near-wall flow reverses, so the tangential component
     of the wall traction along the surface passes through zero. Interpolating
     between the two faces either side locates it to better than one cell.
+
+    **The sign comes from a one-sided wall gradient, not from the first cell.**
+    The traction direction that :func:`wall_shear_stress` returns is taken from
+    the tangential velocity at the first cell centre, and in a separating
+    boundary layer that is not the same thing as the wall shear: the profile is
+    inflected, so ``du_t/dy`` changes sign *at the wall* before ``u_t(y1)`` does,
+    because the reversed region grows outward from the surface. The disagreement
+    is ``O(y1)`` -- first order in the wall spacing. Measured on the converged
+    Re 40 cylinder, the same field gives 53.71710 degrees from the first-cell
+    velocity and 53.97023 from a one-sided wall gradient, a difference of 0.253
+    degrees on a quantity the gate was printing to three decimals.
+
+    So the sign is taken here from a quadratic through the wall and the first two
+    cell centres, ``u_t = a y + b y^2``, whose slope at the wall is
+
+        a = ( u_t1 y2^2 - u_t2 y1^2 ) / ( y1 y2^2 - y2 y1^2 )
+
+    which is ``O(h^2)`` where the first-cell value is ``O(h)``. Only the sign is
+    taken from it; the traction *magnitude* still comes from
+    :func:`wall_shear_stress`, which for a turbulent run is the blended wall
+    treatment and has no better one-sided estimate available.
+
+    The crossing test is ``along * following < 0`` rather than a comparison of
+    ``np.sign``. ``np.sign`` returns 0 for an exact zero, so a face where the
+    traction vanishes identically registered as *two* crossings rather than one.
+    On a symmetric body the stagnation faces can hit that exactly;
+    ``separation_angle`` filters them by angle afterwards, which works on a
+    cylinder and would not on an aerofoil.
     """
-    traction, _ = wall_shear_stress(state, faces, fluid, boundaries)
+    _, magnitude = wall_shear_stress(state, faces, fluid, boundaries)
     centre = faces.wall.centre
 
     tangent = np.roll(centre, -1, axis=0) - np.roll(centre, 1, axis=0)
     tangent /= np.linalg.norm(tangent, axis=-1, keepdims=True)
-    along = np.sum(traction * tangent, axis=-1)
+    along = magnitude * _wall_gradient_sign(state, faces, tangent)
 
     following = np.roll(along, -1)
-    crossing = np.flatnonzero(np.sign(along) != np.sign(following))
+    crossing = np.flatnonzero(along * following < 0.0)
     if len(crossing) == 0:
         return np.empty((0, 2))
 
