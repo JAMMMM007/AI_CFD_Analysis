@@ -902,6 +902,69 @@ class TestRhieChowConsistency:
             f"which is {worst / scale:.4e} of the physical pressure term"
         )
 
+    @pytest.mark.parametrize("mesh", [lambda: uniform_mesh(96), aerofoil_mesh],
+                             ids=["near-orthogonal circle", "body-fitted aerofoil"])
+    def test_the_converged_flux_does_not_depend_on_the_velocity_relaxation(self, mesh):
+        """Regression. It did, linearly, and four docstrings said it could not.
+
+        ``momentum`` returns the *under-relaxed* diagonal, so the Rhie-Chow
+        mobility is ``D_f = alpha_u V / a_P`` and carries the relaxation factor
+        into a term that does not vanish at convergence. Choi's remedy retains the
+        previous damping,
+
+            X^m = -rho D_f (damping)^m + (1 - alpha_u) X^{m-1},
+
+        whose fixed point ``alpha_u X = -rho D_f (damping)`` has the ``alpha_u``
+        cancel, leaving the unrelaxed mobility ``V / a_P``.
+
+        This is the algebraic half of the criterion and it is deliberately not the
+        whole of it. A test built from the same belief as the code agrees with it
+        by construction, so the fixed point is *iterated* here rather than
+        asserted -- the state is held frozen and ``face_fluxes`` called until the
+        recursion settles, which is exactly the situation the derivation
+        describes and nothing more. The end-to-end half is a converged cylinder
+        swept over ``alpha_u`` at a residual of 1e-9, recorded in
+        :meth:`PressureVelocityCoupling.face_fluxes`; a unit test cannot stand in
+        for it because it cannot tell a fixed point that is independent of
+        ``alpha_u`` from one that is merely reached slowly.
+        """
+        from fluidsolver.solver.simple import Numerics, PressureVelocityCoupling
+
+        _, metrics, faces = mesh()
+        fluid = Fluid(density=1.0, viscosity=1.0e-3)
+        freestream = Freestream(velocity=1.0)
+
+        def settled(alpha_u):
+            boundaries = Boundaries(faces, fluid, freestream)
+            coupling = PressureVelocityCoupling(
+                faces, fluid, boundaries,
+                Numerics(relax_velocity=alpha_u), wall_model=False,
+            )
+            state = State.uniform(faces, fluid, freestream)
+            # A frozen, non-trivial pressure field: the recursion is the only
+            # thing allowed to move, so what it settles on is the fixed point of
+            # the flux definition and of nothing else.
+            state.pressure = np.sin(2.1 * metrics.centroid[..., 0]) * np.cos(
+                1.4 * metrics.centroid[..., 1]
+            )
+            # The relaxed diagonal, which is what ``momentum`` returns and the
+            # only route by which ``alpha_u`` reaches the flux: ``a_P / alpha_u``
+            # with the same unrelaxed ``a_P`` in both runs. Passing a diagonal
+            # that does not scale with the relaxation would make the test pass
+            # for the wrong reason -- and would also make it fail for the wrong
+            # reason, since the retention is built to cancel exactly this scaling.
+            diagonal = (1.0 + np.abs(metrics.centroid[..., 0])) / alpha_u
+            for _ in range(400):
+                flux_i, flux_j, _, _ = coupling.face_fluxes(state, diagonal)
+            return flux_i, flux_j
+
+        slow_i, slow_j = settled(0.4)
+        fast_i, fast_j = settled(0.9)
+
+        scale = max(np.abs(fast_i).max(), np.abs(fast_j).max())
+        assert np.abs(slow_i - fast_i).max() < 1e-10 * scale
+        assert np.abs(slow_j - fast_j).max() < 1e-10 * scale
+
     def test_the_aerofoil_mesh_is_actually_non_orthogonal(self):
         """The test above is only evidence if its mesh can carry the defect.
 

@@ -22,13 +22,27 @@ that alternates cell to cell, so nothing in the discrete system penalises a
 checkerboard pressure field, and one duly appears. Rhie-Chow builds the face flux
 from a *compact* two-cell pressure difference instead of the interpolated
 gradient. The difference between the two acts as a third-derivative damping that
-vanishes with mesh refinement but couples adjacent cells directly.
+vanishes with mesh refinement but couples adjacent cells directly. Both
+differences -- the compact one and the interpolated one -- have to be taken along
+the same direction, or the term does not vanish where it is supposed to; see
+:meth:`PressureVelocityCoupling.face_fluxes`.
 
 **Implicit under-relaxation.** The pressure correction derived here is not exact:
 it neglects the effect of neighbouring velocity corrections. Taking it at face
 value diverges. Relaxing it, along with the momentum solutions, is what makes the
-iteration contract -- and because the relaxation is applied in Patankar's implicit
-form, it changes only the path taken, never the converged answer.
+iteration contract.
+
+This file used to end that sentence with "and because the relaxation is applied
+in Patankar's implicit form, it changes only the path taken, never the converged
+answer". Three other docstrings said the same. It was not true of
+``relax_velocity``, and the argument for it was correct about the wrong thing:
+Patankar's cancellation applies to the solution of the *momentum equation*, but
+the relaxed diagonal then leaves that equation and builds the Rhie-Chow mobility
+``D_f = alpha_u V / a_P``, and the damping term it multiplies does not vanish at
+the fixed point. The damping is now carried between iterations so that the
+relaxation cancels out of the fixed point by construction; the measurement, and
+the ``alpha_p`` control that identifies the mechanism, are in
+:meth:`PressureVelocityCoupling.face_fluxes`.
 """
 
 from __future__ import annotations
@@ -184,9 +198,15 @@ class CflRamp:
     and grows geometrically while the residual keeps falling. If the residual
     turns and climbs, the step was too big and is halved.
 
-    Nothing here changes the converged answer. Every CFL only scales a term that
-    vanishes at convergence, so the ramp changes the path taken and cannot move
-    the fixed point.
+    Nothing here changes the converged answer, and unlike the velocity relaxation
+    that claim survives inspection: every CFL only scales the pseudo-time
+    diagonal, which is added as ``a_P += rho V / dtau`` with a matching source and
+    cancels identically once the field stops moving. It does not leak into the
+    Rhie-Chow mobility the way ``relax_velocity`` did, because
+    :meth:`PressureVelocityCoupling.momentum` adds the pseudo-time term before the
+    relaxation and both end up in the same returned diagonal -- which
+    :meth:`face_fluxes` now carries between iterations precisely so that neither
+    can reach the fixed point.
     """
 
     def __init__(self, numerics: Numerics):
@@ -439,6 +459,76 @@ class PressureVelocityCoupling:
         -- one dot product with ``delta`` in place of one with the area vector,
         and ``cross`` is not needed at all.
 
+        **The damping is carried between iterations, so that the converged answer
+        does not depend on `relax_velocity`.** ``momentum`` returns the
+        *under-relaxed* diagonal ``a_P / alpha_u`` -- it has to, because that is
+        what the matrix contains and what the velocity correction must divide by
+        -- so the mobility here is ``D_f = alpha_u V / a_P`` and is proportional
+        to the relaxation factor. The damping term does not vanish at
+        convergence: it is part of the definition of the converged face flux and
+        is what suppresses the checkerboard. So ``alpha_u`` was entering the fixed
+        point, and four docstrings in this project asserted that it could not.
+
+        Choi's remedy is to retain the previous iteration's damping explicitly,
+
+            X^m = -rho D_f (damping)^m + (1 - alpha_u) X^{m-1},
+            F^m = rho u_f^m . S + X^m,
+
+        with ``X`` stored on the state. At a fixed point ``X = X^{m-1}``, so
+
+            alpha_u X = -rho D_f (damping) = -alpha_u rho (V / a_P) (damping),
+
+        and the ``alpha_u`` cancels exactly: the converged flux is built from the
+        *unrelaxed* mobility ``V / a_P``, whatever relaxation the path was taken
+        at. Note that ``alpha_p`` never needed this. It appears only in
+        ``pressure += relax_pressure * correction`` and ``p' -> 0`` at
+        convergence, so it genuinely cannot move the answer -- and that asymmetry
+        is the signature that identifies the mechanism rather than a convergence
+        floor.
+
+        Building the mobility from the unrelaxed diagonal instead is one line and
+        removes the leading dependence, but not the part hidden inside ``u_f``
+        itself, and Stage 4 needs this same machinery to make Rhie-Chow
+        independent of the time step. Doing it once is cheaper than doing it
+        twice.
+
+        **Measured, with the control that identifies the mechanism.** Cylinder at
+        Re 40, ``scheme="linear"``, every run converged to ``tolerance = 1e-9`` --
+        two orders below the gate, so that a dependence cannot be mistaken for a
+        stopping artefact. Same binary throughout: "without" zeroes the carried
+        damping before each call, which reproduces the previous behaviour exactly.
+
+                                    without          with
+            alpha_u 0.70        1.514229041     1.514085081
+            alpha_u 0.55        1.514320440     1.514085965
+            alpha_u 0.40        1.514432805     1.514085910
+            spread               2.038e-04       8.83e-07
+
+            alpha_p 0.15        1.514228454     1.514084390
+            alpha_p 0.30        1.514229041     1.514085081
+            alpha_p 0.45        1.514229618     1.514085615
+            spread               1.164e-06       1.225e-06
+
+        Read the two columns against each other and the argument is complete. The
+        ``alpha_p`` family is the control: ``alpha_p`` appears only in
+        ``pressure += relax_pressure * correction`` and ``p' -> 0`` at the fixed
+        point, so it cannot move the answer, and it does not -- its spread is the
+        convergence floor at about 1.2e-06 and is the same before and after. The
+        ``alpha_u`` family spans 2.04e-04 before, 173 times that floor, and
+        8.83e-07 after, which is *at* the floor and not below it. A remedy that
+        drove it to zero would be reporting something other than a measurement at
+        a finite residual.
+
+        The iteration counts are unchanged -- 1362, 2415 and 4215 for the three
+        ``alpha_u`` values, identical in both columns -- so the retention costs
+        nothing in convergence rate.
+
+        The converged ``Cd`` itself moves by -1.44e-04, from 1.514229 to
+        1.514085, because the fixed point now uses the unrelaxed mobility
+        ``V / a_P`` where it used ``0.7 V / a_P``. The gate's printed fourth
+        decimal moves with it, from 1.5142 to 1.5141. That digit was never a
+        property of the discretisation.
+
         **The pressure-correction operator is deliberately *not* changed to
         match.** It stays orthogonal-only, in :meth:`pressure_correction` and in
         :meth:`apply_correction` alike, which are the two that must agree with
@@ -473,9 +563,14 @@ class PressureVelocityCoupling:
             (state.pressure - np.roll(state.pressure, 1, axis=0))
             - np.sum(grad_face_i * self.faces.i_faces.delta, axis=-1)
         )
-        flux_i = self.fluid.density * (
-            np.sum(interpolated * self.faces.metrics.face_i_area, axis=-1)
-            - d_i * damping_i
+        retained = 1.0 - self.numerics.relax_velocity
+        damping_flux_i = (
+            -self.fluid.density * d_i * damping_i + retained * state.damping_i
+        )
+        flux_i = (
+            self.fluid.density
+            * np.sum(interpolated * self.faces.metrics.face_i_area, axis=-1)
+            + damping_flux_i
         )
 
         # --- j faces (interior only; boundaries handled below) ---
@@ -486,10 +581,21 @@ class PressureVelocityCoupling:
             (state.pressure[:, 1:] - state.pressure[:, :-1])
             - np.sum(grad_face_j * self.faces.j_faces.delta, axis=-1)
         )
-        interior_j = self.fluid.density * (
-            np.sum(interpolated_j * self.faces.metrics.face_j_area[:, 1:-1], axis=-1)
-            - d_j * damping_j
+        damping_flux_j = (
+            -self.fluid.density * d_j * damping_j + retained * state.damping_j
         )
+        interior_j = (
+            self.fluid.density
+            * np.sum(interpolated_j * self.faces.metrics.face_j_area[:, 1:-1], axis=-1)
+            + damping_flux_j
+        )
+
+        # The recursion advances once per call, which is once per outer
+        # iteration. Anything calling this twice for the same iteration would
+        # take two steps of it and get a different -- though equally convergent --
+        # path; nothing does.
+        state.damping_i = damping_flux_i
+        state.damping_j = damping_flux_j
 
         # Wall: impermeable. Far field: whatever the boundary velocity carries,
         # rescaled so the domain neither gains nor loses mass overall.

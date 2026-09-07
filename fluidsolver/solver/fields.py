@@ -20,6 +20,14 @@ class State:
     rather than derived quantities: SIMPLE corrects them directly, and
     reconstructing them from the cell velocities each iteration would discard the
     Rhie-Chow term that keeps pressure and velocity coupled.
+
+    ``damping_i`` and ``damping_j`` hold the Rhie-Chow contribution to each face
+    flux from the *previous* outer iteration -- that is, the part of ``F`` that is
+    not ``rho u_f . S``. They are carried for the same reason the fluxes
+    themselves are: without them the converged answer depends on
+    ``relax_velocity``, because the mobility ``D_f = alpha_u V / a_P`` is built
+    from the under-relaxed momentum diagonal and the damping term does not vanish
+    at the fixed point. See :meth:`PressureVelocityCoupling.face_fluxes`.
     """
 
     u: np.ndarray
@@ -30,6 +38,20 @@ class State:
     eddy_viscosity: np.ndarray
     flux_i: np.ndarray
     flux_j: np.ndarray
+    #: Optional so that a state can still be built from the six physical fields
+    #: and its fluxes alone; filled with zeros on first use, which starts the
+    #: recursion at the un-corrected Rhie-Chow term and is what the first
+    #: iteration of a cold start should do anyway.
+    damping_i: np.ndarray | None = None
+    damping_j: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.damping_i is None:
+            self.damping_i = np.zeros_like(self.flux_i)
+        if self.damping_j is None:
+            self.damping_j = np.zeros(
+                (self.flux_i.shape[0], max(self.flux_i.shape[1] - 1, 0))
+            )
 
     @classmethod
     def uniform(
@@ -99,6 +121,7 @@ class State:
     #: measuring it cannot drift apart from each other.
     ARRAYS = (
         "u", "v", "pressure", "k", "omega", "eddy_viscosity", "flux_i", "flux_j",
+        "damping_i", "damping_j",
     )
 
     def copy(self) -> "State":
@@ -124,6 +147,7 @@ class Residuals:
     each equation was solved with the *current* pressure, but SIMPLE guarantees
     that anyway; it is the mass imbalance that says whether pressure and velocity
     have actually agreed with each other.
+
     """
 
     iteration: int
