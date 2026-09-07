@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import scipy.sparse.linalg as spla
 
+from fluidsolver.geometry.naca import naca4
 from fluidsolver.geometry.primitives import circle
 from fluidsolver.mesh.metrics import compute_metrics
 from fluidsolver.mesh.ogrid import build_ogrid
@@ -86,6 +87,31 @@ def uniform_mesh(surface_points: int, outer: float = 3.0):
         first_layer=radial / (surface_points // 3),
         far_field_radius=outer,
         growth=1.0,
+    )
+    metrics = compute_metrics(grid.nodes)
+    return grid, metrics, build_faces(metrics)
+
+
+def aerofoil_mesh(surface_points: int = 160, first_layer: float = 5.0e-5):
+    """A body-fitted mesh with the non-orthogonality the solver actually meets.
+
+    ``uniform_mesh`` is a circle in a circular far field, and a circle meshes at
+    exactly 0.0000 degrees of non-orthogonality, mean and peak -- measured. That
+    makes it the right mesh for isolating a scheme's interior order and the wrong
+    one for anything whose error term is proportional to the non-orthogonal
+    remainder ``T = S - g d``, because ``T`` is identically zero there.
+
+    This mesh is a NACA 0012 through the same ``build_ogrid`` the solver uses, so
+    the marched-to-analytic seam and the polar blend are both present. Measured:
+    non-orthogonality mean 4.05 degrees and peak 61.01, marched 49 layers of 80,
+    against the primary NACA 2412 use case's mean 3.9 and peak 60.1. It is a
+    small mesh -- 160x80, built in 0.23 s -- but it is the same *kind* of mesh,
+    which is the property that matters here.
+    """
+    grid = build_ogrid(
+        naca4("0012", 400).resample(surface_points, min_spacing=first_layer),
+        first_layer=first_layer,
+        far_field_radius=20.0,
     )
     metrics = compute_metrics(grid.nodes)
     return grid, metrics, build_faces(metrics)
@@ -534,6 +560,158 @@ class TestBoundaries:
         flux = flux * np.where(flux > 0, 1.6, 1.0)  # break the balance
         balanced = boundaries.enforce_global_mass_balance(flux)
         assert abs(balanced.sum()) < 1e-10 * np.abs(balanced).sum()
+
+
+class TestRhieChowConsistency:
+    """That the pressure-velocity damping vanishes when it is supposed to.
+
+    Rhie-Chow adds the difference between a compact two-cell pressure gradient
+    and a smoothly interpolated one. The whole justification for adding it is
+    that the difference is a *third* derivative -- it suppresses a checkerboard
+    and disappears under refinement without biasing the answer. A term that does
+    not vanish for a field with no third derivative is not that term.
+
+    So the test is an identity rather than an order of accuracy. Writing the
+    face area as ``S = g d + T`` with ``d`` the centroid-to-centroid vector, and
+    taking any exactly linear ``p = G . x``:
+
+        p_N - p_P = G . d,   (grad p)_f = G,
+
+        damping / D_f = g (G . d) + G . T - G . (g d + T) = 0
+
+    identically, on any mesh, for any ``G``. There is no discretisation error to
+    allow for and the tolerance is machine precision.
+
+    This is the one measurement that catches an inconsistent compact operator,
+    and no manufactured solution in this file can: they exercise the assembled
+    convection and diffusion operator against a *prescribed* flux field, while
+    the defect lives in the code that builds the flux.
+    """
+
+    @staticmethod
+    def _damping(faces, metrics, gradient_of_p):
+        """The flux ``face_fluxes`` produces for a linear ``p`` and zero velocity.
+
+        Run through the real :meth:`PressureVelocityCoupling.face_fluxes` rather
+        than a re-derivation of it, because a test that reimplements the code it
+        is testing agrees with it by construction. With the velocity at rest the
+        convective part of the flux is exactly zero, so whatever comes back *is*
+        the damping.
+        """
+        from fluidsolver.solver.simple import Numerics, PressureVelocityCoupling
+
+        fluid = Fluid(density=1.0, viscosity=1.0e-3)
+        freestream = Freestream(velocity=1.0)
+        boundaries = Boundaries(faces, fluid, freestream)
+        coupling = PressureVelocityCoupling(
+            faces, fluid, boundaries, Numerics(), wall_model=False
+        )
+
+        state = State.uniform(faces, fluid, freestream)
+        state.u[:] = 0.0
+        state.v[:] = 0.0
+        state.flux_i[:] = 0.0
+        state.flux_j[:] = 0.0
+        state.pressure = metrics.centroid @ gradient_of_p
+
+        # Any strictly positive diagonal is a legitimate momentum diagonal here;
+        # it scales the damping and cannot create or remove it.
+        flux_i, flux_j, _, _ = coupling.face_fluxes(state, np.ones(faces.shape))
+        return flux_i, flux_j
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="the compact operator omits the non-orthogonal cross term; "
+        "fixed in the commit that makes this pass",
+    )
+    @pytest.mark.parametrize(
+        "mesh",
+        [lambda: uniform_mesh(96), aerofoil_mesh],
+        ids=["near-orthogonal circle", "body-fitted aerofoil"],
+    )
+    def test_a_linear_pressure_field_produces_no_damping(self, mesh):
+        """Fails on both meshes until the compact operator carries the cross term.
+
+        Regression for the missing non-orthogonal correction. As it stands, for a
+        linear field the coded ``compact - smooth`` evaluates to
+        ``-(grad p)_f . T`` rather than to zero -- verified to 8e-14 against that
+        closed form on both of these meshes -- so the damping is proportional to
+        the non-orthogonal remainder ``T`` and is spurious in its entirety.
+
+        Measured, as the worst interior face flux against the largest
+        ``V |(grad p)_f . S|`` on the same mesh:
+
+            circle 96x32   2.7771e-07     max |T|/|S| 5.8769e-07
+            aerofoil       2.5502e-02     max |T|/|S| 1.8046e+00
+
+        Five orders apart, and each tracks its mesh's own ``|T|/|S|`` to within a
+        factor of two, which is the closed form above and not a coincidence.
+        Note that the circle fails too: ``build_ogrid`` marches even a circular
+        body, and the result is orthogonal to about 6e-7 rather than to rounding.
+        The defect is one mechanism at two magnitudes, not two different things.
+
+        The tolerance is machine precision because the statement being tested is
+        an algebraic identity with no discretisation error in it. It is not sized
+        from healthy behaviour -- there is no band here, only zero.
+
+        Both boundary rows are excluded, and not to make the test pass. The
+        gradient there is built from the boundary values ``face_fluxes`` chooses
+        for its own purposes -- zero-gradient at the wall, and zero on outflow
+        faces -- neither of which is the exact value of a manufactured linear
+        field, so ``(grad p)_f`` is not exact in those rows and the identity does
+        not apply to them. Measured: the gradient is exact to 5.6e-15 in every
+        other row and wrong by 0.90 and 69.8 in the two excluded ones. The
+        existing manufactured solutions exclude the same two rows for the same
+        reason.
+        """
+        _, metrics, faces = mesh()
+        gradient_of_p = np.array([1.7, -0.9])
+
+        flux_i, flux_j = self._damping(faces, metrics, gradient_of_p)
+
+        # The physical term the damping is derived from, carrying the same
+        # mobility (here the cell volume, since the diagonal was set to one).
+        volume = metrics.volume
+        scale = max(
+            (np.abs(np.sum(gradient_of_p * metrics.face_i_area, axis=-1)) * volume).max(),
+            (
+                np.abs(np.sum(gradient_of_p * metrics.face_j_area[:, 1:-1], axis=-1))
+                * volume[:, 1:]
+            ).max(),
+        )
+        worst = max(np.abs(flux_i[:, 1:-1]).max(), np.abs(flux_j[:, 2:-2]).max())
+        assert worst < 1e-12 * scale, (
+            f"a linear pressure field leaves a spurious flux of {worst:.4e}, "
+            f"which is {worst / scale:.4e} of the physical pressure term"
+        )
+
+    def test_the_aerofoil_mesh_is_actually_non_orthogonal(self):
+        """The test above is only evidence if its mesh can carry the defect.
+
+        A guard on the guard: if ``aerofoil_mesh`` ever came back orthogonal --
+        through a mesher change, or a resample that happened to land on a smooth
+        distribution -- the test above would pass while measuring nothing, which
+        is exactly how the cylinder gate has been blind to this for the whole
+        life of the project.
+        """
+        _, _, faces = aerofoil_mesh()
+        angles = []
+        for family in (faces.i_faces, faces.j_faces):
+            unit_area = family.area / np.linalg.norm(
+                family.area, axis=-1, keepdims=True
+            )
+            unit_delta = family.delta / np.linalg.norm(
+                family.delta, axis=-1, keepdims=True
+            )
+            angles.append(
+                np.degrees(
+                    np.arccos(
+                        np.clip(np.abs(np.sum(unit_area * unit_delta, axis=-1)), 0.0, 1.0)
+                    )
+                )
+            )
+        assert max(a.max() for a in angles) > 30.0
+        assert np.mean([a.mean() for a in angles]) > 1.0
 
 
 class TestPressureCorrection:
