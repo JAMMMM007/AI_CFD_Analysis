@@ -227,7 +227,7 @@ the sign of `u . n`, whether it fixes velocity or pressure.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-290 tests, about 220 seconds. The centrepiece is a method-of-manufactured-
+309 tests, about 430 seconds. The centrepiece is a method-of-manufactured-
 solutions check on the discrete operators, which measures their *order of
 accuracy* rather than their error: diffusion and the high-order convection
 schemes come out second order, upwind first, which is what each is by

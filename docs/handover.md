@@ -61,7 +61,7 @@ The virtual environment lives at the repository root, outside any worktree:
 .venv/Scripts/python.exe -m pytest -q
 ```
 
-290 tests, about 220 seconds. The GUI needs a real graphical session:
+309 tests, about 430 seconds. The GUI needs a real graphical session:
 
 ```bash
 .venv/Scripts/python.exe -m fluidsolver
@@ -110,7 +110,7 @@ fluidsolver/
     post.py         forces, surface data, separation
     turbulence/     laminar, SST 2003
   gui/        Qt front end; five pages, background solve thread
-tests/        290 tests
+tests/        309 tests
 validation/   cylinder.py -- the regression gate
 docs/         this file, hardening-plan.md, compressible.md, optional-deps.md
 ```

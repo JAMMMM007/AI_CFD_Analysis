@@ -22,12 +22,13 @@ of the record is to stop the same ground being covered twice.
 | 7 | Verification, validation and speed | **part done** — GCI machinery and a second gate exist; TMR cases remain |
 | 8 | Response to the 2026-09-07 physics audit | **in progress** — see `docs/audit-response-plan.md` |
 
-Regression gate: cylinder at Re 40 gives Cd 1.5141, wake 2.1219 D, separation
-53.718 degrees, Cl -0.00000, residual 9.95e-08. The fourth decimal of `Cd` moved
-from 1.5142 deliberately, and the reason is recorded with the change that moved
-it; it is the first thing to check after any change, but it is now checked
-alongside `validation/aerofoil.py`, which can see seven findings the cylinder
-structurally cannot.
+309 tests. Regression gate: cylinder at Re 40 gives Cd 1.5160, wake 2.1219 D,
+separation 53.718 degrees, Cl -0.00000, residual 9.98e-08. `Cd` moved from 1.5142
+by two deliberate changes -- the wall-pressure reconstruction (+1.955e-03) and the
+Rhie-Chow mobility (-2.738e-04) -- each measured on its own and recorded with the
+commit that made it. It is the first thing to check after any change, and it is now
+checked alongside `validation/aerofoil.py`, which can see seven findings the
+cylinder structurally cannot.
 
 **The open defect that headed this list has been withdrawn.** Stage 2's
 divergence monitor was recorded here, in `README.md` and in `docs/handover.md` as
