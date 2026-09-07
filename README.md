@@ -60,7 +60,7 @@ On the solve page the field plot is the whole point, so it gets the room:
 |---|---|
 | Geometry: NACA 4-digit, circle, square, DXF import | working, tested |
 | Body-fitted O-grid mesher | working, tested |
-| Finite-volume discretisation | working, second order (verified by manufactured solution) |
+| Finite-volume discretisation | working; the operators are second order on orthogonal, stretched and non-orthogonal meshes (manufactured solution). The *solved* order of `Cd` on the cylinder is 1.26 -- see below |
 | Laminar Navier-Stokes | **validated** against published cylinder benchmarks |
 | k-omega SST | converges to 2.8e-05, but **the divergence monitor aborts it on factory defaults** -- see below |
 | Qt front end | working, tested |
@@ -160,6 +160,34 @@ Lift comes out identically zero, as symmetry requires. The Re = 40 drag splits a
 0.993 pressure and 0.522 friction, against a published split of roughly 0.99 and
 0.53.
 
+**Read those figures with the discretisation uncertainty in mind, which the table
+does not yet carry.** The 2026-09-07 physics audit ran the first grid-convergence
+study this project has had, on three systematically refined cylinder meshes, and
+measured the observed order of `Cd` at **1.261** with a Richardson limit of
+1.515358 -- so the reported 1.5142 sits about 0.08% below the solver's own
+continuum answer. The wake length has not converged at all: observed order 0.735,
+limit 2.200. The reported 2.1219 agrees with Coutanceau and Bouard's measured
+2.13 because the mesh is coarse, and the solver's own grid-converged answer sits
+with the computations at 2.20. That is a coincidence being read as agreement.
+
+`validation/convergence.py` now computes observed order, Richardson limit and the
+ASME (Celik et al. 2008) GCI from a mesh family, so those numbers can be produced
+rather than quoted:
+
+```
+.\.venv\Scripts\python.exe -m validation.convergence
+```
+
+The order is measured, never assumed: a GCI computed at the formal order of 2
+rather than the observed 1.26 comes out 1.87 times narrower, and reporting the
+narrower one is not the conservative choice.
+
+`validation/aerofoil.py` is a second gate -- a NACA 2412 at 5 degrees with SST.
+It is **not** a validation case and certifies nothing; its job is to notice
+change. The cylinder cannot do that job alone, because its mesh is orthogonal to
+0.0000 degrees and it carries no circulation, which makes it structurally blind
+to any error proportional to either.
+
 ## How it works
 
 **Geometry** (`fluidsolver/geometry/`) produces a closed, validated contour from
@@ -203,12 +231,21 @@ the sign of `u . n`, whether it fixes velocity or pressure.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-188 tests. The centrepiece is a method-of-manufactured-solutions check on the
-discrete operators, which measures their *order of accuracy* rather than their
-error: diffusion and the high-order convection schemes come out second order,
-upwind first, which is what each is by construction. A scheme that is second
-order on paper and first order in practice has a bug, and this is the only test
-that says so.
+290 tests, about 220 seconds. The centrepiece is a method-of-manufactured-
+solutions check on the discrete operators, which measures their *order of
+accuracy* rather than their error: diffusion and the high-order convection
+schemes come out second order, upwind first, which is what each is by
+construction. A scheme that is second order on paper and first order in practice
+has a bug, and this is the only test that says so.
+
+It now runs on three mesh families rather than one. The original is an
+orthogonal, unstretched circle -- non-orthogonality 0.0000 degrees mean and peak,
+aspect ratio 2.5 -- which is not the kind of mesh the solver runs on. A stretched
+family and an analytically sheared one (36.5 degrees of non-orthogonality, held
+constant under refinement) were added, and the interior order survives both:
+1.87 to 1.94 across diffusion, convection and the two together. The boundary rows
+are now measured rather than excluded, and they are *zeroth* order, not the first
+order previously claimed -- see `tests/test_solver.py`.
 
 Many tests are regressions for specific defects found during development, and
 each records which. Those are worth reading -- they are the parts of a CFD code
