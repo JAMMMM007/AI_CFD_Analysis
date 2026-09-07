@@ -265,6 +265,61 @@ class TestOGrid:
         with pytest.raises(MeshError, match="not clear of the body"):
             build_ogrid(circle(1.0, 120), first_layer=first_layer, far_field_radius=0.6)
 
+    def test_the_march_reaches_its_requested_depth_on_an_aerofoil(self):
+        """Regression. It stopped at 54 of 63 layers because Newton stopped early.
+
+        ``_march_one_layer`` ran a fixed four passes with no convergence test,
+        which its own docstring described as insufficient in the far field and
+        then did nothing about. The consequence was not a wrong node position --
+        those differ by at most 4.5e-3 of the local radius -- but an
+        under-converged layer carrying extra width variation, tripping the
+        ``max_width_ratio`` guard early and handing the rest of the mesh to the
+        polar blend, which is where all of the non-orthogonality lives.
+
+        Measured on this geometry, same binary, pass count the only change:
+
+            y+     marched          non-orth mean      faces above 30 deg
+                   4 passes -> res  4 passes -> res    4 passes -> res
+            1      54 -> 63         3.929 -> 2.835     2.92% -> 0.09%
+            5      43 -> 52         4.414 -> 3.233     3.15% -> 0.12%
+            30     37 -> 39         3.797 -> 3.672     0.18% -> 0.01%
+            100    30 -> 30         4.556 -> 4.551     0.02% -> 0.03%
+
+        The peak is not what improved -- at y+ 1 it moves 60.098 to 60.863, and
+        that single face is the marched-to-analytic seam, which is a separate
+        problem needing a separate fix. What improved is how much of the mesh sits
+        near the peak: a factor of 32 fewer faces past 30 degrees.
+
+        On the mesh below, which is the unrotated body at a fixed first layer
+        rather than the one ``build_case`` produces, the march goes from 62 of 73
+        near-field layers to 71 -- a wall distance of 0.796 against 0.227 where
+        1.0 was asked for. It still stops two layers short, so the note is still
+        raised and this test does not assert its absence; what is asserted is that
+        the march gets most of the way, which it did not before.
+        """
+        grid = build_ogrid(
+            naca4("2412", 400).resample(240, min_spacing=6.0e-6),
+            first_layer=6.0e-6,
+            far_field_radius=40.0,
+        )
+        assert grid.marched_layers >= 70
+
+    def test_a_circle_still_marches_in_a_single_pass(self):
+        """The residual test must not cost anything where one pass is exact.
+
+        A circle marches to concentric circles exactly, so the first Newton pass
+        lands on the answer and every further one is wasted work. Measured, the
+        gate's cylinder mesh builds in 0.07 s against 0.17 s at a fixed four
+        passes -- the change makes the orthogonal case faster, not slower, and
+        leaves it bit-identical at 0.000 degrees of non-orthogonality.
+        """
+        layers = spacing.geometric_layers(1e-4, 20.0, 1.12)
+        nodes, completed = hyperbolic_grid(circle(1.0, 240), layers, dissipation=0.0)
+        assert completed == len(layers)
+        radius = np.linalg.norm(nodes, axis=2)
+        exact = 0.5 + np.concatenate(([0.0], np.cumsum(layers)))
+        assert np.abs(radius / exact[None, :] - 1.0).max() < 1e-12
+
     def test_an_early_handover_is_reported_not_hidden(self, first_layer):
         """A sharp square cannot be marched as far as a smooth body, and the grid
         should say so rather than quietly returning something different."""

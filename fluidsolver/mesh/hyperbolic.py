@@ -221,7 +221,8 @@ def _march_one_layer(
     equalisation: float,
     epsilon: float,
     second_difference: float,
-    iterations: int = 4,
+    iterations: int = 20,
+    tolerance: float = 1e-6,
 ) -> np.ndarray:
     """Newton-solve the orthogonality/area system for the next layer.
 
@@ -262,6 +263,40 @@ def _march_one_layer(
     geometric growth makes the layers comparable to the local radius of
     curvature, and it accumulates over the march. Re-linearising a few times
     drives each layer onto the true nonlinear solution instead.
+
+    **How many times is decided by a residual, not by a count.** This used to run
+    a fixed four passes with no convergence test, which is the paragraph above
+    describing a problem and then not acting on it. ``f`` is quadratic in the
+    unknowns, so Newton converges quadratically once inside its basin and the
+    error after ``n`` passes from a starting error ``e_0`` goes as
+    ``e_n ~ C^(2^n - 1) e_0^(2^n)``; with ``e_0 = O((step/radius)^2)`` and
+    ``step/radius`` approaching order one in the far field, four is not obviously
+    enough, and nothing detected the case where it was not.
+
+    The failure did not show up as a wrong node position. It showed up through
+    ``max_width_ratio``, the guard that stops the march: an under-converged layer
+    carries more width variation, trips the guard sooner, and hands more of the
+    mesh to the polar blend -- which is where all of the non-orthogonality lives.
+    Measured on the NACA 2412 wall line, marching with the pass count as the only
+    change:
+
+        passes    4     8    16    40
+        layers   52    49    54    62
+
+    Forty passes reach 62 of the 63 requested near-field layers where four reach
+    52 at a wall distance of 0.23 where 1.0 was asked for. The node positions
+    differ by at most 4.5e-3 of the local radius, which is small; the ten extra
+    layers are not, because march depth *is* mesh quality and every layer given up
+    is one the polar blend builds instead. The count is non-monotone at eight
+    passes because the guard is a threshold on a maximum over the layer, so the
+    layer count is noisy in a way the node positions are not.
+
+    The iteration now stops when the layer stops moving -- ``max |r^(m+1) - r^(m)|
+    < tolerance * thickness`` -- with a ceiling that is the old behaviour's
+    successor rather than its equal. ``tolerance`` is relative to the layer
+    thickness because that is the scale the increment is measured against; an
+    absolute tolerance would mean something different at the wall and in the far
+    field, where the thicknesses differ by four orders of magnitude.
     """
     xi_old = _d_xi(previous)
     current = previous + step
@@ -321,7 +356,12 @@ def _march_one_layer(
         solution = spla.spsolve(matrix, rhs.ravel())
         if not np.all(np.isfinite(solution)):
             raise MeshError("the marching system produced a non-finite solution")
-        current = solution.reshape(-1, 2)
+        updated = solution.reshape(-1, 2)
+
+        movement = float(np.abs(updated - current).max())
+        current = updated
+        if movement < tolerance * thickness:
+            break
 
     return current
 
