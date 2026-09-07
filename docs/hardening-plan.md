@@ -18,16 +18,27 @@ of the record is to stop the same ground being covered twice.
 | 3 | A wall treatment that works above y+ 1 | **done** — validated range measured, see below |
 | 4 | URANS and vortex shedding | not started |
 | 5 | Turbulence and transition models | not started |
-| 6 | Meshing | **part done** — spacing constraint merged (#5); seam, wake and C-grid remain |
-| 7 | Verification, validation and speed | not started |
+| 6 | Meshing | **part done** — spacing constraint (#5) and the marching Newton; seam, wake and C-grid remain |
+| 7 | Verification, validation and speed | **part done** — GCI machinery and a second gate exist; TMR cases remain |
+| 8 | Response to the 2026-09-07 physics audit | **in progress** — see `docs/audit-response-plan.md` |
 
-252 tests. Regression gate: cylinder at Re 40 gives Cd 1.5142, wake 2.12 D,
-separation 53.717 degrees, Cl -0.00000, residual 9.96e-08 — unchanged through
-every stage so far, and the first thing to check after any change.
+Regression gate: cylinder at Re 40 gives Cd 1.5141, wake 2.1219 D, separation
+53.718 degrees, Cl -0.00000, residual 9.95e-08. The fourth decimal of `Cd` moved
+from 1.5142 deliberately, and the reason is recorded with the change that moved
+it; it is the first thing to check after any change, but it is now checked
+alongside `validation/aerofoil.py`, which can see seven findings the cylinder
+structurally cannot.
 
-**Open defect, ahead of all of the above:** Stage 2's divergence monitor stops a
-NACA 0012 at Re 2e6 with SST at iteration 367 on a case that recovers completely
-if allowed to run. It blocks the primary use case. Details under Remaining.
+**The open defect that headed this list has been withdrawn.** Stage 2's
+divergence monitor was recorded here, in `README.md` and in `docs/handover.md` as
+stopping a NACA 0012 at Re 2e6 with SST at iteration 367, blocking the primary use
+case, and as the first thing to fix. It does not reproduce. The physics audit
+could not reproduce it on `main` at 37fabd2, and a direct run of that case here
+converged to 9.85e-07 at iteration 479 on factory defaults with the monitor armed.
+The monitor is left alone until a real false positive appears. What the same case
+*did* have -- a residual plateau near 4e-05 that never reached tolerance -- was
+real, and it is gone: its cause was the missing non-orthogonal term in the
+pressure correction. See Stage 8.
 
 ---
 
@@ -256,41 +267,149 @@ Note for anyone comparing against sources: Esch and Menter (IGTC 2003) list
 Kuntz and Langtry (2003) state 5/9 and 0.44. This code follows the latter. Same
 author, same year, 0.4% apart; the mismatch is deliberate.
 
+### Stage 8 — the response to the 2026-09-07 physics audit
+
+The audit is `docs/physics-audit-2026-09-07.md`; the order of attack and the
+argument for it are in `docs/audit-response-plan.md`. What follows is what has
+landed and what it measured. Three of its findings were re-derived independently
+before anything was implemented, and all three reproduced exactly.
+
+**The instruments came first, because four of the seventeen findings are
+invisible to every measurement the project owned.** F4, F13 and F14 are
+identically zero on an orthogonal mesh and F2's vortex term is identically zero
+on a non-lifting body; the cylinder gate is both, and so are the
+manufactured-solution meshes. Four instruments were built and none of them moves
+a number:
+
+- a linear-pressure-field identity for the Rhie-Chow flux, which is exact rather
+  than asymptotic and needs no solve;
+- the manufactured solution on a stretched family and on an analytically sheared
+  one holding 36.5 degrees of non-orthogonality constant under refinement, plus a
+  separate measurement of the boundary rows;
+- `validation/aerofoil.py`, a NACA 2412 at 5 degrees with SST, whose job is to
+  detect change rather than to certify accuracy;
+- `validation/convergence.py`, Celik's GCI with the observed order and the cell
+  size both measured rather than assumed.
+
+**Two things the instruments found that the audit did not.**
+
+The boundary rows of the discrete operator are *zeroth* order, not the first
+order this project's own test docstring claimed and the audit repeated. Measured
+4.0608e-01, 4.0576e-01, 4.0635e-01 across a refinement by four, an observed order
+of +0.001. The derivation agrees: the wall flux error is `O(h)|S| = O(h^2)` and
+the operator divides by a volume that is also `O(h^2)`. This does not make the
+solution zeroth order at the wall -- for an elliptic operator the boundary
+truncation error is damped -- but it does mean the boundary treatment is the
+weakest part of the discretisation and that nothing had ever measured it.
+
+The interior order *survives* non-orthogonality and stretching: 1.87 to 1.94
+across diffusion, convection and the two together on both new families. That is a
+positive result and it narrows F4 rather than widening it -- the operators are
+fine, and the first-order term is in the flux definition, which no manufactured
+solution evaluates.
+
+**The flux definition.** Rhie-Chow was comparing a compact pressure difference
+taken along `d` against an interpolated gradient dotted with the full area vector
+`S`. For a linear field, where the damping must be identically zero, that leaves
+`-(grad p)_f . T` -- verified against the closed form to 8e-14. Correcting it
+alone made the solver *worse*: the NACA 2412 stopped converging and the NACA 0012
+diverged at iteration 163, with its fastest cell inside the polar-blended region.
+The spurious flux had been paying for a second omission -- the pressure correction
+applied only the two-cell part of `(grad p')_f . S` and dropped the cross term
+entirely -- and the two errors had been partly cancelling. Both are now fixed, the
+cross term lagged into the source in one corrector pass.
+
+A control separates the two halves of that corrector, because the loop both adds
+the cross term and runs a second warm-started solve. With the same number of
+solves and the cross term forced to zero, the case stops diverging and plateaus at
+1.773e-04; with the cross term it converges at 1044 iterations. The extra solve
+turns divergence into a plateau, and the cross term turns the plateau into
+convergence.
+
+Measured on the NACA 2412, same mesh throughout: `Cd` 0.012506 to 0.011773,
+-5.87%, of which 14.5% comes out of the pressure drag while friction drag moves
+0.03%. That split is the signature -- the spurious flux lived in the blended far
+field and the marched near-wall region is orthogonal to 0.25 degrees.
+
+**Relaxation-independence, which four docstrings asserted and none of them had.**
+The Rhie-Chow mobility is built from the under-relaxed momentum diagonal, so
+`D_f = alpha_u V / a_P`, and the damping term it multiplies does not vanish at
+convergence. Measured on the cylinder at a residual of 1e-9, `Cd` spanned
+2.038e-04 across `alpha_u` 0.70 to 0.40 -- while the `alpha_p` control spanned
+1.164e-06, which is the convergence floor. Carrying the damping between
+iterations (Choi) makes the relaxation cancel out of the fixed point by
+construction: the `alpha_u` spread falls to 8.83e-07, *at* the floor and not below
+it. Iteration counts are unchanged.
+
+**The marching Newton.** A fixed four passes became a residual test with a
+ceiling. At y+ 1 the march reaches all 63 requested near-field layers where it
+reached 54, and the fraction of faces past 30 degrees falls from 2.92% to 0.09%.
+The peak does not improve -- 60.098 to 60.863 -- because that face is the
+marched-to-analytic seam, which is a discontinuity in the construction and needs
+its own fix. The cylinder is untouched and *faster*, because a circle marches
+exactly and now exits after one pass.
+
+**A negative result on a proposed remedy.** The audit's F3 asks for the wall
+pressure to be reconstructed as `p_P + (grad p)_P . d` using the solver's own
+least-squares gradient. Implemented and measured, that is order 1.13, not 2, and
+the cause is that the least-squares gradient *in the wall row does not converge at
+all* -- observed order 0.00. The stencil weights go as `1/|d|^2` and the wall face
+is the nearest stencil point, so a wall value asserting zero normal gradient is
+the most heavily weighted member of the fit, and the reconstruction inherits the
+error of the assumption it exists to remove. A linear extrapolation along the wall
+normal through the first two cell centres, which needs no gradient, measures 2.05
+to 2.13 on all three families and is what landed.
+
+**Also landed:** the `omega` residual now excludes the identity-substituted wall
+row, which was 56.89% of its normaliser and 65.54% of its imbalance; `Cm` is
+reported nose-up positive; separation takes its sign from a one-sided wall
+gradient rather than the first cell, worth 0.253 degrees; and the mesh page no
+longer calls a flat-plate correlation the achieved `y+`.
+
+**Still open at the time of writing:** F13, F14, F15 in the near term; F6, F7 and
+F1 in the turbulence closure, with F1 gated behind the NASA TMR flat plate; F2's
+far-field vortex correction; K2's seam; and the grid-convergence study on a
+properly refined family.
+
 ---
 
 ## Remaining
 
-### The divergence monitor's false positive — do this first
+### The divergence monitor's false positive — withdrawn, does not reproduce
 
-A NACA 0012 at Re 2e6 with SST on factory defaults raises `SolverDiverged` at
-iteration 367. It is not diverging. With the monitor disarmed the residual peaks
-at 1.8e-01 near iteration 400, as the eddy-viscosity ratio passes 100, and then
-recovers monotonically to 2.8e-05 by iteration 1100, with `Cd` = 0.009487 to a
-standard deviation of 2e-6 and `Cl` = -8e-6.
+**This item is closed and the work it was directing should not be done.** It said
+that a NACA 0012 at Re 2e6 with SST on factory defaults raises `SolverDiverged` at
+iteration 367 on a case that recovers completely, that the residual peaks at
+1.8e-01 near iteration 400, and that this blocks the primary use case and comes
+before the meshing work.
 
-```
-iterations    median residual
- 300 -  500      2.68e-02   (peak 1.78e-01)
- 500 -  800      2.53e-03
- 800 - 1100      4.73e-05
-1100 - 1500      2.81e-05
-```
+Measured twice, on two code states, and it does not happen. The physics audit ran
+it on `main` at 37fabd2 with the monitor armed: 1600 iterations, no exception, no
+excursion, largest residual after iteration 100 of 7.45e-03 against a claimed peak
+of 1.8e-01. A direct run here on the audit-response branch converged at iteration
+479 to 9.85e-07. The plan's own residual table disagrees with measurement by three
+orders in its first window and agrees in its last two, which is the signature of a
+transient that something has since removed rather than of a different case.
 
-The clause that fires is `_MONITOR_LOST`: the residual exceeds a hundred times
-the best the run had reached. The flaw is in what "best" means — a SIMPLE run's
-early residual minimum is a transient artefact, here a passing 5.6e-04 at
-iteration 200, before the turbulence field has developed, and holding the rest of
-the run to it makes a full recovery indistinguishable from a failure.
+The plan's *diagnosis* of the monitor's design was sound as far as it went, and it
+is left recorded: `_MONITOR_LOST` holds a run to the best residual it ever reached,
+and an early minimum before the turbulence field has developed is not a
+meaningful reference. But the monitor is not close to firing on any case that can
+be reproduced -- a shadow monitor over 1600 iterations peaked at a ratio of 1.8
+against the 100 it requires -- so there is nothing to tune against. **Do not touch
+it until a real false positive appears, and record that case's full specification
+when it does.** None of the three documents that carried this item recorded the
+angle of attack, surface point count, `y+` target or far-field ratio of the case
+it described, and all four change the answer.
 
-This is a Stage 2 regression made visible only once Stages 0 and 3 made the case
-recoverable, which is why it was not caught then. It blocks the primary use case,
-so it comes before the meshing work.
-
-Do not simply move the threshold; that is how the monitor was mis-set the first
-time. It needs a measured answer to what excursion is recoverable, probably a
-trailing reference rather than an all-time best, and end-to-end tests on both
-this case and a genuine divergence — the laminar cylinder at Re 2e6, which grinds
-upward at about 1.3% per iteration.
+There *was* a real defect on that case and it was a different one: the residual
+stopped falling at about 4e-05 and oscillated there indefinitely, so the run would
+exhaust `max_iterations` rather than converge while the forces sat steady in the
+sixth decimal. The audit guessed the mechanism -- "the deferred correction's
+lagged source is the usual cause of a plateau at this level" -- and the guess was
+right. The pressure correction was dropping the non-orthogonal cross term of
+`(grad p')_f . S` entirely. With it restored the same case converges at iteration
+479. See Stage 8.
 
 ### Stage 6 (rest) — meshing
 
