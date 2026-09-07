@@ -89,7 +89,92 @@ def uniform_mesh(surface_points: int, outer: float = 3.0):
         growth=1.0,
     )
     metrics = compute_metrics(grid.nodes)
-    return grid, metrics, build_faces(metrics)
+    return grid.nodes, metrics, build_faces(metrics)
+
+
+#: Refinement base for the two families below. Level ``r`` has ``r`` times the
+#: surface points and ``r`` times the layers of the base, so ``h`` halves in both
+#: directions at once and an order read off the sequence is an order in ``h``.
+_MMS_BASE_POINTS = 48
+_MMS_BASE_LAYERS = 16
+
+
+def stretched_mesh(surface_points: int, outer: float = 3.0, base_growth: float = 1.3):
+    """The circle again, with the wall-normal spacing geometrically stretched.
+
+    Isolates stretching from non-orthogonality: the body is still a circle, so
+    ``T`` is still zero to rounding, and the only thing that has changed against
+    :func:`uniform_mesh` is the expansion ratio -- 1.30 at the base level against
+    ``uniform_mesh``'s 1.27 falling to 1.08. Truncation error on a stretched mesh
+    loses one order in its leading term unless the stretching is *smooth*, and
+    nothing in this file tested that before.
+
+    Refining a stretched family is not the same as refining a uniform one, and
+    doing it wrongly is how a family stops being a family. Holding ``growth``
+    fixed while halving the first layer adds only ``ln 2 / ln growth`` layers, so
+    the radial direction refines logarithmically while the surface refines
+    linearly -- measured, that gives 20, 25 and 30 layers against 48, 96 and 192
+    points, and an order read off it means nothing. Here the layer count is
+    doubled outright and ``growth`` taken to the matching root, ``g^(1/r)``, so
+    that the same total thickness is spanned by twice the layers with the same
+    *distribution*. The expansion ratio then tends to one as the family refines,
+    which is the definition of smooth stretching rather than a way of making it
+    disappear: a family whose expansion ratio stayed at 1.30 would have a first
+    layer that never shrank.
+    """
+    ratio = surface_points / _MMS_BASE_POINTS
+    layers = int(round(_MMS_BASE_LAYERS * ratio))
+    growth = base_growth ** (1.0 / ratio)
+    total = outer - 0.5
+    first_layer = total * (growth - 1.0) / (growth**layers - 1.0)
+    grid = build_ogrid(
+        circle(1.0, surface_points),
+        first_layer=first_layer,
+        far_field_radius=outer,
+        growth=growth,
+    )
+    metrics = compute_metrics(grid.nodes)
+    return grid.nodes, metrics, build_faces(metrics)
+
+
+def sheared_mesh(surface_points: int, outer: float = 3.0, shear: float = 0.45):
+    """Concentric circles with the angular coordinate sheared against the radius.
+
+    Isolates non-orthogonality from everything else, at an angle that is *the
+    same at every refinement level*. That last property is what a body-fitted
+    family cannot supply and why this is built analytically instead: a NACA
+    through ``build_ogrid`` refined in both directions was measured at
+    non-orthogonality mean 13.85, 14.73, 15.15 degrees and aspect ratio 32, 57,
+    103 across three levels, so it drifts on two axes at once and an order read
+    off it cannot be attributed. Nodes are placed at
+
+        r_j = 0.5 + (outer - 0.5) j / Nj
+        theta_ij = -2 pi i / Ni + shear (r_j - 0.5)
+
+    so the ``j`` grid lines are spirals rather than radii. The sign of the first
+    term is not cosmetic: ``build_ogrid`` orders its surface clockwise, and a
+    mesh built anticlockwise has negative cell volumes everywhere and is
+    rejected by ``quality.assess`` before the solver sees it. The local
+    misalignment between the face normal and the centroid-to-centroid vector is
+    ``arctan(r shear)``, which runs from 12.7 degrees at the body to 51.5 at the
+    outer boundary and does not change when the mesh is refined -- which is
+    exactly the property that makes an ``O(h) tan(theta)`` error term survive
+    refinement, and therefore the property this family has to have.
+
+    Radial spacing is uniform, the angular sweep is uniform, and the cells are
+    convex everywhere for ``shear`` below about 0.8; 0.45 is well inside that.
+    """
+    layers = int(round(_MMS_BASE_LAYERS * surface_points / _MMS_BASE_POINTS))
+    radius = 0.5 + (outer - 0.5) * np.arange(layers + 1) / layers
+    angle = (
+        -2.0 * np.pi * np.arange(surface_points)[:, None] / surface_points
+        + shear * (radius - 0.5)[None, :]
+    )
+    nodes = np.stack(
+        (radius[None, :] * np.cos(angle), radius[None, :] * np.sin(angle)), axis=-1
+    )
+    metrics = compute_metrics(nodes)
+    return nodes, metrics, build_faces(metrics)
 
 
 def aerofoil_mesh(surface_points: int = 160, first_layer: float = 5.0e-5):
@@ -114,7 +199,7 @@ def aerofoil_mesh(surface_points: int = 160, first_layer: float = 5.0e-5):
         far_field_radius=20.0,
     )
     metrics = compute_metrics(grid.nodes)
-    return grid, metrics, build_faces(metrics)
+    return grid.nodes, metrics, build_faces(metrics)
 
 
 def divergence_free_fluxes(nodes):
@@ -420,14 +505,35 @@ class TestManufacturedSolution:
     """Order-of-accuracy of the discrete operators.
 
     The operator is evaluated as ``apply(phi) - source``: the implicit half from
-    the matrix, plus everything the assembly moved to the right-hand side. Only
-    interior cells are measured. Boundary rows use a one-sided gradient which is
-    first order there by construction; that is a known and accepted property of
-    the scheme, not a defect, and including them would mask the interior order.
+    the matrix, plus everything the assembly moved to the right-hand side.
+
+    **Which cells are measured, and why it is now a parameter.** Interior cells
+    were the only ones measured, on the argument that the boundary rows use a
+    one-sided gradient which is first order there by construction, so including
+    them would mask the interior order. The second half is right and the first
+    half is not: measured, the boundary truncation error is *zeroth* order, and
+    the derivation agrees -- see
+    :meth:`test_the_boundary_rows_are_zeroth_order`. Excluding them from the
+    interior measurement is still correct, but they are now measured separately
+    rather than left unexamined, so that a change in the boundary treatment is
+    visible instead of averaged away.
+
+    **Which meshes, and why it is now a parameter.** Every order in this class
+    was measured on ``uniform_mesh``: an orthogonal, unstretched circle in a
+    circular far field, aspect ratio 2.5, expansion 1.08 to 1.27, and
+    non-orthogonality of 0.0000 degrees mean and peak. The mesh ``build_case``
+    produces for the primary use case has aspect ratio 453, expansion 4.77 and
+    non-orthogonality averaging 3.9 degrees with a peak of 60.1. It is not a
+    harder version of the verification mesh; it is a different object, and a
+    second-order result on one says nothing about the other. Two more families
+    are measured here, each isolating one property -- :func:`stretched_mesh` for
+    the expansion ratio and :func:`sheared_mesh` for the non-orthogonality.
     """
 
-    def _operator_error(self, surface_points, convect, diffuse, scheme):
-        grid, metrics, faces = uniform_mesh(surface_points)
+    def _operator_error(
+        self, surface_points, convect, diffuse, scheme, mesh=uniform_mesh, rows="interior"
+    ):
+        nodes, metrics, faces = mesh(surface_points)
         phi = scalar(metrics.centroid)
         wall, far = scalar(faces.wall.centre), scalar(faces.far_field.centre)
         gradient = ops.Gradient(faces)(phi, wall, far)
@@ -436,7 +542,7 @@ class TestManufacturedSolution:
         exact = np.zeros(faces.shape)
 
         if convect:
-            flux_i, flux_j = divergence_free_fluxes(grid.nodes)
+            flux_i, flux_j = divergence_free_fluxes(nodes)
             assert np.abs(ops.divergence(flux_i, flux_j, faces)).max() < 1e-12
             ops.add_convection(
                 coefficients, faces, flux_i, flux_j, phi, gradient,
@@ -453,9 +559,21 @@ class TestManufacturedSolution:
             exact -= metrics.volume * scalar_laplacian(metrics.centroid)
 
         error = (coefficients.apply(phi) - coefficients.source) - exact
-        weight = metrics.volume[:, 1:-1]
         norm = np.sqrt((exact**2 * metrics.volume).sum() / metrics.volume.sum())
-        return float(np.sqrt((error[:, 1:-1] ** 2 * weight).sum() / weight.sum()) / norm)
+
+        # The norm is taken over the whole field either way, so the two row
+        # selections are measured against the same yardstick and their errors
+        # can be compared with each other rather than only within a family.
+        if rows == "interior":
+            error, weight = error[:, 1:-1], metrics.volume[:, 1:-1]
+        elif rows == "boundary":
+            error = np.concatenate((error[:, :1], error[:, -1:]), axis=1)
+            weight = np.concatenate(
+                (metrics.volume[:, :1], metrics.volume[:, -1:]), axis=1
+            )
+        else:
+            raise ValueError(f"unknown row selection {rows!r}")
+        return float(np.sqrt((error**2 * weight).sum() / weight.sum()) / norm)
 
     def test_diffusion_is_second_order(self):
         errors = [self._operator_error(n, False, True, "linear") for n in (48, 96, 192)]
@@ -491,6 +609,110 @@ class TestManufacturedSolution:
     def test_full_convection_diffusion_is_second_order(self):
         errors = [self._operator_error(n, True, True, "linear") for n in (48, 96, 192)]
         assert observed_order(errors) > 1.8
+
+    # ------------------------------------------------------------------
+    # The meshes the solver actually runs on
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "convect, diffuse, scheme",
+        [(False, True, "linear"), (True, False, "linear"), (True, True, "linear")],
+        ids=["diffusion", "convection", "both"],
+    )
+    def test_the_interior_order_survives_stretching(self, convect, diffuse, scheme):
+        """Expansion ratio 1.61 at the base level against ``uniform_mesh``'s 1.27.
+
+        Measured, errors and the order from the finer pair:
+
+            diffusion    7.1597e-02  2.4099e-02  6.5743e-03   1.874
+            convection   6.8472e-02  2.5944e-02  6.8067e-03   1.930
+            both         4.5950e-02  1.5920e-02  4.5842e-03   1.796
+
+        The coarse pair reads 1.40 to 1.57 on all three, so the family is not
+        asymptotic at 48 points and the finer pair is the one to read -- which is
+        why the threshold is set below the measured value rather than at it.
+        """
+        errors = [
+            self._operator_error(n, convect, diffuse, scheme, mesh=stretched_mesh)
+            for n in (48, 96, 192)
+        ]
+        assert observed_order(errors) > 1.7
+
+    @pytest.mark.parametrize(
+        "convect, diffuse, scheme",
+        [(False, True, "linear"), (True, False, "linear"), (True, True, "linear")],
+        ids=["diffusion", "convection", "both"],
+    )
+    def test_the_interior_order_survives_non_orthogonality(
+        self, convect, diffuse, scheme
+    ):
+        """36.5 degrees mean and 53.3 peak, held constant across the family.
+
+        This is the measurement that was missing. Every order in this class was
+        taken on a mesh with ``T = S - g d`` identically zero, which makes the
+        whole non-orthogonal correction path in ``add_diffusion`` dead code under
+        test -- the audit's phrase, and it was accurate. Measured now, with the
+        path live:
+
+            diffusion    9.2842e-02  2.6914e-02  7.2018e-03   1.902
+            convection   3.6641e-02  1.0055e-02  2.6293e-03   1.935
+            both         9.7303e-02  2.8181e-02  7.5320e-03   1.904
+
+        A positive result, and worth stating plainly because the audit's F4 could
+        easily have been read as implying otherwise: the *operators* are second
+        order on a non-orthogonal mesh and the deferred cross-term correction
+        does its job. The first-order term F4 identifies is in the flux
+        definition, which no manufactured solution here evaluates -- see
+        :class:`TestRhieChowConsistency`, which is where that one is caught.
+        """
+        errors = [
+            self._operator_error(n, convect, diffuse, scheme, mesh=sheared_mesh)
+            for n in (48, 96, 192)
+        ]
+        assert observed_order(errors) > 1.7
+
+    @pytest.mark.parametrize(
+        "mesh", [uniform_mesh, stretched_mesh, sheared_mesh],
+        ids=["uniform", "stretched", "sheared"],
+    )
+    def test_the_boundary_rows_are_zeroth_order(self, mesh):
+        """Not first order. Measured, on all three families and both operators.
+
+        This class's own docstring said the boundary rows "use a one-sided
+        gradient which is first order there by construction", and the audit
+        repeated it while asking for the rows to be measured rather than
+        excluded. Measured, the truncation error there does not fall at all:
+
+            uniform    both   4.0608e-01  4.0576e-01  4.0635e-01   order +0.001
+            stretched  both   7.0577e-01  6.9856e-01  6.9281e-01   order +0.012
+            sheared    both   6.9594e-01  6.7848e-01  6.7323e-01   order +0.011
+
+        The derivation agrees, which is why this is a correction to the docstring
+        rather than a suspected bug. The wall diffusive flux is
+        ``Gamma (phi_wall - phi_P) |S| / delta`` with ``delta ~ h/2``, so the
+        one-sided difference carries an ``O(h)`` error in the gradient and an
+        ``O(h) |S| = O(h^2)`` error in the flux; the operator divides through by
+        a volume that is also ``O(h^2)``, and what is left is ``O(1)``. First
+        order would have required a second-order boundary gradient.
+
+        **This does not mean the solution is zeroth order at the wall.** For an
+        elliptic operator the boundary truncation error is damped rather than
+        transported, and a boundary one order below the interior is the classical
+        situation in which the global order is still the interior one. It does
+        mean that the boundary treatment is the weakest link in the discretisation
+        and that nothing here has ever measured it, which is the point of adding
+        this.
+
+        The bound is two-sided, in the same spirit as
+        :meth:`test_upwind_convection_is_first_order`: a *rise* would be a real
+        defect, and an improvement should fail this test and make somebody update
+        the number rather than passing silently.
+        """
+        errors = [
+            self._operator_error(n, True, True, "linear", mesh=mesh, rows="boundary")
+            for n in (48, 96, 192)
+        ]
+        assert -0.2 < observed_order(errors) < 0.5
 
 
 class TestDivergence:
