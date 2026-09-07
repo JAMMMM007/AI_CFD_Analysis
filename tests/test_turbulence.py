@@ -201,19 +201,30 @@ class TestWallConditions:
         assert state.omega[:, 0] == pytest.approx(wall_omega, rel=1e-12)
 
     def test_the_omega_seed_uses_one_wall_distance_on_an_aerofoil_too(self):
-        """Regression. The seed and the boundary condition disagreed by 38%.
+        """Regression, and the record of two audit findings turning out to be one.
 
         ``State.uniform`` evaluated ``bc.py``'s asymptote on
-        ``metrics.wall_distance`` -- the true minimum distance to the surface
-        polyline -- while ``bc.py`` evaluates it on
-        ``faces.wall.wall_normal_distance``, the perpendicular distance from the
-        cell to its own wall face. Both are correct for their own purpose and
-        they are not interchangeable.
+        ``metrics.wall_distance`` -- the minimum distance to the surface polyline
+        -- while ``bc.py`` evaluates it on ``faces.wall.wall_normal_distance``, the
+        perpendicular distance from the cell to its own wall face, with the
+        constants copied across as literals. The audit measured the two
+        disagreeing by up to 15% in the first cell row, which is 38% in ``omega``,
+        and reported it as a defect separate from the wall-distance sampling.
 
-        Measured on this mesh, the two disagree in the first cell row by a ratio
-        down to 0.851965, and ``omega ~ 1/d^2`` turns that into 37.8%. On a
-        circle the ratio is exactly 1, which is why every existing test was blind
-        to it and why this one uses an aerofoil.
+        They are the same defect. For a first-row cell the nearest point on the
+        polyline *is* the perpendicular foot on its own wall segment, so the two
+        definitions must agree there identically -- and once the polyline distance
+        is computed exactly rather than sampled, they do. Measured on this mesh:
+
+            sampled at 8 points per segment   ratio min 0.259848703
+            exact point-to-segment            ratio min 1.000000000, to nine digits
+
+        The entire disagreement was the sampling error. So this test no longer
+        requires the mesh to exhibit one -- there is none to exhibit. What it
+        guards is the property that survives: one definition of the wall ``omega``,
+        living in ``bc.py``, with the seed taking it from there rather than
+        rebuilding it from a different distance and its own copies of the
+        constants.
         """
         from fluidsolver.geometry.naca import naca4
 
@@ -227,9 +238,8 @@ class TestWallConditions:
         freestream = Freestream(velocity=30.0, turbulence_intensity=0.001)
         boundaries = Boundaries(faces, AIR_15C, freestream)
 
-        # The mesh has to be able to show the defect, or the test proves nothing.
         ratio = faces.wall.wall_normal_distance / faces.metrics.wall_distance[:, 0]
-        assert ratio.min() < 0.95
+        assert ratio.min() == pytest.approx(1.0, rel=1e-9)
 
         state = State.uniform(faces, AIR_15C, freestream)
         _, wall_omega = boundaries.wall_turbulence()
