@@ -289,6 +289,88 @@ class TestSolve:
             solve(matrix, np.ones(shape), np.ones(shape))
 
 
+class TestResidualScaling:
+    """That the residual measures the system being solved, and only that."""
+
+    @staticmethod
+    def _with_a_prescribed_wall_row(shape=(8, 5), wall_value=8.0e6):
+        """A plausible ``omega`` system: identity on the wall row, huge value on it.
+
+        The wall row is what ``sst._fix_wall_row`` leaves behind -- ``1 * phi = W``
+        with ``W`` of order 1e6 against an interior field near 1e2. That is a
+        prescribed value, not a solved equation.
+        """
+        coefficients = Coefficients.zeros(shape)
+        coefficients.centre[:] = 2.0
+        coefficients.west[:] = coefficients.east[:] = -0.5
+        coefficients.south[:] = coefficients.north[:] = -0.5
+        coefficients.source[:] = 1.0
+
+        field = np.full(shape, 100.0)
+        for band in (
+            coefficients.west, coefficients.east,
+            coefficients.south, coefficients.north,
+        ):
+            band[:, 0] = 0.0
+        coefficients.centre[:, 0] = 1.0
+        coefficients.source[:, 0] = wall_value
+        field[:, 0] = wall_value
+        return coefficients, field
+
+    def test_a_prescribed_row_does_not_contribute_to_the_residual(self):
+        """Regression. On ``omega`` it supplied most of both sums.
+
+        Measured on the NACA 2412 at iteration 400, the wall row was 56.89% of the
+        normaliser and 65.54% of the imbalance -- reproducing the audit's 56.90%
+        and 65.32% on an independent run. What it contributed was the distance the
+        *boundary condition* had moved since the previous iteration, which is not
+        a measure of how well any transport equation was solved.
+
+        The assertion is insensitivity rather than size. Moving the prescribed
+        row's own imbalance must not move the reported residual *at all*, which is
+        what "does not contribute" means; asserting that the masked figure is
+        merely smaller would be weaker and, on this system, not even true --
+        removing the row takes more out of the normaliser than out of the
+        imbalance, so the masked residual here comes out larger. Which direction
+        it moves depends on the case and is not the property being tested.
+        """
+        coefficients, field = self._with_a_prescribed_wall_row()
+        solved = np.ones(field.shape, dtype=bool)
+        solved[:, 0] = False
+
+        masked = coefficients.residual(field, solved)
+        whole = coefficients.residual(field)
+
+        # Put a large, arbitrary error on the prescribed row alone.
+        coefficients.source[:, 0] *= 1.5
+
+        assert coefficients.residual(field, solved) == pytest.approx(masked)
+        assert coefficients.residual(field) != pytest.approx(whole)
+
+    def test_masking_does_not_change_a_system_with_nothing_prescribed(self):
+        """The mask must be inert where it selects everything."""
+        coefficients, field = self._with_a_prescribed_wall_row()
+        everything = np.ones(field.shape, dtype=bool)
+        assert coefficients.residual(field, everything) == pytest.approx(
+            coefficients.residual(field)
+        )
+
+    def test_the_residual_still_falls_as_the_field_approaches_the_solution(self):
+        """A masked residual is still a residual, not just a smaller number."""
+        coefficients, field = self._with_a_prescribed_wall_row()
+        solved = np.ones(field.shape, dtype=bool)
+        solved[:, 0] = False
+
+        matrix = StructuredMatrix(field.shape).build(coefficients)
+        exact, _ = solve(matrix, coefficients.source, field, tolerance=1e-12)
+
+        errors = [
+            coefficients.residual(field + (exact - field) * (1.0 - gap), solved)
+            for gap in (1.0, 0.5, 0.1)
+        ]
+        assert errors[0] > errors[1] > errors[2]
+
+
 class TestUnderRelaxation:
     def test_relaxation_leaves_the_converged_solution_unchanged(self):
         """Patankar's implicit form must alter the path, never the destination."""

@@ -385,7 +385,15 @@ class KOmegaSST(TurbulenceModel):
         if fixed_wall is not None:
             self._fix_wall_row(coefficients, fixed_wall)
 
-        residual = coefficients.residual(current)
+        # The wall row is prescribed rather than solved, so it is excluded from
+        # the residual. See Coefficients.residual: left in, it supplied 57% of
+        # omega's normaliser and 65% of its imbalance, and what it was measuring
+        # was how far its own boundary condition had moved.
+        solved = None
+        if fixed_wall is not None:
+            solved = np.ones(coefficients.centre.shape, dtype=bool)
+            solved[:, 0] = False
+        residual = coefficients.residual(current, solved)
 
         # Damped with the same local step the momentum equations use, so that k
         # and omega move at the pace of the velocity field driving them. The

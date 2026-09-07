@@ -64,9 +64,17 @@ class Coefficients:
         """Apply implicit (Patankar) under-relaxation in place.
 
         ``a_P/alpha`` on the diagonal with ``(1-alpha)/alpha a_P phi_old`` added to
-        the source. Written this way the converged solution is untouched -- at
-        convergence ``phi = phi_old`` and the two added terms cancel exactly -- so
-        the relaxation factor changes only the path, never the answer.
+        the source. Written this way the solution *of this equation* is untouched
+        -- at convergence ``phi = phi_old`` and the two added terms cancel exactly.
+
+        That is a statement about one equation and it used to be written as though
+        it were a statement about the solver. It is not. The relaxed diagonal
+        leaves this object and is used to build the Rhie-Chow mobility
+        ``D_f = alpha_u V / a_P``, whose damping term does *not* vanish at
+        convergence, so ``alpha_u`` reached the converged answer by a route that
+        has nothing to do with Patankar's cancellation -- measured at 2.76e-04 in
+        the cylinder's ``Cd`` across ``alpha_u`` 0.70 to 0.40. See
+        :meth:`PressureVelocityCoupling.face_fluxes`, which now removes it.
         """
         if not 0.0 < factor <= 1.0:
             raise ValueError(f"relaxation factor must be in (0, 1], got {factor}")
@@ -96,18 +104,50 @@ class Coefficients:
         self.centre += diagonal
         self.source += diagonal * field
 
-    def residual(self, field: np.ndarray) -> float:
+    def residual(self, field: np.ndarray, solved: np.ndarray | None = None) -> float:
         """Scaled residual of the current field, in the usual finite-volume sense.
 
         The raw imbalance ``|b - A phi|`` has the units of the equation and says
         nothing on its own -- it is small for a momentum equation on a fine mesh
         whether or not the solution is converged. Normalising by the variation the
         operator produces across the field gives a number that starts near one and
-        falls as the solution settles, comparably between equations.
+        falls as the solution settles, comparably between equations. This is the
+        standard finite-volume scaling and is not an invention here; it is
+        OpenFOAM's ``normFactor``.
+
+        ``solved`` marks the cells whose equation is genuinely being solved. Rows
+        that have been replaced by the identity are *prescribed*, not solved, and
+        including them measures how far a boundary condition moved since the last
+        iteration rather than how well any transport equation was satisfied.
+
+        That is not a small correction for ``omega``. Measured inside
+        ``_solve_and_clip`` on the NACA 2412, with the wall row's share separated
+        out:
+
+            iteration 100   wall row is 53.7% of the normaliser, 70.4% of the imbalance
+            iteration 300               56.9%                     66.2%
+            iteration 400               56.9%                     65.3%
+
+        The wall value is of order ``8e6`` against a field mean near ``1.2e5``, so
+        a single prescribed row per surface cell dominated both sums. ``k`` is
+        clean by the same measurement -- its wall row is 0.3% of the normaliser --
+        so this is specifically a consequence of the identity substitution and not
+        of the normalisation.
+
+        This finishes a repair that was started and not completed. The residual
+        used to be measured *before* the substitution, on the unsubstituted wall
+        equation that is then thrown away, and that put a floor of order 1e-1
+        under every run. Moving the measurement after the substitution removed the
+        floor; it left the prescribed row inside both sums, where it is still
+        measuring its own boundary condition.
         """
         imbalance = np.abs(self.source - self.apply(field))
         uniform = self.apply(np.full_like(field, field.mean()))
         scale = np.abs(self.apply(field) - uniform) + np.abs(self.source - uniform)
+
+        if solved is not None:
+            imbalance = imbalance[solved]
+            scale = scale[solved]
 
         total = scale.sum()
         if total <= 0.0:
