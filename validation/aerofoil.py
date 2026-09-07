@@ -99,11 +99,16 @@ REFERENCE = {
 #:     moves 0.03%. That split is the point: the spurious flux lived in the
 #:     polar-blended far field and the marched near-wall region is orthogonal.
 #:
-#:   current -- deeper march, unrelaxed damping mobility, wall-pressure
-#:   reconstruction, nose-up Cm, corrected omega production
-#:     2600 it  3.63e-06   Cd 0.011697, steady to five figures from iteration 1400
-#:     This entry does not converge to 1e-6 and that is deliberate rather than
-#:     unnoticed; see RESIDUAL_FLOOR and AerofoilResult.passes.
+#:   e95a7f3 -- deeper march, unrelaxed damping mobility, wall-pressure
+#:   reconstruction, nose-up Cm, corrected omega production, exact wall distance
+#:     2600 it  3.63e-06   Cl 0.75872  Cd 0.011697  Cdp 0.004245  Cdf 0.007452
+#:              Cm +0.08360   y+ 0.275 .. 2.310
+#:     Cd -0.65% and Cdp -1.76% against the entry above, friction +0.011%. Cm
+#:     changes sign, which is F10 and not a result: a NACA 2412 with Cm_ac near
+#:     -0.05, about a reference roughly 0.42c aft of the aerodynamic centre at
+#:     Cl = 0.76, should read about +0.08, and it now does.
+#:     This entry does not converge to 1e-6, deliberately rather than unnoticed;
+#:     see RESIDUAL_FLOOR and AerofoilResult.passes.
 #:
 #: **The first run also settled the hardening plan's first open item.** It was
 #: made on factory `Numerics()` with the divergence monitor *armed* and converged
@@ -117,15 +122,15 @@ REFERENCE = {
 RESIDUAL_FLOOR = 5.0e-06
 
 BASELINE = {
-    "iterations": 1044,
-    "residual": 9.91e-07,
-    "Cl": 0.75894,
-    "Cd": 0.011773,
-    "Cd_pressure": 0.004321,
-    "Cd_friction": 0.007451,
-    "Cm": -0.08349,
-    "y_plus_min": 0.280,
-    "y_plus_max": 2.311,
+    "iterations": 2600,
+    "residual": 3.63e-06,
+    "Cl": 0.75872,
+    "Cd": 0.011697,
+    "Cd_pressure": 0.004245,
+    "Cd_friction": 0.007452,
+    "Cm": +0.08360,
+    "y_plus_min": 0.275,
+    "y_plus_max": 2.310,
 }
 
 
