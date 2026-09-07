@@ -62,7 +62,7 @@ On the solve page the field plot is the whole point, so it gets the room:
 | Body-fitted O-grid mesher | working, tested |
 | Finite-volume discretisation | working; the operators are second order on orthogonal, stretched and non-orthogonal meshes (manufactured solution). The *solved* order of `Cd` on the cylinder is 1.26 -- see below |
 | Laminar Navier-Stokes | **validated** against published cylinder benchmarks |
-| k-omega SST | converges to 2.8e-05, but **the divergence monitor aborts it on factory defaults** -- see below |
+| k-omega SST | working; NACA 0012 at Re 2e6 converges to 9.85e-07 in 479 iterations on factory defaults |
 | Qt front end | working, tested |
 
 **The turbulence model was blamed for four bugs that were not in it.** The
@@ -107,32 +107,28 @@ monotonically, Re_eff = 2000 to 1.6e-5 -- and the NACA 0012 at Re = 2e6 with SST
 reaches 8.3e-4 by iteration 200 with a peak eddy-viscosity ratio of 90 where the
 flat-plate estimate is 84.
 
-**It then gets worse before it gets better, and that transient is now the
-problem.** As the eddy-viscosity ratio passes 100 the residual climbs back to a
-peak of 1.8e-1 around iteration 400, then recovers monotonically and settles:
+**That case now converges, and two earlier descriptions of it here were wrong.**
+On factory defaults with the divergence monitor armed it reaches 9.85e-07 at
+iteration 479, with `Cd` = 0.009076, `Cl` = -5e-5 against the zero symmetry
+requires, and an eddy-viscosity ratio steady at 117.7.
 
-```
-iterations    median residual
- 300 -  500      2.68e-02   (peak 1.78e-01)
- 500 -  800      2.53e-03
- 800 - 1100      4.73e-05
-1100 - 1500      2.81e-05
-```
+An earlier version of this file reported a bounded limit cycle around 1e-2 that
+never settled. A later one reported a residual excursion to 1.8e-1 near iteration
+400 followed by a recovery, and said the divergence monitor stopped the run at
+iteration 367 in the middle of it -- "a false positive on the primary use case and
+the first thing to fix". Neither reproduces. The 2026-09-07 physics audit ran the
+case on that same commit with the monitor armed and got 1600 iterations without an
+exception and a post-transient peak of 7.45e-03; the monitor's own trip condition
+requires a ratio of 100 against a run that peaks at 1.8. The item has been
+withdrawn from the hardening plan, and the monitor is left alone until a real
+false positive appears.
 
-By iteration 1100 it is converged in every sense that matters -- `Cd` = 0.009487
-with a standard deviation of 2e-6 over the last 400 iterations, `Cl` = -8e-6
-against the zero symmetry requires, eddy-viscosity ratio steady at 117. An
-earlier version of this file reported a bounded limit cycle at around 1e-2 that
-never settled; that is no longer what happens, and the change is down to the
-`mu_t S^2` production correction and the wall treatment. `Cd` = 0.0095 against a
-published 0.008 is a separate matter, and is what transition modelling is for.
-
-**The catch: on factory defaults you never see any of that.** The divergence
-monitor added in Stage 2 stops the run at iteration 367, in the middle of the
-excursion, because the residual is more than a hundred times the best the run had
-managed by then. The recovery is real and the monitor cannot see it. This is a
-false positive on the primary use case and it is the first thing to fix -- see
-`docs/handover.md`. Until then a run that trips it is not necessarily lost.
+What was real on that case was a residual plateau near 4e-05 that never reached
+tolerance, so the run would exhaust `max_iterations` while its forces sat steady in
+the sixth decimal. Its cause was the pressure correction dropping the
+non-orthogonal cross term of `(grad p')_f . S`, and with that restored the plateau
+is gone. `Cd` = 0.0091 against a published 0.008 is a separate matter, and is what
+transition modelling is for.
 
 So: the turbulence model's algebra checks out against every analytic property it
 is derived from, and the coupled iteration converges when it is allowed to. The
