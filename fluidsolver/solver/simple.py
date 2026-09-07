@@ -37,12 +37,11 @@ in Patankar's implicit form, it changes only the path taken, never the converged
 answer". Three other docstrings said the same. It was not true of
 ``relax_velocity``, and the argument for it was correct about the wrong thing:
 Patankar's cancellation applies to the solution of the *momentum equation*, but
-the relaxed diagonal then leaves that equation and builds the Rhie-Chow mobility
-``D_f = alpha_u V / a_P``, and the damping term it multiplies does not vanish at
-the fixed point. The damping is now carried between iterations so that the
-relaxation cancels out of the fixed point by construction; the measurement, and
-the ``alpha_p`` control that identifies the mechanism, are in
-:meth:`PressureVelocityCoupling.face_fluxes`.
+the relaxed diagonal then left that equation and built the Rhie-Chow mobility
+``alpha_u V / a_P``, and the damping term it multiplies does not vanish at the
+fixed point. The damping now uses ``V / a_P`` instead; the measurement, the
+``alpha_p`` control that identifies the mechanism, and the two remedies that were
+tried and rejected are in :meth:`PressureVelocityCoupling.face_fluxes`.
 """
 
 from __future__ import annotations
@@ -459,75 +458,79 @@ class PressureVelocityCoupling:
         -- one dot product with ``delta`` in place of one with the area vector,
         and ``cross`` is not needed at all.
 
-        **The damping is carried between iterations, so that the converged answer
+        **The damping uses the unrelaxed diagonal, so that the converged answer
         does not depend on `relax_velocity`.** ``momentum`` returns the
         *under-relaxed* diagonal ``a_P / alpha_u`` -- it has to, because that is
         what the matrix contains and what the velocity correction must divide by
-        -- so the mobility here is ``D_f = alpha_u V / a_P`` and is proportional
+        -- so a mobility built from it is ``alpha_u V / a_P`` and is proportional
         to the relaxation factor. The damping term does not vanish at
         convergence: it is part of the definition of the converged face flux and
         is what suppresses the checkerboard. So ``alpha_u`` was entering the fixed
         point, and four docstrings in this project asserted that it could not.
 
-        Choi's remedy is to retain the previous iteration's damping explicitly,
+        Majumdar's remedy: build the damping from ``V / a_P`` and leave the
+        relaxed mobility to the pressure equation, where it belongs. One line.
 
-            X^m = -rho D_f (damping)^m + (1 - alpha_u) X^{m-1},
-            F^m = rho u_f^m . S + X^m,
-
-        with ``X`` stored on the state. At a fixed point ``X = X^{m-1}``, so
-
-            alpha_u X = -rho D_f (damping) = -alpha_u rho (V / a_P) (damping),
-
-        and the ``alpha_u`` cancels exactly: the converged flux is built from the
-        *unrelaxed* mobility ``V / a_P``, whatever relaxation the path was taken
-        at. Note that ``alpha_p`` never needed this. It appears only in
+        ``alpha_p`` never needed this. It appears only in
         ``pressure += relax_pressure * correction`` and ``p' -> 0`` at
         convergence, so it genuinely cannot move the answer -- and that asymmetry
         is the signature that identifies the mechanism rather than a convergence
         floor.
 
-        Building the mobility from the unrelaxed diagonal instead is one line and
-        removes the leading dependence, but not the part hidden inside ``u_f``
-        itself, and Stage 4 needs this same machinery to make Rhie-Chow
-        independent of the time step. Doing it once is cheaper than doing it
-        twice.
-
         **Measured, with the control that identifies the mechanism.** Cylinder at
-        Re 40, ``scheme="linear"``, every run converged to ``tolerance = 1e-9`` --
-        two orders below the gate, so that a dependence cannot be mistaken for a
-        stopping artefact. Same binary throughout: "without" zeroes the carried
-        damping before each call, which reproduces the previous behaviour exactly.
+        Re 40, ``scheme="linear"``, converged to ``tolerance = 1e-9`` -- two orders
+        below the gate, so that a dependence cannot be mistaken for a stopping
+        artefact.
 
-                                    without          with
-            alpha_u 0.70        1.514229041     1.514085081
-            alpha_u 0.55        1.514320440     1.514085965
-            alpha_u 0.40        1.514432805     1.514085910
-            spread               2.038e-04       8.83e-07
+                                relaxed mobility    unrelaxed (this)
+            alpha_u 0.70          1.514229041        1.516039920
+            alpha_u 0.40          1.514432805        1.516040794
+            spread                 2.038e-04          8.7e-07
 
-            alpha_p 0.15        1.514228454     1.514084390
-            alpha_p 0.30        1.514229041     1.514085081
-            alpha_p 0.45        1.514229618     1.514085615
-            spread               1.164e-06       1.225e-06
+            alpha_p 0.15          1.514228454
+            alpha_p 0.30          1.514229041
+            alpha_p 0.45          1.514229618
+            spread                 1.164e-06
 
-        Read the two columns against each other and the argument is complete. The
-        ``alpha_p`` family is the control: ``alpha_p`` appears only in
-        ``pressure += relax_pressure * correction`` and ``p' -> 0`` at the fixed
-        point, so it cannot move the answer, and it does not -- its spread is the
-        convergence floor at about 1.2e-06 and is the same before and after. The
-        ``alpha_u`` family spans 2.04e-04 before, 173 times that floor, and
-        8.83e-07 after, which is *at* the floor and not below it. A remedy that
-        drove it to zero would be reporting something other than a measurement at
-        a finite residual.
+        The ``alpha_p`` family is the control and it is what makes this a
+        measurement rather than an assertion: ``alpha_p`` cannot move the answer,
+        and it does not -- its spread is the convergence floor at about 1.2e-06.
+        The ``alpha_u`` spread was 2.04e-04, a hundred and seventy times that
+        floor, and is now 8.7e-07, which is *at* the floor. A remedy that drove it
+        to zero would be reporting something other than a measurement taken at a
+        finite residual.
 
-        The iteration counts are unchanged -- 1362, 2415 and 4215 for the three
-        ``alpha_u`` values, identical in both columns -- so the retention costs
-        nothing in convergence rate.
+        **Two rejected remedies, both measured, because the second nearly landed.**
 
-        The converged ``Cd`` itself moves by -1.44e-04, from 1.514229 to
-        1.514085, because the fixed point now uses the unrelaxed mobility
-        ``V / a_P`` where it used ``0.7 V / a_P``. The gate's printed fourth
-        decimal moves with it, from 1.5142 to 1.5141. That digit was never a
-        property of the discretisation.
+        *Choi's retention*, which the audit recommends: carry the damping between
+        iterations as ``X^m = -rho D_f (damping)^m + (1 - alpha_u) X^{m-1}``, whose
+        fixed point has the ``alpha_u`` cancel. Implemented, it produced an
+        ``alpha_u`` spread of 8.83e-07 -- which looked like success. It was not:
+        the value it converged *to* was 1.514085, and both the correct fixed point
+        and an independent implementation of it sit at 1.516040. It was
+        consistently converging to the wrong answer, which an
+        independence-of-``alpha_u`` test cannot detect on its own. The defect was
+        that ``X^{m-1}`` was taken as the damping ``face_fluxes`` built, not as the
+        non-convective part of the *corrected* flux, so the recursion never saw
+        what the pressure correction had done.
+
+        *Choi's retention with that lag corrected*, which does reach 1.516039883 --
+        agreeing with the line above to 4e-08, and the two together are why
+        1.516040 is believed. It was rejected anyway: the cylinder at
+        ``alpha_u = 0.40`` no longer reached 1e-9 in 8000 iterations, and the
+        NACA 2412 plateaued at 1.8e-06 through 2600 iterations. A remedy that
+        needs a state array and costs convergence, to reach a fixed point that one
+        line reaches without either, is not the one to take. Stage 4 will need
+        Rhie-Chow to be time-step independent, which is the argument the audit
+        makes for Choi's form; that is a different construction and can be built
+        when there is a time step to be independent of.
+
+        **What this costs.** The unrelaxed mobility is ``1/alpha_u`` larger, so the
+        damping is larger, and the outer iteration slows on a stiff case. The
+        NACA 2412 reaches 3.10e-06 at 1500 iterations and is still falling, where
+        the relaxed mobility converged at 1039. The cylinder is unaffected -- 1363
+        and 4214 iterations at ``alpha_u`` 0.70 and 0.40, both normal. That cost
+        is recorded as an open item rather than tuned away.
 
         **The pressure-correction operator is deliberately *not* changed to
         match.** It stays orthogonal-only, in :meth:`pressure_correction` and in
@@ -548,7 +551,19 @@ class PressureVelocityCoupling:
         far_pressure = self.boundaries.far_pressure(state.pressure, far_flux)
 
         grad_p = self.gradient(state.pressure, state.pressure[:, 0], far_pressure)
+
+        # Two mobilities, and they are different quantities that happen to share
+        # a symbol in the literature.
+        #
+        # ``mobility`` is the velocity's response to a pressure change, V / (a_P /
+        # alpha_u), and it is right that it carries the relaxation: the momentum
+        # equation the correction has to undo is the relaxed one. It is what the
+        # pressure equation and the velocity correction use.
+        #
+        # ``unrelaxed`` is V / a_P, and it is what the Rhie-Chow damping must use.
+        # See the note on relaxation-independence below.
         mobility = self.volume / diagonal
+        unrelaxed = mobility / self.numerics.relax_velocity
 
         # --- i faces (all interior, wrapping around the body) ---
         velocity = state.velocity
@@ -556,6 +571,7 @@ class PressureVelocityCoupling:
             velocity, np.roll(velocity, 1, axis=0)
         )
         d_i = self.faces.i_faces.interpolate(mobility, np.roll(mobility, 1, axis=0))
+        e_i = self.faces.i_faces.interpolate(unrelaxed, np.roll(unrelaxed, 1, axis=0))
         grad_face_i = self.faces.i_faces.interpolate(
             grad_p, np.roll(grad_p, 1, axis=0)
         )
@@ -563,10 +579,7 @@ class PressureVelocityCoupling:
             (state.pressure - np.roll(state.pressure, 1, axis=0))
             - np.sum(grad_face_i * self.faces.i_faces.delta, axis=-1)
         )
-        retained = 1.0 - self.numerics.relax_velocity
-        damping_flux_i = (
-            -self.fluid.density * d_i * damping_i + retained * state.damping_i
-        )
+        damping_flux_i = -self.fluid.density * e_i * damping_i
         flux_i = (
             self.fluid.density
             * np.sum(interpolated * self.faces.metrics.face_i_area, axis=-1)
@@ -575,27 +588,19 @@ class PressureVelocityCoupling:
 
         # --- j faces (interior only; boundaries handled below) ---
         d_j = self.faces.j_faces.interpolate(mobility[:, 1:], mobility[:, :-1])
+        e_j = self.faces.j_faces.interpolate(unrelaxed[:, 1:], unrelaxed[:, :-1])
         interpolated_j = self.faces.j_faces.interpolate(velocity[:, 1:], velocity[:, :-1])
         grad_face_j = self.faces.j_faces.interpolate(grad_p[:, 1:], grad_p[:, :-1])
         damping_j = self.faces.j_faces.diffusion_factor * (
             (state.pressure[:, 1:] - state.pressure[:, :-1])
             - np.sum(grad_face_j * self.faces.j_faces.delta, axis=-1)
         )
-        damping_flux_j = (
-            -self.fluid.density * d_j * damping_j + retained * state.damping_j
-        )
+        damping_flux_j = -self.fluid.density * e_j * damping_j
         interior_j = (
             self.fluid.density
             * np.sum(interpolated_j * self.faces.metrics.face_j_area[:, 1:-1], axis=-1)
             + damping_flux_j
         )
-
-        # The recursion advances once per call, which is once per outer
-        # iteration. Anything calling this twice for the same iteration would
-        # take two steps of it and get a different -- though equally convergent --
-        # path; nothing does.
-        state.damping_i = damping_flux_i
-        state.damping_j = damping_flux_j
 
         # Wall: impermeable. Far field: whatever the boundary velocity carries,
         # rescaled so the domain neither gains nor loses mass overall.

@@ -989,23 +989,18 @@ class TestRhieChowConsistency:
     def test_the_converged_flux_does_not_depend_on_the_velocity_relaxation(self, mesh):
         """Regression. It did, linearly, and four docstrings said it could not.
 
-        ``momentum`` returns the *under-relaxed* diagonal, so the Rhie-Chow
-        mobility is ``D_f = alpha_u V / a_P`` and carries the relaxation factor
-        into a term that does not vanish at convergence. Choi's remedy retains the
-        previous damping,
-
-            X^m = -rho D_f (damping)^m + (1 - alpha_u) X^{m-1},
-
-        whose fixed point ``alpha_u X = -rho D_f (damping)`` has the ``alpha_u``
-        cancel, leaving the unrelaxed mobility ``V / a_P``.
+        ``momentum`` returns the *under-relaxed* diagonal, so a Rhie-Chow
+        mobility built from it is ``alpha_u V / a_P`` and carries the relaxation
+        factor into a term that does not vanish at convergence. The damping is now
+        built from ``V / a_P`` instead, and the flux it produces is therefore the
+        same at any ``alpha_u``.
 
         This is the algebraic half of the criterion and it is deliberately not the
         whole of it. A test built from the same belief as the code agrees with it
-        by construction, so the fixed point is *iterated* here rather than
-        asserted -- the state is held frozen and ``face_fluxes`` called until the
-        recursion settles, which is exactly the situation the derivation
-        describes and nothing more. The end-to-end half is a converged cylinder
-        swept over ``alpha_u`` at a residual of 1e-9, recorded in
+        by construction, so the flux is compared between two relaxation factors on
+        an otherwise frozen state rather than being checked against a formula. The
+        end-to-end half is a converged cylinder swept over ``alpha_u`` at a
+        residual of 1e-9, recorded in
         :meth:`PressureVelocityCoupling.face_fluxes`; a unit test cannot stand in
         for it because it cannot tell a fixed point that is independent of
         ``alpha_u`` from one that is merely reached slowly.
@@ -1023,9 +1018,8 @@ class TestRhieChowConsistency:
                 Numerics(relax_velocity=alpha_u), wall_model=False,
             )
             state = State.uniform(faces, fluid, freestream)
-            # A frozen, non-trivial pressure field: the recursion is the only
-            # thing allowed to move, so what it settles on is the fixed point of
-            # the flux definition and of nothing else.
+            # A frozen, non-trivial pressure field, so that the only thing
+            # differing between the two runs is the relaxation factor.
             state.pressure = np.sin(2.1 * metrics.centroid[..., 0]) * np.cos(
                 1.4 * metrics.centroid[..., 1]
             )
@@ -1036,8 +1030,7 @@ class TestRhieChowConsistency:
             # for the wrong reason -- and would also make it fail for the wrong
             # reason, since the retention is built to cancel exactly this scaling.
             diagonal = (1.0 + np.abs(metrics.centroid[..., 0])) / alpha_u
-            for _ in range(400):
-                flux_i, flux_j, _, _ = coupling.face_fluxes(state, diagonal)
+            flux_i, flux_j, _, _ = coupling.face_fluxes(state, diagonal)
             return flux_i, flux_j
 
         slow_i, slow_j = settled(0.4)
