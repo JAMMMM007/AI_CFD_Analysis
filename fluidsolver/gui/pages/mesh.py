@@ -182,7 +182,25 @@ class MeshPage(QWidget):
         metrics = compute_metrics(self.grid.nodes)
         self.report = assess(metrics, self.grid.nodes)
 
-        achieved = spacing.y_plus_of(
+        # A flat-plate correlation's prediction, and labelled as one.
+        #
+        # `spacing.y_plus_of` inverts `first_layer_thickness`, so on a mesh sized
+        # by a y+ target it returns that target back, computed from
+        # Cf = 0.026 Re^(-1/7) -- a correlation with no knowledge of the pressure
+        # gradient or of the stagnation point. The real friction velocity varies
+        # by roughly an order of magnitude between the stagnation point and the
+        # suction peak, so no single number can describe the distribution
+        # whatever correlation produces it.
+        #
+        # This line used to call the result `achieved`, at the moment the user is
+        # deciding whether the mesh resolves the wall well enough for the
+        # turbulence model. Measured on the NACA 2412 at 5 degrees, Re 2.03e6: it
+        # reads 1.00 where the solver delivers 0.301 to 2.301, a factor of 7.6
+        # across the surface. `spacing.friction_velocity`'s own docstring says the
+        # distribution the solver reports is the number to trust, and this page
+        # was quietly contradicting it. `health.assess` calls the same quantity
+        # `estimated_y_plus`, which is honest, and is the precedent followed here.
+        estimated = spacing.y_plus_of(
             first_layer,
             session.freestream.velocity,
             session.shape.reference_length,
@@ -190,7 +208,8 @@ class MeshPage(QWidget):
             session.fluid.viscosity,
         )
         lines = [
-            f"first cell        {first_layer:.4g} m  (y+ approx {achieved:.2f})",
+            f"first cell        {first_layer:.4g} m"
+            f"  (y+ target {estimated:.2f}, flat-plate estimate)",
             self.report.summary(),
         ]
         lines.extend(self.grid.notes)
