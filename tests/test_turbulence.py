@@ -188,10 +188,52 @@ class TestWallConditions:
         assert np.allclose(omega, expected)
 
     def test_initial_omega_matches_the_prescribed_wall_value(self, rig):
-        """A mismatch here is the six-order discontinuity that breaks F1."""
+        """A mismatch here is the six-order discontinuity that breaks F1.
+
+        Exactly, not to within 5%. This assertion used to carry ``rel=0.05``, and
+        on a circle it could have carried ``rel=1e-12`` and still passed: the two
+        wall distances in this code agree identically on a circle. The slack was
+        hiding a real disagreement that only a non-circular body shows -- see
+        :meth:`test_the_omega_seed_uses_one_wall_distance_on_an_aerofoil_too`.
+        """
         model, state, _, _, _ = rig
         _, wall_omega = model.boundaries.wall_turbulence()
-        assert state.omega[:, 0] == pytest.approx(wall_omega, rel=0.05)
+        assert state.omega[:, 0] == pytest.approx(wall_omega, rel=1e-12)
+
+    def test_the_omega_seed_uses_one_wall_distance_on_an_aerofoil_too(self):
+        """Regression. The seed and the boundary condition disagreed by 38%.
+
+        ``State.uniform`` evaluated ``bc.py``'s asymptote on
+        ``metrics.wall_distance`` -- the true minimum distance to the surface
+        polyline -- while ``bc.py`` evaluates it on
+        ``faces.wall.wall_normal_distance``, the perpendicular distance from the
+        cell to its own wall face. Both are correct for their own purpose and
+        they are not interchangeable.
+
+        Measured on this mesh, the two disagree in the first cell row by a ratio
+        down to 0.851965, and ``omega ~ 1/d^2`` turns that into 37.8%. On a
+        circle the ratio is exactly 1, which is why every existing test was blind
+        to it and why this one uses an aerofoil.
+        """
+        from fluidsolver.geometry.naca import naca4
+
+        first_layer = 6.0e-6
+        grid = build_ogrid(
+            naca4("2412", 400).resample(240, min_spacing=first_layer),
+            first_layer=first_layer,
+            far_field_radius=40.0,
+        )
+        faces = build_faces(compute_metrics(grid.nodes))
+        freestream = Freestream(velocity=30.0, turbulence_intensity=0.001)
+        boundaries = Boundaries(faces, AIR_15C, freestream)
+
+        # The mesh has to be able to show the defect, or the test proves nothing.
+        ratio = faces.wall.wall_normal_distance / faces.metrics.wall_distance[:, 0]
+        assert ratio.min() < 0.95
+
+        state = State.uniform(faces, AIR_15C, freestream)
+        _, wall_omega = boundaries.wall_turbulence()
+        assert state.omega[:, 0] == pytest.approx(wall_omega, rel=1e-12)
 
     def test_k_takes_a_zero_flux_wall_condition(self, rig):
         """Not ``k = 0``, which is right only in the low-Reynolds limit.

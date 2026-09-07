@@ -40,8 +40,11 @@ from fluidsolver.solver.fluid import Fluid, Freestream
 # first cell instead, at a point where the asymptote is simply valid, so the
 # factor does not belong: including it puts omega ten times too high in the
 # stiffest cell of the mesh.
-_OMEGA_WALL_FACTOR = 6.0
-_BETA_1 = 0.075
+#: Public, because ``fields.State.uniform`` seeds ``omega`` with the same
+#: asymptote and used to carry its own copy of both numbers. One definition,
+#: in the module that owns the boundary condition.
+OMEGA_WALL_FACTOR = 6.0
+BETA_1 = 0.075
 _BETA_STAR = 0.09
 
 # von Karman's constant and the additive constant of the smooth-wall log law,
@@ -248,9 +251,9 @@ class Boundaries:
         """
         distance = self.faces.wall.wall_normal_distance
         viscous = (
-            _OMEGA_WALL_FACTOR
+            OMEGA_WALL_FACTOR
             * self.fluid.kinematic_viscosity
-            / (_BETA_1 * distance**2)
+            / (BETA_1 * distance**2)
         )
         if u is None or v is None:
             return None, viscous
