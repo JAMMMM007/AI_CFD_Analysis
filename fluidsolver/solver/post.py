@@ -85,6 +85,14 @@ class Forces:
 
     @property
     def moment_coefficient(self) -> float:
+        """Pitching moment, nose-up positive, about :attr:`moment_reference`.
+
+        The sign convention is the aerodynamic one -- Anderson section 1.5, and
+        the one Abbott and von Doenhoff's tabulated ``Cm_ac`` values are quoted
+        in -- because comparison against published section data is what this
+        number is for. It is not the ``+z`` component of ``r x F`` in the mesh
+        frame, which is its negative; see :func:`compute_forces`.
+        """
         return self.moment / (self.dynamic_pressure * self.reference_length**2)
 
 
@@ -137,15 +145,30 @@ def compute_forces(
     length = faces.wall.length
 
     # Zero normal pressure gradient at a wall, so the face value is the cell value.
-    wall_pressure = state.pressure[:, 0]
-    pressure_force = np.sum(wall_pressure[:, None] * area, axis=0)
+    face_pressure = state.pressure[:, 0]
+    pressure_force = np.sum(face_pressure[:, None] * area, axis=0)
 
     traction, _ = wall_shear_stress(state, faces, fluid, boundaries)
     viscous_force = np.sum(traction * length[:, None], axis=0)
 
+    # Nose-up positive, which is the negative of the mesh-frame z moment.
+    #
+    # `Forces.lift` is `total[1]` and `Forces.drag` is `total[0]`, so lift is +y,
+    # the freestream runs +x, and the leading edge is at smaller x. The sum
+    # `r_x F_y - r_y F_x` is then the +z component of `r x F` with z out of the
+    # page. Take a unit lift applied one length *ahead* of the reference,
+    # r = (-1, 0) and F = (0, 1): that expression gives -1, and lift acting ahead
+    # of the moment reference is a nose-up moment, which the standard convention
+    # reports as +1. The two differ by a sign uniformly, for every contribution.
+    #
+    # Checked against the case: on the NACA 2412 at 5 degrees this reported
+    # Cm = -0.0825, and a NACA 2412 with Cm_ac about -0.05, taken about a
+    # reference roughly 0.42c aft of the aerodynamic centre at Cl = 0.75, should
+    # read about -0.05 + 0.17 x 0.75 = +0.08. The magnitude agreed and the sign
+    # did not.
     lever = faces.wall.centre - moment_reference
-    element = wall_pressure[:, None] * area + traction * length[:, None]
-    moment = float(np.sum(lever[:, 0] * element[:, 1] - lever[:, 1] * element[:, 0]))
+    element = face_pressure[:, None] * area + traction * length[:, None]
+    moment = -float(np.sum(lever[:, 0] * element[:, 1] - lever[:, 1] * element[:, 0]))
 
     return Forces(
         pressure_force=pressure_force,

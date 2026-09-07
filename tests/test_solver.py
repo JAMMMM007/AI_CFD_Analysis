@@ -1240,6 +1240,51 @@ class TestForces:
         )
         assert forces.drag > 0.0
 
+    def test_lift_acting_ahead_of_the_reference_is_a_nose_up_moment(self, setup):
+        """Regression. Every reported ``Cm`` had the opposite sign to the convention.
+
+        The integrand was ``r_x F_y - r_y F_x``, the ``+z`` component of ``r x F``
+        with ``z`` out of the page. Lift is ``+y`` and the freestream runs ``+x``,
+        so the leading edge is at smaller ``x``; a unit lift applied one length
+        ahead of the reference has ``r = (-1, 0)`` and ``F = (0, 1)``, and that
+        expression returns ``-1``. Lift ahead of the moment reference is a
+        *nose-up* moment, which the aerodynamic convention reports as ``+1``.
+
+        The sign is not a matter of taste here because the number's purpose is
+        comparison against published section data, where ``Cm`` is nose-up
+        positive. On the NACA 2412 at 5 degrees the code reported ``Cm = -0.0825``
+        where a section with ``Cm_ac`` near -0.05, about a reference roughly
+        0.42c aft of the aerodynamic centre at ``Cl = 0.75``, should read about
+        ``+0.08``: right magnitude, wrong sign.
+
+        The body here is a circle, and that needs saying because it constrains
+        how the test can be built: pressure acts along the surface normal, every
+        normal of a circle is radial, so *every* pressure distribution on a circle
+        has exactly zero moment about its centre. The first attempt at this test
+        loaded the forward upper quadrant and measured a moment of 1.5e-18, which
+        is the correct answer to the question it was asking.
+
+        So the reference is moved instead. About any point ``P``, the moment of a
+        purely radial load is ``sum (r_i - P) x F_i = -P x F_total``, exactly.
+        With the reference at the rear of the body and the whole upper surface in
+        suction, the resultant lift acts one radius *ahead* of it, and the
+        nose-up moment is ``+0.5 L`` in closed form.
+        """
+        grid, faces, fluid, freestream, state = setup
+        state.u[:] = 0.0
+        state.v[:] = 0.0
+
+        centre = grid.contour.centroid
+        reference = centre + np.array([0.5, 0.0])
+
+        state.pressure[:] = 0.0
+        state.pressure[faces.wall.centre[:, 1] > centre[1], 0] = -1.0
+
+        forces = compute_forces(state, faces, fluid, freestream, 1.0, reference)
+        assert forces.lift > 0.0
+        assert forces.moment == pytest.approx(0.5 * forces.lift, rel=1e-9)
+        assert forces.moment_coefficient > 0.0
+
     def test_wall_shear_follows_the_near_wall_flow(self, setup):
         _, faces, fluid, _, state = setup
         traction, magnitude = wall_shear_stress(state, faces, fluid)
