@@ -131,6 +131,89 @@ def wall_shear_stress(
     return direction * magnitude[:, None], magnitude
 
 
+def wall_pressure(state: State, faces: FaceGeometry) -> np.ndarray:
+    """Pressure on the wall *faces*, extrapolated along the wall normal.
+
+    What the force integral needs is ``p`` on the wall face; what the solver holds
+    is ``p`` at the first cell centre, a distance ``y1`` away. Taking one for the
+    other is a zeroth-order extrapolation, and it was the largest remaining
+    first-order term in a scheme claimed to be second order.
+
+    **Why ``dp/dn = 0`` does not rescue it.** The exact normal momentum balance at
+    a solid wall, with ``u = 0`` there, is ``dp/dn = mu (grad^2 u) . n``, because
+    the convective term vanishes identically at a no-slip surface. So ``dp/dn = 0``
+    at the wall is the boundary-layer approximation, not an identity -- and the
+    derivative that matters is the one at the *cell centre*, which sits inside the
+    layer where ``u_t != 0`` and is not zero even when the wall value is. Taylor:
+
+        p_face = p_cell - y1 (dp/dn)|_cell + O(y1^2),
+
+    so using the cell value drops a term of order ``y1 (dp/dn)|_cell = O(h)``.
+    Integrated round the body it does not cancel, because ``dp/dn`` at the first
+    cell centre scales with the local ``u_t^2`` and is largest at the shoulder, so
+    it is not fore-aft symmetric. The curvature term usually blamed for this is
+    not the mechanism: on the Re 40 cylinder ``rho u1^2 y0 / R`` is 3.4e-06 of a
+    dynamic head against the 4.0e-03 actually present, three orders too small.
+
+    **The obvious construction does not work, and the measurement is why this one
+    is here instead.** The natural fix, and the one the audit proposes, is
+    ``p_face = p_P + (grad p)_P . d`` with the solver's own least-squares
+    gradient, iterated once because the gradient depends on the wall value it is
+    computing. Implemented and measured against a manufactured field on three mesh
+    families, that is **order 1.13**, not 2:
+
+        uniform mesh, 48 / 96 / 192 points        error        observed order
+          cell value                   8.07e-02 4.05e-02 2.03e-02    1.00
+          p_P + (grad p)_P . d         2.85e-02 1.21e-02 5.53e-03    1.13
+          p_P + (grad p exact) . d     3.68e-03 8.53e-04 2.04e-04    2.06
+          this: linear along n         1.15e-02 2.62e-03 6.21e-04    2.08
+
+    The third row isolates the cause: with an exact gradient the formula is second
+    order, so the formula is right and the gradient is not. The least-squares
+    gradient **in the wall row does not converge at all** -- its error measured
+    5.16e-01, 5.17e-01, 5.17e-01 across the same refinement, an observed order of
+    0.00, and 0.12 after the fixed-point pass. The reason is structural: the
+    stencil weights go as ``1/|d|^2``, and the wall face is the *nearest* stencil
+    point, so a wall value asserting zero normal gradient is the most heavily
+    weighted member of the fit. The reconstruction would be inheriting the error
+    of the very assumption it exists to remove.
+
+    So the face value is extrapolated along the wall normal through the first two
+    cell centres instead, which needs no gradient:
+
+        p_face = p_0 + (p_0 - p_1) y_0 / (y_1 - y_0)
+
+    with ``y_j`` the perpendicular distance from the wall face to centre ``j``.
+    Measured order 2.08 on the uniform family, 2.13 on the stretched one and 2.05
+    on the sheared one.
+
+    A Lagrange quadratic through the first three centres was also measured. It is
+    better on the smooth families -- order 2.94 and 3.25 -- and *worse* on the
+    sheared one at 1.95, where the third cell centre is far enough off the normal
+    that the extra point costs more than it buys. The audit's own re-integration
+    of the converged Re 40 cylinder found the linear and quadratic reconstructions
+    agreeing to 8e-05 in ``Cd_pressure``, so on a real case the extra order buys
+    nothing; the linear form is taken for being the more robust of two answers
+    that agree.
+    """
+    normal = faces.wall.normal
+    centroid = faces.metrics.centroid
+    face = faces.wall.centre
+
+    y0 = np.abs(np.sum((centroid[:, 0] - face) * normal, axis=-1))
+    y1 = np.abs(np.sum((centroid[:, 1] - face) * normal, axis=-1))
+
+    # A mesh one cell deep has nothing to extrapolate through; the cell value is
+    # then the only information there is.
+    gap = y1 - y0
+    return np.where(
+        gap > 0.0,
+        state.pressure[:, 0]
+        + (state.pressure[:, 0] - state.pressure[:, 1]) * y0 / np.where(gap > 0.0, gap, 1.0),
+        state.pressure[:, 0],
+    )
+
+
 def compute_forces(
     state: State,
     faces: FaceGeometry,
@@ -144,8 +227,7 @@ def compute_forces(
     area = faces.wall.area
     length = faces.wall.length
 
-    # Zero normal pressure gradient at a wall, so the face value is the cell value.
-    face_pressure = state.pressure[:, 0]
+    face_pressure = wall_pressure(state, faces)
     pressure_force = np.sum(face_pressure[:, None] * area, axis=0)
 
     traction, _ = wall_shear_stress(state, faces, fluid, boundaries)
@@ -200,7 +282,9 @@ def surface_data(
         x=centre[:, 0],
         y=centre[:, 1],
         arclength=np.cumsum(edges) - edges[0],
-        pressure_coefficient=state.pressure[:, 0] / dynamic,
+        # The same reconstruction the force integral uses, so a plotted Cp and
+        # the Cd it integrates to describe the same wall pressure.
+        pressure_coefficient=wall_pressure(state, faces) / dynamic,
         skin_friction_coefficient=shear / dynamic,
         y_plus=y_plus,
         wall_shear=shear,

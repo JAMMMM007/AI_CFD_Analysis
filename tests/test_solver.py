@@ -1240,6 +1240,48 @@ class TestForces:
         )
         assert forces.drag > 0.0
 
+    @pytest.mark.parametrize(
+        "mesh", [uniform_mesh, stretched_mesh, sheared_mesh],
+        ids=["uniform", "stretched", "sheared"],
+    )
+    def test_the_wall_pressure_is_second_order(self, mesh):
+        """Regression. It was the cell value, which is zeroth-order extrapolation.
+
+        A first-order boundary term in the force integral caps the observed order
+        of every coefficient the solver reports, and no amount of second-order
+        accuracy in the interior operators recovers it. Measured on the gate's own
+        mesh, this term is worth 0.143% of ``Cd``.
+
+        The order is measured against a manufactured field rather than against a
+        finer mesh of the same solution, so the exact answer is known at every
+        refinement and there is no extrapolation in the test itself.
+
+        The comparison against the cell value is part of the assertion. Without
+        it, a reconstruction that happened to be second order for an unrelated
+        reason would pass; the point is that this specific term went from first
+        order to second.
+        """
+        def error(n):
+            _, metrics, faces = mesh(n)
+            state = State.uniform(
+                faces, Fluid(density=1.0, viscosity=1.0e-3), Freestream(velocity=1.0)
+            )
+            state.pressure = scalar(metrics.centroid)
+            exact = scalar(faces.wall.centre)
+            from fluidsolver.solver.post import wall_pressure
+
+            return (
+                np.abs(state.pressure[:, 0] - exact).max(),
+                np.abs(wall_pressure(state, faces) - exact).max(),
+            )
+
+        rows = [error(n) for n in (48, 96, 192)]
+        cell = observed_order([r[0] for r in rows])
+        reconstructed = observed_order([r[1] for r in rows])
+
+        assert 0.9 < cell < 1.2
+        assert reconstructed > 1.9
+
     def test_lift_acting_ahead_of_the_reference_is_a_nose_up_moment(self, setup):
         """Regression. Every reported ``Cm`` had the opposite sign to the convention.
 
