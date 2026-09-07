@@ -841,11 +841,6 @@ class TestRhieChowConsistency:
         flux_i, flux_j, _, _ = coupling.face_fluxes(state, np.ones(faces.shape))
         return flux_i, flux_j
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="the compact operator omits the non-orthogonal cross term; "
-        "fixed in the commit that makes this pass",
-    )
     @pytest.mark.parametrize(
         "mesh",
         [lambda: uniform_mesh(96), aerofoil_mesh],
@@ -975,17 +970,69 @@ class TestPressureCorrection:
         state = case.state
         _, _, diagonal = coupling.momentum(state)
         flux_i, flux_j, d_i, d_j = coupling.face_fluxes(state, diagonal)
-        correction, coefficients = coupling.pressure_correction(
+        correction, coefficients, cross_i, cross_j = coupling.pressure_correction(
             state, flux_i, flux_j, d_i, d_j, diagonal
         )
         coupling.apply_correction(
-            state, correction, flux_i, flux_j, d_i, d_j, diagonal
+            state, correction, flux_i, flux_j, d_i, d_j, diagonal, cross_i, cross_j
         )
 
         after = ops.divergence(state.flux_i, state.flux_j, case.faces)
         expected = coefficients.apply(correction) - coefficients.source
         scale = np.abs(coefficients.source).max()
         assert np.abs(after - expected).max() < 1e-10 * scale
+
+    def test_the_cross_term_is_a_real_part_of_the_correction_on_a_skewed_mesh(self):
+        """And is identically zero on an orthogonal one, which is why it was missed.
+
+        The flux correction through a face is ``-rho D_f (grad p')_f . S``, which
+        splits into ``g (p'_N - p'_P)`` -- the part the matrix holds -- and
+        ``(grad p')_f . T``, which it cannot. The second was simply absent.
+
+        Measured after five iterations, as the largest cross flux against the
+        largest orthogonal correction flux on the same mesh:
+
+            cylinder 96 points   1.0115e-08
+            NACA 2412, y+ 1      2.2374e-01
+
+        Eight orders apart. On the cylinder the term is zero to rounding, so
+        every measurement this project has ever taken was blind to its absence;
+        on the aerofoil it is 22% of the correction that was being applied.
+
+        The thresholds are set between those two measurements with room to spare,
+        not at them.
+        """
+        from validation.aerofoil import build as build_aerofoil
+
+        def cross_fraction(case):
+            case.numerics.pressure_correctors = 1
+            for _ in range(5):
+                case.step()
+            coupling, state = case.coupling, case.state
+            _, _, diagonal = coupling.momentum(state)
+            flux_i, flux_j, d_i, d_j = coupling.face_fluxes(state, diagonal)
+            correction, _, cross_i, _ = coupling.pressure_correction(
+                state, flux_i, flux_j, d_i, d_j, diagonal
+            )
+            orthogonal = np.abs(
+                case.fluid.density
+                * d_i
+                * case.faces.i_faces.diffusion_factor
+                * (correction - np.roll(correction, 1, axis=0))
+            )
+            return np.abs(cross_i).max() / orthogonal.max()
+
+        from fluidsolver.solver.case import MeshSettings, build_case
+
+        cylinder = build_case(
+            circle(1.0, 96),
+            Fluid(density=1.0, viscosity=1.0 / 200.0),
+            Freestream(velocity=1.0),
+            mesh_settings=MeshSettings(surface_points=96, far_field_radius_ratio=20.0),
+            model_name="laminar",
+        )
+        assert cross_fraction(cylinder) < 1e-6
+        assert cross_fraction(build_aerofoil()) > 0.05
 
     def test_the_outer_row_is_not_where_the_mass_error_lives(self, case):
         """The symptom the identity above explains, stated in the terms it was seen in."""

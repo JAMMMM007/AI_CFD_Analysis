@@ -74,6 +74,34 @@ class Numerics:
     relax_eddy_viscosity: float = 0.4
     inner_tolerance: float = 0.1
     pressure_inner_tolerance: float = 0.01
+
+    # Non-orthogonal corrector passes in the pressure equation.
+    #
+    # The flux correction through a face is -rho D_f (grad p')_f . S, and on a
+    # non-orthogonal face that splits into a two-cell part the matrix can hold
+    # and a cross term it cannot. Zero here drops the cross term, which is what
+    # this code did until the Rhie-Chow flux was made consistent; each pass folds
+    # it into the source from the previous solve and solves again.
+    #
+    # The default is measured, not chosen. On the NACA 2412 at 5 degrees,
+    # Re 2.03e6, with the consistent Rhie-Chow flux:
+    #
+    #   passes   outcome
+    #   0        grinds upward from 1.8e-03 at iteration 800 to 8.2e-03 at 1500
+    #   1        converges at 1044 to 9.91e-07;  Cl 0.75894  Cd 0.011773
+    #   2        converges at 1043 to 9.92e-07;  Cl 0.7589385  Cd 0.01177273
+    #
+    # One and two passes agree to six significant figures, so the second buys
+    # nothing but a pressure solve per outer iteration -- which is the most
+    # expensive part of one. Above one pass the lagged term has already
+    # converged; below it, it is not there at all.
+    #
+    # On an orthogonal mesh the cross flux is identically zero -- measured at
+    # 1.0e-08 of the orthogonal correction flux on the cylinder against 2.2e-01
+    # on the aerofoil -- so the pass costs a solve and changes nothing there. The
+    # cylinder gate is unmoved to every printed digit and takes the same 992
+    # iterations with it as without.
+    pressure_correctors: int = 1
     max_iterations: int = 3000
     tolerance: float = 1e-6
 
@@ -365,13 +393,62 @@ class PressureVelocityCoupling:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Mass fluxes with the Rhie-Chow pressure-velocity coupling.
 
-        ``F = rho [ u_f . S  -  D_f ( (p_N - p_P) g  -  (grad p)_f . S ) ]``
+        ``F = rho [ u_f . S  -  D_f g ( (p_N - p_P)  -  (grad p)_f . d ) ]``
 
         The bracketed difference is between the compact two-cell pressure
-        gradient and the smoothly interpolated one. They agree for a smooth
-        pressure field and differ sharply for a checkerboard, which is precisely
-        the mode that has to be suppressed. The term is of order ``h^3``, so it
-        disappears under refinement without biasing the answer.
+        gradient and the smoothly interpolated one, both taken *along the same
+        direction* ``d``. They agree for a smooth pressure field and differ
+        sharply for a checkerboard, which is precisely the mode that has to be
+        suppressed. The term is of order ``h^3``, so it disappears under
+        refinement without biasing the answer.
+
+        **The two gradients have to be compared along the same direction, and
+        this is what that costs.** Written the obvious way, as the compact
+        difference ``g (p_N - p_P)`` against the interpolated gradient dotted
+        with the full area vector ``(grad p)_f . S``, they are not the same
+        operator on a non-orthogonal face. Decomposing ``S = g d + T``, a linear
+        pressure field ``p = G . x`` gives ``p_N - p_P = G . d`` exactly and
+        leaves
+
+            g (G . d) - G . (g d + T) = -G . T,
+
+        which is not zero, and is zero only where ``T`` is. So the damping term
+        did not vanish for a field with no third derivative in it -- the entire
+        justification for adding the term at all. Measured on a linear field, the
+        residue equalled ``-(grad p)_f . T`` to 8e-14 on both the cylinder and
+        the aerofoil mesh, so this is an identity rather than an estimate.
+
+        What it cost, measured on the converged NACA 2412 at 5 degrees: the term
+        as coded was 9.5 times larger than the term it was supposed to be, and
+        93% of its content was the spurious residue rather than the third
+        derivative. On the worst single face the spurious part reached 34% of the
+        physical flux through it, and over the domain it introduced 1.37e-04 of
+        the total mass throughput -- two orders above the 1e-6 the run stops at,
+        so it was not buried under iteration error. Its relative size is
+        ``(h / L) tan(theta)``, first order in ``h`` and not vanishing under
+        refinement of a self-similar family, because ``theta`` does not; the
+        scheme was therefore formally first order on any non-orthogonal mesh
+        whatever the interior operators did.
+
+        The form above is the same split the diffusion assembly uses, with the
+        cancellation already done: adding ``(grad p)_f . T`` to the compact
+        operator and subtracting ``(grad p)_f . S`` from it leaves ``g`` times
+        the difference between the compact pressure difference and the
+        interpolated gradient projected on ``d``. That is manifestly zero for a
+        linear field on any mesh, and it is cheaper than the uncancelled version
+        -- one dot product with ``delta`` in place of one with the area vector,
+        and ``cross`` is not needed at all.
+
+        **The pressure-correction operator is deliberately *not* changed to
+        match.** It stays orthogonal-only, in :meth:`pressure_correction` and in
+        :meth:`apply_correction` alike, which are the two that must agree with
+        each other -- and they still do. The correction operator is the Jacobian
+        of this flux with respect to ``p'``, and an inexact Jacobian costs
+        convergence rate and nothing else, because ``p' -> 0`` at the fixed point
+        and the converged flux is this one. Making it exact would add a lagged
+        cross term to the matrix and risk diagonal dominance on a mesh with 39%
+        of its cells in the polar-blended region, which is the trade this project
+        has already declined once. Revisit it only if the outer iteration slows.
 
         Also returns the two ``D`` coefficients the pressure equation needs.
         """
@@ -389,33 +466,29 @@ class PressureVelocityCoupling:
             velocity, np.roll(velocity, 1, axis=0)
         )
         d_i = self.faces.i_faces.interpolate(mobility, np.roll(mobility, 1, axis=0))
-        compact = (
-            state.pressure - np.roll(state.pressure, 1, axis=0)
-        ) * self.faces.i_faces.diffusion_factor
-        smooth = np.sum(
-            self.faces.i_faces.interpolate(grad_p, np.roll(grad_p, 1, axis=0))
-            * self.faces.metrics.face_i_area,
-            axis=-1,
+        grad_face_i = self.faces.i_faces.interpolate(
+            grad_p, np.roll(grad_p, 1, axis=0)
+        )
+        damping_i = self.faces.i_faces.diffusion_factor * (
+            (state.pressure - np.roll(state.pressure, 1, axis=0))
+            - np.sum(grad_face_i * self.faces.i_faces.delta, axis=-1)
         )
         flux_i = self.fluid.density * (
             np.sum(interpolated * self.faces.metrics.face_i_area, axis=-1)
-            - d_i * (compact - smooth)
+            - d_i * damping_i
         )
 
         # --- j faces (interior only; boundaries handled below) ---
         d_j = self.faces.j_faces.interpolate(mobility[:, 1:], mobility[:, :-1])
         interpolated_j = self.faces.j_faces.interpolate(velocity[:, 1:], velocity[:, :-1])
-        compact_j = (
-            state.pressure[:, 1:] - state.pressure[:, :-1]
-        ) * self.faces.j_faces.diffusion_factor
-        smooth_j = np.sum(
-            self.faces.j_faces.interpolate(grad_p[:, 1:], grad_p[:, :-1])
-            * self.faces.metrics.face_j_area[:, 1:-1],
-            axis=-1,
+        grad_face_j = self.faces.j_faces.interpolate(grad_p[:, 1:], grad_p[:, :-1])
+        damping_j = self.faces.j_faces.diffusion_factor * (
+            (state.pressure[:, 1:] - state.pressure[:, :-1])
+            - np.sum(grad_face_j * self.faces.j_faces.delta, axis=-1)
         )
         interior_j = self.fluid.density * (
             np.sum(interpolated_j * self.faces.metrics.face_j_area[:, 1:-1], axis=-1)
-            - d_j * (compact_j - smooth_j)
+            - d_j * damping_j
         )
 
         # Wall: impermeable. Far field: whatever the boundary velocity carries,
@@ -444,8 +517,40 @@ class PressureVelocityCoupling:
         d_i: np.ndarray,
         d_j: np.ndarray,
         diagonal: np.ndarray,
-    ) -> tuple[np.ndarray, Coefficients]:
-        """Solve for the pressure correction that restores continuity."""
+    ) -> tuple[np.ndarray, Coefficients, np.ndarray, np.ndarray]:
+        """Solve for the pressure correction that restores continuity.
+
+        The flux correction through a face is ``-rho D_f (grad p')_f . S``, and on
+        a non-orthogonal face that does not reduce to a two-cell difference. It
+        splits the way every other flux in this code splits,
+
+            (grad p')_f . S  =  g (p'_N - p'_P)  +  (grad p')_f . T,
+
+        with the first part implicit in the matrix and the second lagged in the
+        source. Returning to the source and re-solving is a *non-orthogonal
+        corrector* pass; :attr:`Numerics.pressure_correctors` sets how many.
+
+        **This term used to be absent, and its absence was being paid for by a
+        bug.** With the old flux definition, ``face_fluxes`` carried a spurious
+        ``+rho D_f (grad p)_f . T`` of its own -- measured at 9.5 times the
+        damping term it was supposed to be -- and the two errors partly cancelled.
+        Correcting the flux alone, without adding this, broke the cancellation:
+        the NACA 2412 stopped converging and instead ground upward from 1.8e-03 at
+        iteration 800 to 8.2e-03 at 1500, and the NACA 0012 at Re 2e6 diverged
+        outright at iteration 163, its fastest cell at ten times the freestream
+        and sitting at ``j = 54`` -- inside the polar-blended region, which is
+        where the mesh's non-orthogonality lives and therefore where this term is
+        the one that was missing. That pair of measurements is the whole argument
+        for this pass existing.
+
+        It reverses a decision recorded in ``docs/audit-response-plan.md``, which
+        followed the audit in expecting the matrix could stay orthogonal-only
+        because ``p' -> 0`` at convergence. That reasoning is sound about the
+        *fixed point* and says nothing about whether the iteration reaches it.
+
+        Diagonal dominance is not at risk, because the cross term goes to the
+        source and never to the matrix: the five bands are exactly what they were.
+        """
         density = self.fluid.density
         coefficients = Coefficients.zeros(self.faces.shape)
 
@@ -466,18 +571,88 @@ class PressureVelocityCoupling:
         # correction through that face is zero.
         coefficients.centre[:, -1] += self._far_field_coupling(flux_j, diagonal)
 
-        coefficients.source = -ops.divergence(flux_i, flux_j, self.faces)
+        imbalance = -ops.divergence(flux_i, flux_j, self.faces)
+        fixed = self.boundaries.far_pressure_is_fixed(flux_j[:, -1])
 
         matrix = self.matrix.build(coefficients)
-        correction, _ = solve(
-            matrix,
-            coefficients.source,
-            np.zeros(self.faces.shape),
-            tolerance=self.numerics.pressure_inner_tolerance,
-            max_iterations=400,
-            preconditioner=incomplete_lu_preconditioner(matrix),
+        preconditioner = incomplete_lu_preconditioner(matrix)
+
+        correction = np.zeros(self.faces.shape)
+        cross_i = np.zeros_like(flux_i)
+        cross_j = np.zeros_like(flux_j)
+
+        # One pass is the plain orthogonal solve; each further pass folds the
+        # lagged cross-term flux into the source and solves again. The loop is
+        # written so that ``pressure_correctors = 0`` reproduces the previous
+        # behaviour exactly, which is what makes the two comparable.
+        for _ in range(1 + self.numerics.pressure_correctors):
+            coefficients.source = imbalance - ops.divergence(
+                cross_i, cross_j, self.faces
+            )
+            correction, _ = solve(
+                matrix,
+                coefficients.source,
+                correction,
+                tolerance=self.numerics.pressure_inner_tolerance,
+                max_iterations=400,
+                preconditioner=preconditioner,
+            )
+            if self.numerics.pressure_correctors:
+                cross_i, cross_j = self._correction_cross_flux(
+                    correction, d_i, d_j, fixed
+                )
+
+        # The source is left describing the cross flux that is actually applied,
+        # not the one the last solve was given. The two differ by one lag, which
+        # is the deferred correction's own error, and it belongs in the reported
+        # pressure residual rather than being hidden: leaving the stale source
+        # here would make ``A p' - b`` describe a flux update that never happened,
+        # which is the same class of disagreement the far-field coupling once
+        # had. Measured on the 96-point cylinder, this takes the identity in
+        # ``test_the_corrected_fluxes_satisfy_the_equation_that_produced_them``
+        # from a deviation of 2.0e-12 back to rounding.
+        if self.numerics.pressure_correctors:
+            coefficients.source = imbalance - ops.divergence(
+                cross_i, cross_j, self.faces
+            )
+
+        return correction, coefficients, cross_i, cross_j
+
+    def _correction_cross_flux(
+        self,
+        correction: np.ndarray,
+        d_i: np.ndarray,
+        d_j: np.ndarray,
+        fixed: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """``-rho D_f (grad p')_f . T`` on every interior face, zero on boundaries.
+
+        The half of the flux correction the matrix cannot hold, because
+        ``(grad p')_f`` is not a two-point quantity. Boundary faces carry none of
+        it: the wall passes no mass at all, and a far-field face either holds the
+        velocity -- in which case its flux is fixed and no correction goes through
+        it -- or holds the pressure, where ``p'`` is pinned to zero and the
+        :meth:`_far_field_coupling` term is the whole story.
+        """
+        density = self.fluid.density
+        gradient = self.gradient(
+            correction,
+            correction[:, 0],
+            np.where(fixed, 0.0, correction[:, -1]),
         )
-        return correction, coefficients
+
+        cross_i = -density * d_i * np.sum(
+            self.faces.i_faces.interpolate(gradient, np.roll(gradient, 1, axis=0))
+            * self.faces.i_faces.cross,
+            axis=-1,
+        )
+        interior_j = -density * d_j * np.sum(
+            self.faces.j_faces.interpolate(gradient[:, 1:], gradient[:, :-1])
+            * self.faces.j_faces.cross,
+            axis=-1,
+        )
+        zero = np.zeros((self.faces.shape[0], 1))
+        return cross_i, np.concatenate((zero, interior_j, zero), axis=1)
 
     def _far_field_coupling(
         self, flux_j: np.ndarray, diagonal: np.ndarray
@@ -512,15 +687,24 @@ class PressureVelocityCoupling:
         d_i: np.ndarray,
         d_j: np.ndarray,
         diagonal: np.ndarray,
+        cross_i: np.ndarray | None = None,
+        cross_j: np.ndarray | None = None,
     ) -> None:
         """Update pressure, velocity and fluxes with the correction, in place.
 
-        The fluxes are corrected with the same compact operator that built the
-        pressure equation, so continuity is satisfied to solver tolerance
-        immediately -- the far-field faces that hold the pressure included, via
-        :meth:`_far_field_coupling`. The cell velocities are corrected with the
-        smooth gradient instead: they are cell quantities, and using the compact
-        form on them would reintroduce the decoupling Rhie-Chow just removed.
+        The fluxes are corrected with the same operator that built the pressure
+        equation -- both halves of it, the compact two-cell part the matrix holds
+        and the lagged non-orthogonal part :meth:`pressure_correction` moved to
+        the source -- so continuity is satisfied to solver tolerance immediately,
+        the far-field faces that hold the pressure included, via
+        :meth:`_far_field_coupling`. Applying one half and not the other is the
+        failure that this class has already had once, and it is what
+        ``test_the_corrected_fluxes_satisfy_the_equation_that_produced_them``
+        exists to catch.
+
+        The cell velocities are corrected with the smooth gradient instead: they
+        are cell quantities, and using the compact form on them would reintroduce
+        the decoupling Rhie-Chow just removed.
         """
         density = self.fluid.density
         fixed = self.boundaries.far_pressure_is_fixed(flux_j[:, -1])
@@ -546,6 +730,9 @@ class PressureVelocityCoupling:
             * self.faces.j_faces.diffusion_factor
             * (correction[:, 1:] - correction[:, :-1])
         )
+        if cross_i is not None:
+            state.flux_i = state.flux_i + cross_i
+            state.flux_j[:, 1:-1] += cross_j[:, 1:-1]
         # The far field holds p' at zero where it holds the pressure, so the
         # correction through that face is outward and proportional to p' in the
         # cell inside it. Where it holds the velocity instead the coupling is
@@ -582,7 +769,7 @@ class PressureVelocityCoupling:
         flux_i, flux_j, d_i, d_j = self.face_fluxes(state, diagonal)
         imbalance = ops.divergence(flux_i, flux_j, self.faces)
 
-        correction, pressure_coefficients = self.pressure_correction(
+        correction, pressure_coefficients, cross_i, cross_j = self.pressure_correction(
             state, flux_i, flux_j, d_i, d_j, diagonal
         )
         # Measured at the correction that was obtained, not at zero. At zero the
@@ -594,7 +781,7 @@ class PressureVelocityCoupling:
         residual_p = pressure_coefficients.residual(correction)
 
         self.apply_correction(
-            state, correction, flux_i, flux_j, d_i, d_j, diagonal
+            state, correction, flux_i, flux_j, d_i, d_j, diagonal, cross_i, cross_j
         )
 
         # Continuity residual, scaled by the mass actually flowing through the
