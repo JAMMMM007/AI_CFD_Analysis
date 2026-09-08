@@ -591,23 +591,33 @@ class PressureVelocityCoupling:
         # --- i faces (all interior, wrapping around the body) ---
         velocity = state.velocity
         interpolated = self.faces.i_faces.interpolate(
-            velocity, np.roll(velocity, 1, axis=0)
+            *ops.i_neighbours(velocity, self.faces)
         )
-        d_i = self.faces.i_faces.interpolate(mobility, np.roll(mobility, 1, axis=0))
-        e_i = self.faces.i_faces.interpolate(unrelaxed, np.roll(unrelaxed, 1, axis=0))
+        d_i = self.faces.i_faces.interpolate(*ops.i_neighbours(mobility, self.faces))
+        e_i = self.faces.i_faces.interpolate(*ops.i_neighbours(unrelaxed, self.faces))
         grad_face_i = self.faces.i_faces.interpolate(
-            grad_p, np.roll(grad_p, 1, axis=0)
+            *ops.i_neighbours(grad_p, self.faces)
         )
+        owner_p, neighbour_p = ops.i_neighbours(state.pressure, self.faces)
         damping_i = self.faces.i_faces.diffusion_factor * (
-            (state.pressure - np.roll(state.pressure, 1, axis=0))
+            (owner_p - neighbour_p)
             - np.sum(grad_face_i * self.faces.i_faces.delta, axis=-1)
         )
         damping_flux_i = -self.fluid.density * e_i * damping_i
+        area_i = self.faces.metrics.face_i_area
+        if not self.faces.periodic_i:
+            area_i = area_i[1:-1]
         flux_i = (
-            self.fluid.density
-            * np.sum(interpolated * self.faces.metrics.face_i_area, axis=-1)
+            self.fluid.density * np.sum(interpolated * area_i, axis=-1)
             + damping_flux_i
         )
+        if not self.faces.periodic_i:
+            # The two ends are impermeable until a boundary condition says
+            # otherwise, and are assembled into the face array the way the wall
+            # and far-field j fluxes are below -- so that flux_i carries one
+            # entry per face, exactly as flux_j does.
+            closed = np.zeros((1, self.faces.shape[1]))
+            flux_i = np.concatenate((closed, flux_i, closed), axis=0)
 
         # --- j faces (interior only; boundaries handled below) ---
         d_j = self.faces.j_faces.interpolate(mobility[:, 1:], mobility[:, :-1])
@@ -688,9 +698,10 @@ class PressureVelocityCoupling:
         coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
 
         coupling_i = density * d_i * self.faces.i_faces.diffusion_factor
-        coefficients.centre += coupling_i + np.roll(coupling_i, -1, axis=0)
-        coefficients.west -= coupling_i
-        coefficients.east -= np.roll(coupling_i, -1, axis=0)
+        low_i, high_i = ops.spread_i(coupling_i, self.faces)
+        coefficients.centre += low_i + high_i
+        coefficients.west -= low_i
+        coefficients.east -= high_i
 
         coupling_j = density * d_j * self.faces.j_faces.diffusion_factor
         coefficients.centre[:, 1:] += coupling_j
@@ -792,10 +803,13 @@ class PressureVelocityCoupling:
         )
 
         cross_i = -density * d_i * np.sum(
-            self.faces.i_faces.interpolate(gradient, np.roll(gradient, 1, axis=0))
+            self.faces.i_faces.interpolate(*ops.i_neighbours(gradient, self.faces))
             * self.faces.i_faces.cross,
             axis=-1,
         )
+        if not self.faces.periodic_i:
+            closed = np.zeros((1, self.faces.shape[1]))
+            cross_i = np.concatenate((closed, cross_i, closed), axis=0)
         interior_j = -density * d_j * np.sum(
             self.faces.j_faces.interpolate(gradient[:, 1:], gradient[:, :-1])
             * self.faces.j_faces.cross,
@@ -870,9 +884,16 @@ class PressureVelocityCoupling:
         state.u -= mobility * correction_gradient[..., 0]
         state.v -= mobility * correction_gradient[..., 1]
 
-        state.flux_i = flux_i - density * d_i * self.faces.i_faces.diffusion_factor * (
-            correction - np.roll(correction, 1, axis=0)
+        owner_c, neighbour_c = ops.i_neighbours(correction, self.faces)
+        correction_i = (
+            density * d_i * self.faces.i_faces.diffusion_factor
+            * (owner_c - neighbour_c)
         )
+        if self.faces.periodic_i:
+            state.flux_i = flux_i - correction_i
+        else:
+            state.flux_i = flux_i.copy()
+            state.flux_i[1:-1] -= correction_i
         state.flux_j = flux_j.copy()
         state.flux_j[:, 1:-1] -= (
             density
@@ -883,6 +904,7 @@ class PressureVelocityCoupling:
         if cross_i is not None:
             state.flux_i = state.flux_i + cross_i
             state.flux_j[:, 1:-1] += cross_j[:, 1:-1]
+
         # The far field holds p' at zero where it holds the pressure, so the
         # correction through that face is outward and proportional to p' in the
         # cell inside it. Where it holds the velocity instead the coupling is

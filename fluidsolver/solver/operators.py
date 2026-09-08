@@ -152,14 +152,32 @@ class Gradient:
         self._wall_tangential = _tangential(south[:, 0], faces.wall.normal)
         self._far_tangential = _tangential(north[:, -1], faces.far_field.normal)
 
-        self._offsets = np.stack(
-            (
-                np.roll(centroid, 1, axis=0) - centroid,
-                np.roll(centroid, -1, axis=0) - centroid,
-                south,
-                north,
-            ),
-            axis=2,
+        if faces.periodic_i:
+            west = np.roll(centroid, 1, axis=0) - centroid
+            east = np.roll(centroid, -1, axis=0) - centroid
+        else:
+            # The same construction as south and north above: where there is no
+            # neighbouring cell the stencil reaches to the boundary face instead,
+            # which keeps it rectangular and needs no special-casing downstream.
+            west = np.empty_like(centroid)
+            west[1:] = centroid[:-1] - centroid[1:]
+            west[0] = faces.i_start.centre - centroid[0]
+
+            east = np.empty_like(centroid)
+            east[:-1] = centroid[1:] - centroid[:-1]
+            east[-1] = faces.i_end.centre - centroid[-1]
+
+        self._offsets = np.stack((west, east, south, north), axis=2)
+        self._periodic_i = faces.periodic_i
+        self._i_start_tangential = (
+            None
+            if faces.periodic_i
+            else _tangential(west[0], faces.i_start.normal)
+        )
+        self._i_end_tangential = (
+            None
+            if faces.periodic_i
+            else _tangential(east[-1], faces.i_end.normal)
         )
 
         squared = np.sum(self._offsets**2, axis=-1)
@@ -192,6 +210,8 @@ class Gradient:
         field: np.ndarray,
         wall: np.ndarray | None,
         far_field: np.ndarray | None,
+        i_start: np.ndarray | None = None,
+        i_end: np.ndarray | None = None,
     ) -> np.ndarray:
         """Gradient of a cell field, ``(Ni, Nj, 2)``.
 
@@ -225,11 +245,14 @@ class Gradient:
         seed with ``phi_face = phi_P``, rebuild, apply. That lags by one pass and
         is exact at convergence.
         """
-        if wall is None or far_field is None:
+        open_i = not self._periodic_i
+        if wall is None or far_field is None or (open_i and (i_start is None or i_end is None)):
             seeded = self(
                 field,
                 field[:, 0] if wall is None else wall,
                 field[:, -1] if far_field is None else far_field,
+                field[0] if open_i and i_start is None else i_start,
+                field[-1] if open_i and i_end is None else i_end,
             )
             if wall is None:
                 wall = field[:, 0] + np.sum(
@@ -239,6 +262,12 @@ class Gradient:
                 far_field = field[:, -1] + np.sum(
                     seeded[:, -1] * self._far_tangential, axis=-1
                 )
+            if open_i and i_start is None:
+                i_start = field[0] + np.sum(
+                    seeded[0] * self._i_start_tangential, axis=-1
+                )
+            if open_i and i_end is None:
+                i_end = field[-1] + np.sum(seeded[-1] * self._i_end_tangential, axis=-1)
 
         south = np.empty_like(field)
         south[:, 1:] = field[:, :-1] - field[:, 1:]
@@ -248,15 +277,19 @@ class Gradient:
         north[:, :-1] = field[:, 1:] - field[:, :-1]
         north[:, -1] = far_field - field[:, -1]
 
-        differences = np.stack(
-            (
-                np.roll(field, 1, axis=0) - field,
-                np.roll(field, -1, axis=0) - field,
-                south,
-                north,
-            ),
-            axis=2,
-        )
+        if self._periodic_i:
+            west = np.roll(field, 1, axis=0) - field
+            east = np.roll(field, -1, axis=0) - field
+        else:
+            west = np.empty_like(field)
+            west[1:] = field[:-1] - field[1:]
+            west[0] = i_start - field[0]
+
+            east = np.empty_like(field)
+            east[:-1] = field[1:] - field[:-1]
+            east[-1] = i_end - field[-1]
+
+        differences = np.stack((west, east, south, north), axis=2)
 
         rhs = np.einsum(
             "ijn,ijn,ijna->ija", self._weights, differences, self._offsets
