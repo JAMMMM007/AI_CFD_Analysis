@@ -344,6 +344,123 @@ def grid():
     )
 
 
+def uniform_rectangle(nx: int = 7, ny: int = 4, dx: float = 0.5, dy: float = 0.25):
+    """``(nx+1, ny+1, 2)`` nodes of a uniform rectangle, open in ``i``.
+
+    Every metric of this mesh is known in closed form, which is what makes it the
+    right thing to check an open topology against: the alternative -- comparing it
+    with the periodic branch -- can only show that two code paths agree, not that
+    either is right.
+    """
+    x = np.arange(nx + 1) * dx
+    y = np.arange(ny + 1) * dy
+    return np.stack(np.meshgrid(x, y, indexing="ij"), axis=-1)
+
+
+class TestOpenTopology:
+    """That ``i`` can stop wrapping, and that saying so changes nothing else.
+
+    The O-grid closes its surface into a loop, so cell ``Ni-1`` neighbours cell
+    ``0``. A flat plate or a channel does not, and the NASA TMR verification
+    cases this project intends -- ``2DZP`` and ``2DB`` -- are both of that kind.
+
+    The shape is what distinguishes them, and it is the same relationship ``j``
+    has always had: a closed loop has as many i-faces as cells because the last
+    is shared with the first, an open one has one more.
+    """
+
+    def test_the_periodic_path_is_untouched(self):
+        """The invariant the whole refactor rests on, asserted rather than hoped.
+
+        ``periodic_i=True`` is the default, so an untouched caller must get
+        untouched numbers. This rebuilds the volumes and the ``j`` face areas from
+        the expressions ``compute_metrics`` used before the topology flag existed
+        and requires them to agree exactly -- not approximately, since nothing in
+        the periodic branch should have been re-associated.
+        """
+        grid = build_ogrid(
+            naca4("2412", 400).resample(160, min_spacing=1e-4),
+            first_layer=1e-4,
+            far_field_radius=20.0,
+        )
+        nodes = grid.nodes
+        metrics = compute_metrics(nodes)
+        assert metrics.periodic_i
+        assert metrics.face_i_area.shape[:2] == metrics.shape
+
+        following = np.roll(nodes, -1, axis=0)
+        corners = [nodes[:, :-1], following[:, :-1], following[:, 1:], nodes[:, 1:]]
+        area = np.zeros(corners[0].shape[:-1])
+        for current, nxt in zip(corners, corners[1:] + corners[:1]):
+            area += current[..., 0] * nxt[..., 1] - nxt[..., 0] * current[..., 1]
+        assert np.array_equal(metrics.volume, 0.5 * area)
+
+        edge = following - nodes
+        assert np.array_equal(
+            metrics.face_j_area, np.stack((-edge[..., 1], edge[..., 0]), axis=-1)
+        )
+
+    def test_an_open_mesh_has_one_more_i_face_than_cells(self):
+        nodes = uniform_rectangle()
+        metrics = compute_metrics(nodes, periodic_i=False)
+        assert not metrics.periodic_i
+        assert metrics.shape == (7, 4)
+        assert metrics.face_i_area.shape == (8, 4, 2)
+        assert metrics.face_j_area.shape == (7, 5, 2)
+
+    def test_a_uniform_rectangle_is_exact(self):
+        """Volumes, centroids and both face families, in closed form."""
+        dx, dy = 0.5, 0.25
+        metrics = compute_metrics(uniform_rectangle(dx=dx, dy=dy), periodic_i=False)
+
+        assert np.allclose(metrics.volume, dx * dy, rtol=0, atol=1e-15)
+        centres = np.stack(
+            np.meshgrid(
+                (np.arange(7) + 0.5) * dx, (np.arange(4) + 0.5) * dy, indexing="ij"
+            ),
+            axis=-1,
+        )
+        assert np.allclose(metrics.centroid, centres, rtol=0, atol=1e-15)
+        assert np.allclose(metrics.face_i_area, [dy, 0.0], rtol=0, atol=1e-15)
+        assert np.allclose(metrics.face_j_area, [0.0, dx], rtol=0, atol=1e-15)
+
+    def test_the_faces_of_an_open_cell_still_close(self):
+        """The identity every conservation property downstream rests on.
+
+        On the periodic mesh this is ``cell_face_areas`` summing to zero. Here it
+        is written out directly, because the open ``i`` family is indexed
+        differently -- ``face_i[i+1] - face_i[i]`` rather than a rolled
+        difference -- and that indexing is exactly what could be got wrong.
+        """
+        metrics = compute_metrics(uniform_rectangle(), periodic_i=False)
+        closure = (
+            metrics.face_i_area[1:]
+            - metrics.face_i_area[:-1]
+            + metrics.face_j_area[:, 1:]
+            - metrics.face_j_area[:, :-1]
+        )
+        scale = np.linalg.norm(metrics.face_j_area, axis=-1).max()
+        assert np.abs(closure).max() < 1e-14 * scale
+
+    def test_the_wall_line_of_an_open_mesh_is_not_closed_into_a_loop(self):
+        """Regression against a wall that does not exist.
+
+        ``_wall_distance`` joins the last surface point back to the first, which
+        is right for a body and wrong for a plate: it would lay a segment straight
+        from the trailing edge to the leading one, across the domain, and every
+        cell would measure its distance to that instead. On this mesh the wall is
+        ``y = 0`` and the answer is ``(j + 0.5) dy`` exactly.
+        """
+        dy = 0.25
+        metrics = compute_metrics(uniform_rectangle(dy=dy), periodic_i=False)
+        expected = ((np.arange(4) + 0.5) * dy)[None, :]
+        assert np.allclose(metrics.wall_distance, expected, rtol=0, atol=1e-15)
+
+    def test_an_open_mesh_needs_two_node_lines(self):
+        with pytest.raises(ValueError, match="at least two node lines"):
+            compute_metrics(uniform_rectangle()[:1], periodic_i=False)
+
+
 class TestWallDistance:
     """That it measures a distance to the surface, not to a sampling of it."""
 
