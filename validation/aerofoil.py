@@ -30,7 +30,7 @@ that a run of this gate today and a run in two years are the same run.
     incidence             5 degrees, applied by rotating the body
     fluid                 air at 15 C: rho 1.225, mu 1.81e-5
     freestream            30 m/s, so Re = 2.03e6 on a unit chord
-    turbulence intensity  0.1%, eddy viscosity ratio 1.0 (the defaults)
+    turbulence intensity  0.005%, eddy viscosity ratio 1e-3 (the defaults)
     surface points        240
     target y+             1
     far-field radius      40 chords
@@ -126,6 +126,16 @@ REFERENCE = {
 #:     the run and measured after it, and the gate's job is to detect the NEXT
 #:     unexplained change rather than to certify this one.
 #:
+#:   current -- TMR ambient turbulence defaults and the SST-sust terms
+#:     2600 it  3.35e-06   Cl 0.76778  Cd 0.010571  Cdp 0.003131  Cdf 0.007440
+#:              Cm +0.08527   y+ 0.134 .. 2.326
+#:     Everything moves by less than 0.1%, which is the expected size: the ambient
+#:     eddy viscosity is now 1e-3 of molecular against a boundary-layer peak in
+#:     the hundreds, so it has almost nothing to do at the body. What it changes
+#:     is elsewhere -- k now arrives at the body at 1.0000 of its set value rather
+#:     than 0.0423, so the ambient level no longer depends on where the far-field
+#:     boundary was put.
+#:
 #: **The first run also settled the hardening plan's first open item.** It was
 #: made on factory `Numerics()` with the divergence monitor *armed* and converged
 #: without raising anything. The plan, the README and the handover all describe a
@@ -139,13 +149,13 @@ RESIDUAL_FLOOR = 5.0e-06
 
 BASELINE = {
     "iterations": 2600,
-    "residual": 2.80e-06,
-    "Cl": 0.76808,
-    "Cd": 0.010579,
-    "Cd_pressure": 0.003134,
-    "Cd_friction": 0.007445,
-    "Cm": +0.08526,
-    "y_plus_min": 0.130,
+    "residual": 3.35e-06,
+    "Cl": 0.76778,
+    "Cd": 0.010571,
+    "Cd_pressure": 0.003131,
+    "Cd_friction": 0.007440,
+    "Cm": +0.08527,
+    "y_plus_min": 0.134,
     "y_plus_max": 2.326,
 }
 

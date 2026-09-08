@@ -87,20 +87,49 @@ class Freestream:
         the freestream, so the circular far-field boundary stays aligned with the
         mesh and plots stay upright.
     turbulence_intensity
-        ``u'/U`` in the freestream, as a fraction. 0.001 (0.1%) is representative
-        of a clean wind tunnel or free air; 0.05 of a noisy one. Sets the inlet
-        ``k``.
+        ``u'/U`` in the freestream, as a fraction. Sets the inlet ``k``.
     eddy_viscosity_ratio
         Freestream ``mu_t / mu``. Together with the intensity this fixes the
-        inlet ``omega``. Values of 1 to 10 are usual for external aerodynamics;
-        much larger and the freestream turbulence contaminates the boundary
-        layer.
+        inlet ``omega``.
+
+    **The defaults are the NASA TMR's ambient values, and the ones they replaced
+    were two orders outside them.** The Turbulence Modeling Resource specifies,
+    for external aerodynamics:
+
+        U/L < omega_far < 10 U/L
+        1e-5 U^2/Re_L < k_far < 0.1 U^2/Re_L
+        1e-5 < mu_t_far / mu < 1e-2
+
+    The old defaults, 0.1% intensity with a viscosity ratio of 1, put ``k`` 30
+    times and ``mu_t/mu`` a hundred times above the top of those bands. Measured
+    on the primary case -- 30 m/s, unit chord, air at 15 C, so ``Re_L = 2.03e6``:
+
+        I 1e-3, ratio 1.0     k 1.3500e-03  OUT   omega 91.4  in   mu_t/mu 1.0    OUT
+        I 5e-5, ratio 1e-3    k 3.3750e-06  in    omega 228   in   mu_t/mu 1e-3   in
+
+    The second pair is inside all three with margin rather than at a band edge,
+    and is what these defaults are.
+
+    The physics audit's suggested replacement -- ``k_amb = 1e-6 U^2`` with
+    ``omega_amb = 5 U/L`` -- was measured against the same bands and is outside
+    two of them: ``k`` comes to 9.0e-04, twenty times the top of the ``k`` band,
+    and ``mu_t/mu`` to 4.06e-01 where the audit states 7.4e-3. It would not have
+    fixed what it diagnoses.
+
+    **A fixed default cannot satisfy these bands at every operating point, and
+    that is a property of the parameterisation rather than of the numbers.** The
+    ``k`` band scales as ``U mu / (rho L)`` and the ``omega`` band as ``U / L``,
+    while ``k = 3/2 (I U)^2`` and ``omega = rho k / (mu r)`` both scale as ``U^2``
+    at fixed ``I`` and ``r``. So any pair chosen here is right at one Reynolds
+    number and drifts from the bands away from it. Rather than pretend otherwise,
+    :func:`fluidsolver.solver.health.assess` measures the actual values against
+    the actual bands for the case being run and says so when they fall outside.
     """
 
     velocity: float
     angle_of_attack_deg: float = 0.0
-    turbulence_intensity: float = 0.001
-    eddy_viscosity_ratio: float = 1.0
+    turbulence_intensity: float = 5.0e-5
+    eddy_viscosity_ratio: float = 1.0e-3
 
     def __post_init__(self):
         if self.velocity <= 0.0:
@@ -161,3 +190,42 @@ class Freestream:
             f"limit for the incompressible assumption. Density would vary by roughly "
             f"{50 * mach**2:.0f}% near a stagnation point, which this solver does not model."
         )
+
+
+#: NASA Turbulence Modeling Resource ambient bands for external aerodynamics,
+#: as (low, high) multipliers on the quantities named in Freestream's docstring.
+TMR_OMEGA_BAND = (1.0, 10.0)
+TMR_K_BAND = (1.0e-5, 0.1)
+TMR_VISCOSITY_RATIO_BAND = (1.0e-5, 1.0e-2)
+
+
+def ambient_turbulence_bands(
+    freestream: "Freestream", fluid: Fluid, reference_length: float
+) -> dict[str, tuple[float, float, float]]:
+    """The three ambient quantities, each with the band it should lie in.
+
+    Returns ``{name: (value, low, high)}``. Separate from the warning that uses
+    it so that a caller can report the numbers rather than only the verdict --
+    "outside the band" is much less useful than "1.35e-03 against a top of
+    4.43e-05".
+    """
+    velocity = freestream.velocity
+    reynolds = fluid.reynolds(velocity, reference_length)
+    k = freestream.turbulent_kinetic_energy()
+    omega = freestream.specific_dissipation(fluid)
+
+    scale_k = velocity**2 / reynolds
+    scale_omega = velocity / reference_length
+    return {
+        "k": (k, TMR_K_BAND[0] * scale_k, TMR_K_BAND[1] * scale_k),
+        "omega": (
+            omega,
+            TMR_OMEGA_BAND[0] * scale_omega,
+            TMR_OMEGA_BAND[1] * scale_omega,
+        ),
+        "mu_t/mu": (
+            freestream.eddy_viscosity_ratio,
+            TMR_VISCOSITY_RATIO_BAND[0],
+            TMR_VISCOSITY_RATIO_BAND[1],
+        ),
+    }

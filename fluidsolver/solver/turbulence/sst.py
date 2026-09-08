@@ -107,6 +107,34 @@ class KOmegaSST(TurbulenceModel):
         self._k_floor = K_FLOOR_FRACTION * freestream.turbulent_kinetic_energy()
         self._omega_floor = OMEGA_FLOOR_FRACTION * freestream.specific_dissipation(fluid)
 
+        #: The ambient ``(k, omega)`` the sustaining terms hold the freestream at.
+        #:
+        #: SST-sust, which the NASA Turbulence Modeling Resource specifies as a
+        #: named variant of SST-2003. Without it the freestream turbulence decays
+        #: on its way to the body: in the freestream ``F1 -> 0``, production
+        #: vanishes, and the two equations reduce to
+        #:
+        #:     U dk/dx = -beta* k omega,   U domega/dx = -beta_2 omega^2,
+        #:
+        #: whose solution falls as ``(1 + beta_2 omega_0 x / U)^(-beta*/beta_2)``.
+        #: Over forty chords at the old defaults that is a factor of 11 in
+        #: ``omega`` and 14 in ``k``, so a user asking for 0.1% intensity got
+        #: 0.027% at the body -- and *how much* they got depended on where the
+        #: far-field boundary had been put, which makes a numerical parameter into
+        #: a physical one and compounds the far-field error the vortex correction
+        #: exists to remove.
+        #:
+        #: Adding ``beta* rho k_amb omega_amb`` and ``beta rho omega_amb^2`` to the
+        #: two sources cancels the destruction exactly at the ambient level, so the
+        #: ambient state is a fixed point of the model rather than an initial
+        #: condition for a decay. It is a *source*, not a floor: nothing is clipped
+        #: and the field is free to fall below the ambient level wherever the
+        #: physics takes it there.
+        self._ambient = (
+            freestream.turbulent_kinetic_energy(),
+            freestream.specific_dissipation(fluid),
+        )
+
     # ------------------------------------------------------------------
 
     def update(self, state: State) -> tuple[float, float]:
@@ -367,6 +395,10 @@ class KOmegaSST(TurbulenceModel):
         # cannot drive k negative; as an explicit source it could.
         coefficients.centre += BETA_STAR * density * omega * self.volume
         coefficients.source += production * self.volume
+        # SST-sust: cancel the destruction at the ambient level exactly, so the
+        # freestream values stop decaying. See _ambient.
+        k_amb, omega_amb = self._ambient
+        coefficients.source += BETA_STAR * density * k_amb * omega_amb * self.volume
 
         return self._solve_and_clip(coefficients, state, "k", self._k_floor)
 
@@ -401,6 +433,8 @@ class KOmegaSST(TurbulenceModel):
         # Destruction is quadratic; linearising it as beta rho omega_old * omega
         # keeps it implicit and unconditionally stable.
         coefficients.centre += beta * density * omega * self.volume
+        # SST-sust, the omega half. See _ambient.
+        coefficients.source += beta * density * self._ambient[1] ** 2 * self.volume
         # gamma P~_k / nu_t, not gamma rho S^2. See the module docstring.
         coefficients.source += (
             gamma * density * self._limited_production_over_nu_t(state, strain)
