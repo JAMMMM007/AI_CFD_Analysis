@@ -857,6 +857,78 @@ class TestBoundaries:
         assert np.allclose(far[~boundaries.inflow_mask(flux)], 0.0)
         assert np.allclose(far[boundaries.inflow_mask(flux)], 7.0)
 
+    def test_the_bound_vortex_turns_the_right_way(self, setup):
+        """Three independent physical checks, because the obvious source has it
+        the other way round.
+
+        A point vortex of counter-clockwise strength ``G`` induces
+        ``(G/2pi)(-(y-y0), (x-x0))/|r-r0|^2``. Taking ``G = +Gamma`` with
+        ``Gamma = Cl U c / 2`` -- which is how the physics audit writes it -- puts
+        the induced velocity above a lifting body along ``-x``, so the flow is
+        *slower* over the suction side. That is backwards, and all three of these
+        fail together with it:
+
+            above the body   u > 0   faster where the pressure is lower
+            ahead of it      v > 0   upwash
+            behind it        v < 0   downwash
+
+        The bound vortex of a body lifting along ``+y`` in a freestream along
+        ``+x`` is clockwise. Getting this wrong would double the error rather than
+        remove it, and it would still look plausible: the sensitivity to the
+        far-field radius would change, just in the wrong direction.
+        """
+        faces, boundaries, _ = setup
+        boundaries.set_circulation(0.75)
+        assert boundaries.circulation > 0.0
+
+        centre = boundaries.vortex_centre
+        induced = boundaries.far_vortex_velocity()
+        offset = faces.far_field.centre - centre
+
+        above = np.argmax(offset[:, 1])
+        ahead = np.argmin(offset[:, 0])
+        behind = np.argmax(offset[:, 0])
+
+        assert induced[above, 0] > 0.0
+        assert induced[ahead, 1] > 0.0
+        assert induced[behind, 1] < 0.0
+
+    def test_the_induced_velocity_has_the_magnitude_kutta_joukowski_gives(self, setup):
+        """``|u| = Gamma / (2 pi R) = Cl c / (4 pi R) * U``, analytically.
+
+        The far-field boundary of this mesh is a circle about the body, so every
+        face sits at the same radius and the induced speed is the same on all of
+        them. That makes the magnitude checkable in closed form rather than by
+        comparison against another run.
+        """
+        faces, boundaries, freestream = setup
+        cl, chord = 0.75, boundaries.reference_length
+        boundaries.set_circulation(cl)
+
+        induced = boundaries.far_vortex_velocity()
+        radius = np.linalg.norm(
+            faces.far_field.centre - boundaries.vortex_centre, axis=-1
+        )
+        expected = cl * chord * freestream.velocity / (4.0 * np.pi * radius)
+        assert np.allclose(np.linalg.norm(induced, axis=-1), expected, rtol=1e-12)
+
+    def test_a_non_lifting_case_is_untouched(self, setup):
+        """Zero circulation must leave both far-field conditions exactly as they
+        were, or every cylinder result in this project moves for no reason."""
+        faces, boundaries, _ = setup
+        assert boundaries.circulation == 0.0
+
+        assert np.array_equal(
+            boundaries.far_vortex_velocity(),
+            np.zeros_like(faces.far_field.centre),
+        )
+
+        flux = boundaries.far_flux_from_freestream()
+        pressure = np.zeros((faces.shape[0], 3))
+        assert np.allclose(
+            boundaries.far_pressure(pressure, flux)[~boundaries.inflow_mask(flux)], 0.0
+        )
+
     def test_a_boundary_with_outflow_needs_no_compatibility_projection(self, setup):
         """Because it is not a pure Neumann problem, which is the whole point.
 
@@ -1145,57 +1217,71 @@ class TestPressureCorrection:
         scale = np.abs(coefficients.source).max()
         assert np.abs(after - expected).max() < 1e-10 * scale
 
-    def test_the_cross_term_is_a_real_part_of_the_correction_on_a_skewed_mesh(self):
-        """And is identically zero on an orthogonal one, which is why it was missed.
+    @pytest.mark.parametrize(
+        "mesh, ceiling, floor",
+        [(lambda: uniform_mesh(96), 1e-5, 0.0), (aerofoil_mesh, None, 5e-3)],
+        ids=["near-orthogonal circle", "body-fitted aerofoil"],
+    )
+    def test_the_cross_term_is_a_real_part_of_the_correction(self, mesh, ceiling, floor):
+        """And is identically zero on an orthogonal mesh, which is why it was missed.
 
         The flux correction through a face is ``-rho D_f (grad p')_f . S``, which
         splits into ``g (p'_N - p'_P)`` -- the part the matrix holds -- and
         ``(grad p')_f . T``, which it cannot. The second was simply absent.
 
-        Measured after five iterations, as the largest cross flux against the
-        largest orthogonal correction flux on the same mesh:
+        Measured here on a *prescribed* smooth correction field rather than on
+        whatever a few solver iterations happen to have produced, as the largest
+        cross flux against the largest orthogonal correction flux on the same
+        face family:
 
-            cylinder 96 points   1.0115e-08
-            NACA 2412, y+ 1      2.2374e-01
+                          i-faces      j-faces
+            circle 96x32  3.7653e-07   2.8636e-07
+            aerofoil      1.7714e-02   9.1376e-02
 
-        Eight orders apart. On the cylinder the term is zero to rounding, so
-        every measurement this project has ever taken was blind to its absence;
-        on the aerofoil it is 22% of the correction that was being applied.
+        Five orders apart. On the circle the term is at the level of that mesh's
+        own residual non-orthogonality -- ``build_ogrid`` marches even a circular
+        body, so it is orthogonal to about 6e-7 rather than to rounding -- and on
+        the aerofoil it is 1.8% of the correction on the ``i`` faces and 9.1% on
+        the ``j`` faces. Either way it was missing entirely.
 
-        The thresholds are set between those two measurements with room to spare,
-        not at them.
+        The first version of this test ran five solver iterations and measured
+        0.224 on the aerofoil, and then read 0.0385 once the far-field vortex
+        correction changed the opening transient. Both numbers are true and
+        neither is about the cross term: iteration five of a cold start is a
+        fragile place to measure a ratio. What the term's size actually depends on
+        is the mesh, so the field is prescribed and the measurement is
+        deterministic. The real ``_correction_cross_flux`` still does the work.
         """
-        from validation.aerofoil import build as build_aerofoil
+        from fluidsolver.solver.simple import Numerics, PressureVelocityCoupling
 
-        def cross_fraction(case):
-            case.numerics.pressure_correctors = 1
-            for _ in range(5):
-                case.step()
-            coupling, state = case.coupling, case.state
-            _, _, diagonal = coupling.momentum(state)
-            flux_i, flux_j, d_i, d_j = coupling.face_fluxes(state, diagonal)
-            correction, _, cross_i, _ = coupling.pressure_correction(
-                state, flux_i, flux_j, d_i, d_j, diagonal
-            )
-            orthogonal = np.abs(
-                case.fluid.density
-                * d_i
-                * case.faces.i_faces.diffusion_factor
-                * (correction - np.roll(correction, 1, axis=0))
-            )
-            return np.abs(cross_i).max() / orthogonal.max()
-
-        from fluidsolver.solver.case import MeshSettings, build_case
-
-        cylinder = build_case(
-            circle(1.0, 96),
-            Fluid(density=1.0, viscosity=1.0 / 200.0),
-            Freestream(velocity=1.0),
-            mesh_settings=MeshSettings(surface_points=96, far_field_radius_ratio=20.0),
-            model_name="laminar",
+        _, metrics, faces = mesh()
+        fluid = Fluid(density=1.0, viscosity=1.0e-3)
+        freestream = Freestream(velocity=1.0)
+        coupling = PressureVelocityCoupling(
+            faces, fluid, Boundaries(faces, fluid, freestream), Numerics(),
+            wall_model=False,
         )
-        assert cross_fraction(cylinder) < 1e-6
-        assert cross_fraction(build_aerofoil()) > 0.05
+
+        correction = np.sin(1.7 * metrics.centroid[..., 0]) * np.cos(
+            1.1 * metrics.centroid[..., 1]
+        )
+        mobility = metrics.volume
+        d_i = faces.i_faces.interpolate(mobility, np.roll(mobility, 1, axis=0))
+        d_j = faces.j_faces.interpolate(mobility[:, 1:], mobility[:, :-1])
+        fixed = np.zeros(faces.shape[0], dtype=bool)
+
+        cross_i, _ = coupling._correction_cross_flux(correction, d_i, d_j, fixed)
+        orthogonal = np.abs(
+            fluid.density
+            * d_i
+            * faces.i_faces.diffusion_factor
+            * (correction - np.roll(correction, 1, axis=0))
+        )
+        fraction = np.abs(cross_i).max() / orthogonal.max()
+
+        if ceiling is not None:
+            assert fraction < ceiling
+        assert fraction > floor
 
     def test_the_outer_row_is_not_where_the_mass_error_lives(self, case):
         """The symptom the identity above explains, stated in the terms it was seen in."""

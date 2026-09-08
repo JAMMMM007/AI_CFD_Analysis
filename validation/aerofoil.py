@@ -73,8 +73,8 @@ INCIDENCE_DEG = 5.0
 #: For orientation only, not as targets: Abbott and von Doenhoff give the
 #: NACA 2412 a section `Cl` near 0.75 at 5 degrees and `Cm_ac` near -0.05.
 REFERENCE = {
-    "Cl": (0.68, 0.83),
-    "Cd": (0.0106, 0.0130),
+    "Cl": (0.69, 0.85),
+    "Cd": (0.0095, 0.0117),
     "Cd_friction": (0.0067, 0.0082),
 }
 
@@ -110,6 +110,22 @@ REFERENCE = {
 #:     This entry does not converge to 1e-6, deliberately rather than unnoticed;
 #:     see RESIDUAL_FLOOR and AerofoilResult.passes.
 #:
+#:   current -- the far-field vortex correction
+#:     2600 it  2.80e-06   Cl 0.76808  Cd 0.010579  Cdp 0.003134  Cdf 0.007445
+#:              Cm +0.08526   y+ 0.130 .. 2.326
+#:     Cl +1.24%, Cd -9.6%, Cd_pressure -26.2%, Cd_friction -0.09%. The audit's
+#:     Richardson extrapolation in 1/R put the domain-truncation error at forty
+#:     chords at -1.24% in Cl and +10.1% in Cd; the correction removes almost
+#:     exactly that, in the right direction, which is the check that it is doing
+#:     what it claims rather than merely moving the answer. Friction drag is a
+#:     near-wall quantity and does not move, as it should not.
+#:
+#:     The band on Cd is re-centred here for the second time, which is worth
+#:     flagging: a band that follows the answer is not a test. It is defensible
+#:     only because each move is a landed change whose size was predicted before
+#:     the run and measured after it, and the gate's job is to detect the NEXT
+#:     unexplained change rather than to certify this one.
+#:
 #: **The first run also settled the hardening plan's first open item.** It was
 #: made on factory `Numerics()` with the divergence monitor *armed* and converged
 #: without raising anything. The plan, the README and the handover all describe a
@@ -123,14 +139,14 @@ RESIDUAL_FLOOR = 5.0e-06
 
 BASELINE = {
     "iterations": 2600,
-    "residual": 3.63e-06,
-    "Cl": 0.75872,
-    "Cd": 0.011697,
-    "Cd_pressure": 0.004245,
-    "Cd_friction": 0.007452,
-    "Cm": +0.08360,
-    "y_plus_min": 0.275,
-    "y_plus_max": 2.310,
+    "residual": 2.80e-06,
+    "Cl": 0.76808,
+    "Cd": 0.010579,
+    "Cd_pressure": 0.003134,
+    "Cd_friction": 0.007445,
+    "Cm": +0.08526,
+    "y_plus_min": 0.130,
+    "y_plus_max": 2.326,
 }
 
 

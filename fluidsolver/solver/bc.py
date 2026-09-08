@@ -87,6 +87,71 @@ class Boundaries:
     fluid: Fluid
     freestream: Freestream
 
+    #: Reference length, for the bound circulation. Only the far-field vortex
+    #: correction uses it, and only through ``Gamma = Cl U c / 2``.
+    reference_length: float = 1.0
+    #: Bound circulation, positive for positive lift, updated once per outer
+    #: iteration from the lift the solution currently carries. Zero disables the
+    #: far-field vortex correction entirely, which is what a non-lifting case
+    #: settles at on its own and what every case starts from.
+    circulation: float = 0.0
+    #: Where the bound vortex is placed. Defaults to the centroid of the wall
+    #: face centres. The quarter chord is the textbook choice; at forty chords
+    #: the difference between the two is ``O(c/R)`` of a term that is itself
+    #: ``O(c/R)``, so it is second order in exactly the quantity being corrected.
+    vortex_centre: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.vortex_centre is None:
+            self.vortex_centre = self.faces.wall.centre.mean(axis=0)
+
+    def set_circulation(self, lift_coefficient: float) -> None:
+        """``Gamma = Cl U c / 2``, from Kutta-Joukowski.
+
+        ``L = rho U Gamma`` and ``Cl = L / (rho U^2 c / 2)`` together give
+        ``Gamma = Cl U c / 2``. Called once per outer iteration with the lift the
+        solution currently has, so the correction is lagged by one iteration and
+        exact at the fixed point. A cold start has ``Cl = 0`` and the correction
+        switches itself on as the circulation develops.
+        """
+        self.circulation = 0.5 * lift_coefficient * self.freestream.velocity * (
+            self.reference_length
+        )
+
+    def far_vortex_velocity(self) -> np.ndarray:
+        """Velocity the bound vortex induces at each far-field face centre.
+
+        **The sign is derived, not copied, because the obvious source has it the
+        other way round.** A point vortex of counter-clockwise strength ``G`` at
+        ``r_0`` induces ``(G / 2 pi) (-(y - y_0), (x - x_0)) / |r - r_0|^2``. Put
+        ``G = +Gamma`` with ``Gamma = Cl U c / 2`` -- which is how the physics
+        audit writes it -- and evaluate above a lifting body: the induced velocity
+        comes out along ``-x``, so the flow is *slower* over the suction side.
+        That is the wrong way round, and two independent checks say so:
+
+            above the body   u must be > 0   (faster where the pressure is lower)
+            ahead of it      v must be > 0   (upwash)
+            behind it        v must be < 0   (downwash)
+
+        All three fail together with ``G = +Gamma`` and hold together with
+        ``G = -Gamma``. The bound vortex of a body lifting along ``+y`` in a
+        freestream along ``+x`` is *clockwise*. Written out with ``Gamma``
+        positive for positive lift, that is
+
+            u_induced = (Gamma / 2 pi) ( (y - y_0), -(x - x_0) ) / |r - r_0|^2
+
+        which is what this returns.
+        """
+        if self.circulation == 0.0:
+            return np.zeros_like(self.faces.far_field.centre)
+
+        offset = self.faces.far_field.centre - self.vortex_centre
+        radius_squared = np.sum(offset * offset, axis=-1)
+        rotated = np.stack((offset[:, 1], -offset[:, 0]), axis=-1)
+        return (self.circulation / (2.0 * np.pi)) * rotated / np.maximum(
+            radius_squared, 1e-300
+        )[:, None]
+
     # ------------------------------------------------------------------
     # Wall
     # ------------------------------------------------------------------
@@ -274,23 +339,71 @@ class Boundaries:
     def far_velocity(
         self, u: np.ndarray, v: np.ndarray, far_flux: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Freestream where flow enters, extrapolated where it leaves."""
+        """Freestream plus the bound vortex where flow enters; extrapolated where
+        it leaves.
+
+        **Why the freestream alone is not good enough.** A lifting body carries a
+        bound circulation, and outside the viscous region the flow it sets up is
+
+            u = U_inf + Gamma/(2 pi r) e_theta + O(r^-2),
+
+        so imposing ``u = U_inf`` on the boundary imposes an error of
+        ``-u_vortex`` there. Its size is ``Cl c / (4 pi R)`` -- for ``Cl = 0.75``
+        at forty chords, 1.5 parts in a thousand of the freestream, which sounds
+        negligible. It is not, because it is imposed as a velocity over an arc of
+        length ``2 pi R``, so the spurious volume flux it removes is ``O(Gamma)``:
+        the whole circulation, however far away the boundary is put.
+
+        The error is therefore ``O(1/R)`` in every integrated coefficient, and
+        that is the prediction to test rather than assume -- halving ``R`` should
+        double it. Measured on this solver, the NACA 2412 at 5 degrees between 20
+        and 40 chords: see ``docs/audit-response-plan.md``.
+
+        With the vortex superposed the leading term is gone and the error falls to
+        ``O(1/R^2)``. This is the standard treatment since Thomas and Salas
+        (1986); Vassberg and Jameson (2010) give the grid-convergence evidence for
+        how far out one has to go without it, which is several hundred chords for
+        0.1% in ``Cl``.
+
+        Only inflow faces get it. Outflow faces extrapolate the interior velocity
+        and always did; imposing anything there would over-specify the problem.
+        """
         entering = self.inflow_mask(far_flux)
         stream = self.freestream.vector
+        induced = self.far_vortex_velocity()
         return (
-            np.where(entering, stream[0], u[:, -1]),
-            np.where(entering, stream[1], v[:, -1]),
+            np.where(entering, stream[0] + induced[:, 0], u[:, -1]),
+            np.where(entering, stream[1] + induced[:, 1], v[:, -1]),
         )
 
     def far_pressure(self, p: np.ndarray, far_flux: np.ndarray) -> np.ndarray:
-        """Zero where flow leaves, extrapolated where it enters.
+        """The vortex's Bernoulli pressure where flow leaves, extrapolated where
+        it enters.
 
-        Fixing the pressure on the outflow is also what makes the pressure
-        equation solvable at all: with a pure Neumann condition everywhere the
-        pressure would be determined only up to a constant, and the matrix would
-        be singular.
+        Fixing the pressure on the outflow is what makes the pressure equation
+        solvable at all: with a pure Neumann condition everywhere the pressure
+        would be determined only up to a constant and the matrix would be
+        singular.
+
+        The value fixed there used to be zero, which is right only if the
+        far-field velocity is the freestream. Once the bound vortex is superposed
+        it is not, and the matching pressure follows from Bernoulli along a
+        streamline from infinity:
+
+            p_far = (rho / 2) ( U_inf^2 - |u_far|^2 ).
+
+        Imposing the corrected velocity while leaving the pressure pinned at zero
+        would assert a boundary state that does not satisfy the outer flow's own
+        momentum equation, which is a worse inconsistency than the one being
+        removed. With ``Gamma = 0`` this reduces to zero exactly, so a non-lifting
+        case is untouched.
         """
-        return np.where(self.inflow_mask(far_flux), p[:, -1], 0.0)
+        stream = self.freestream.vector
+        far = stream + self.far_vortex_velocity()
+        bernoulli = 0.5 * self.fluid.density * (
+            self.freestream.velocity**2 - np.sum(far * far, axis=-1)
+        )
+        return np.where(self.inflow_mask(far_flux), p[:, -1], bernoulli)
 
     def far_pressure_is_fixed(self, far_flux: np.ndarray) -> np.ndarray:
         """Faces where the pressure correction is pinned to zero."""

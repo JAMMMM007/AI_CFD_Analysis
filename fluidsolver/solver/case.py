@@ -130,7 +130,10 @@ class Case:
             )
 
         self.faces = build_faces(self.metrics)
-        self.boundaries = Boundaries(self.faces, self.fluid, self.freestream)
+        self.boundaries = Boundaries(
+            self.faces, self.fluid, self.freestream,
+            reference_length=self.reference_length,
+        )
         self.coupling = PressureVelocityCoupling(
             self.faces,
             self.fluid,
@@ -231,6 +234,14 @@ class Case:
             )
 
         forces = self.forces()
+
+        # Hand the far field the circulation the solution now carries, for the
+        # next iteration's inflow condition. Lagged by one iteration and exact at
+        # the fixed point; a cold start has Cl = 0, so the correction switches
+        # itself on as the circulation develops rather than being asserted from
+        # an initial guess. See Boundaries.far_velocity.
+        self.boundaries.set_circulation(forces.lift_coefficient)
+
         self.iteration += 1
         residuals = Residuals(
             iteration=self.iteration,
