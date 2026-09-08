@@ -37,9 +37,57 @@ from fluidsolver.solver.linalg import Coefficients
 SCHEMES = ("upwind", "linear", "linear_upwind", "limited_linear")
 
 
+def i_neighbours(field: np.ndarray, faces: FaceGeometry):
+    """``(owner, neighbour)`` cell values either side of each interior ``i`` face.
+
+    The one place the two topologies differ, so that nothing downstream has to
+    know which it is on. Around a closed body face ``i`` separates cells ``i-1``
+    and ``i`` for every ``i``, and the neighbour is a roll. On an open mesh the
+    interior faces are the ``Ni-1`` node lines with a cell on both sides, and the
+    two sides are plain slices -- which is how the ``j`` direction has always been
+    written.
+    """
+    if faces.periodic_i:
+        return field, np.roll(field, 1, axis=0)
+    return field[1:], field[:-1]
+
+
+def spread_i(values: np.ndarray, faces: FaceGeometry):
+    """A quantity on interior ``i`` faces, gathered onto the cells either side.
+
+    Returns ``(low, high)``: what the face on a cell's low-``i`` side contributes
+    and what the face on its high-``i`` side does, zero where the cell has no such
+    interior face. On a periodic mesh every cell has both and this is the pair of
+    rolls the operators used to write out; on an open mesh the first cell has no
+    low face and the last no high one, and those ends are boundaries instead.
+    """
+    if faces.periodic_i:
+        return values, np.roll(values, -1, axis=0)
+    low = np.zeros(faces.shape, dtype=values.dtype)
+    high = np.zeros(faces.shape, dtype=values.dtype)
+    low[1:] = values
+    high[:-1] = values
+    return low, high
+
+
+def i_boundaries(faces: FaceGeometry):
+    """The ``i`` boundary families with the cell row each acts on.
+
+    Empty on a periodic mesh. The index is a tuple so that a caller can use it on
+    a coefficient array without caring whether it names a row or a column, which
+    is what lets the ``i`` and ``j`` boundary treatments share one code path.
+    """
+    if faces.periodic_i:
+        return ()
+    return (
+        (faces.i_start, (0, slice(None))),
+        (faces.i_end, (-1, slice(None))),
+    )
+
+
 def face_values_i(field: np.ndarray, faces: FaceGeometry) -> np.ndarray:
-    """Linearly interpolate a cell field onto the ``i`` faces. Shape ``(Ni, Nj)``."""
-    return faces.i_faces.interpolate(field, np.roll(field, 1, axis=0))
+    """Linearly interpolate a cell field onto the interior ``i`` faces."""
+    return faces.i_faces.interpolate(*i_neighbours(field, faces))
 
 
 def face_values_j(
@@ -228,6 +276,8 @@ def add_diffusion(
     far_field_diffusivity: np.ndarray | None = None,
     wall_active: np.ndarray | None = None,
     far_field_active: np.ndarray | None = None,
+    i_start_value: np.ndarray | None = None,
+    i_end_value: np.ndarray | None = None,
 ) -> None:
     """Add ``-div(Gamma grad phi)`` to the coefficients, in place.
 
@@ -246,9 +296,10 @@ def add_diffusion(
     # Interior i faces. Each face is shared: it is the east face of cell (i-1)
     # and the west face of cell (i), so it lands in two rows with opposite signs.
     coupling = gamma_i * faces.i_faces.diffusion_factor
-    coefficients.centre += coupling + np.roll(coupling, -1, axis=0)
-    coefficients.west -= coupling
-    coefficients.east -= np.roll(coupling, -1, axis=0)
+    low, high = spread_i(coupling, faces)
+    coefficients.centre += low + high
+    coefficients.west -= low
+    coefficients.east -= high
 
     # Interior j faces, present only between j-1 and j for j >= 1.
     coupling_j = gamma_j * faces.j_faces.diffusion_factor
@@ -260,13 +311,14 @@ def add_diffusion(
     # Non-orthogonal correction: the part of the flux the two-point coupling
     # cannot represent, evaluated on the lagged gradient.
     face_gradient_i = faces.i_faces.interpolate(
-        field_gradient, np.roll(field_gradient, 1, axis=0)
+        *i_neighbours(field_gradient, faces)
     )
     # The cross term sits on the left of the equation, so it enters the source
     # with its sign reversed. A cell is the owner of its west face and the
     # neighbour of its east face, and picks up opposite signs from the two.
     cross_i = gamma_i * np.sum(face_gradient_i * faces.i_faces.cross, axis=-1)
-    coefficients.source += np.roll(cross_i, -1, axis=0) - cross_i
+    cross_low, cross_high = spread_i(cross_i, faces)
+    coefficients.source += cross_high - cross_low
 
     face_gradient_j = faces.j_faces.interpolate(
         field_gradient[:, 1:], field_gradient[:, :-1]
@@ -276,25 +328,40 @@ def add_diffusion(
     coefficients.source[:, :-1] += cross_j
 
     _add_boundary_diffusion(
-        coefficients, faces.wall, 0, wall_value,
+        coefficients, faces.wall, (slice(None), 0), wall_value,
         _boundary_diffusivity(wall_diffusivity, diffusivity[:, 0]),
         field_gradient[:, 0], wall_active,
     )
     _add_boundary_diffusion(
-        coefficients, faces.far_field, -1, far_field_value,
+        coefficients, faces.far_field, (slice(None), -1), far_field_value,
         _boundary_diffusivity(far_field_diffusivity, diffusivity[:, -1]),
         field_gradient[:, -1], far_field_active,
     )
+    # The i ends, when there are any. Zero-gradient unless a caller says
+    # otherwise, which is what an untouched signature means: a mesh that has just
+    # grown two new boundaries must not silently acquire two new Dirichlet
+    # conditions with it.
+    for boundary, index in i_boundaries(faces):
+        _add_boundary_diffusion(
+            coefficients, boundary, index, i_boundary_value(index, i_start_value,
+                                                            i_end_value),
+            diffusivity[index], field_gradient[index], None,
+        )
 
 
 def _boundary_diffusivity(supplied, fallback) -> np.ndarray:
     return fallback if supplied is None else supplied
 
 
+def i_boundary_value(index, start_value, end_value):
+    """Pick the value belonging to whichever ``i`` end ``index`` names."""
+    return start_value if index[0] == 0 else end_value
+
+
 def _add_boundary_diffusion(
     coefficients: Coefficients,
     face,
-    column: int,
+    index,
     value: np.ndarray | None,
     diffusivity: np.ndarray,
     cell_gradient: np.ndarray,
@@ -316,8 +383,8 @@ def _add_boundary_diffusion(
         # puts one there anyway.
         coupling = np.where(active, coupling, 0.0)
         cross = np.where(active, cross, 0.0)
-    coefficients.centre[:, column] += coupling
-    coefficients.source[:, column] += coupling * value + cross
+    coefficients.centre[index] += coupling
+    coefficients.source[index] += coupling * value + cross
 
 
 def add_convection(
@@ -348,11 +415,16 @@ def add_convection(
 
     # Upwind, implicit. For a face carrying flux F out of the owner, the owner
     # supplies the face value when F > 0 and the neighbour when F < 0.
-    outflow_i = np.maximum(flux_i, 0.0)
-    inflow_i = np.maximum(-flux_i, 0.0)
-    coefficients.centre += inflow_i + np.roll(outflow_i, -1, axis=0)
-    coefficients.west -= outflow_i
-    coefficients.east -= np.roll(inflow_i, -1, axis=0)
+    interior_i = flux_i if faces.periodic_i else flux_i[1:-1]
+    outflow_i = np.maximum(interior_i, 0.0)
+    inflow_i = np.maximum(-interior_i, 0.0)
+    inflow_low, _ = spread_i(inflow_i, faces)
+    _, outflow_high = spread_i(outflow_i, faces)
+    outflow_low, _ = spread_i(outflow_i, faces)
+    _, inflow_high = spread_i(inflow_i, faces)
+    coefficients.centre += inflow_low + outflow_high
+    coefficients.west -= outflow_low
+    coefficients.east -= inflow_high
 
     interior_j = flux_j[:, 1:-1]
     outflow_j = np.maximum(interior_j, 0.0)
@@ -405,16 +477,20 @@ def _add_deferred_correction(
     scheme: str,
 ) -> None:
     """Move the high-order minus upwind difference into the source."""
-    correction_i = flux_i * _face_correction(
+    interior_i = flux_i if faces.periodic_i else flux_i[1:-1]
+    owner, neighbour = i_neighbours(field, faces)
+    owner_gradient, neighbour_gradient = i_neighbours(field_gradient, faces)
+    correction_i = interior_i * _face_correction(
         faces.i_faces,
-        flux_i,
-        owner=field,
-        neighbour=np.roll(field, 1, axis=0),
-        owner_gradient=field_gradient,
-        neighbour_gradient=np.roll(field_gradient, 1, axis=0),
+        interior_i,
+        owner=owner,
+        neighbour=neighbour,
+        owner_gradient=owner_gradient,
+        neighbour_gradient=neighbour_gradient,
         scheme=scheme,
     )
-    coefficients.source -= np.roll(correction_i, -1, axis=0) - correction_i
+    correction_low, correction_high = spread_i(correction_i, faces)
+    coefficients.source -= correction_high - correction_low
 
     correction_j = flux_j[:, 1:-1] * _face_correction(
         faces.j_faces,
@@ -482,6 +558,7 @@ def pseudo_time_diagonal(
     flux_i: np.ndarray,
     flux_j: np.ndarray,
     volume: np.ndarray,
+    faces: FaceGeometry,
     *,
     density: float,
     velocity: float,
@@ -536,9 +613,10 @@ def pseudo_time_diagonal(
     through any face it is damped as though the freestream crossed one reference
     length.
     """
+    low_i, high_i = _flux_i_faces(flux_i, faces)
     outflow = (
-        np.maximum(-flux_i, 0.0)
-        + np.maximum(np.roll(flux_i, -1, axis=0), 0.0)
+        np.maximum(-low_i, 0.0)
+        + np.maximum(high_i, 0.0)
         + np.maximum(-flux_j[:, :-1], 0.0)
         + np.maximum(flux_j[:, 1:], 0.0)
     )
@@ -553,10 +631,18 @@ def divergence(
 
     This is the continuity imbalance the pressure correction has to remove, and
     its magnitude is the headline convergence measure for the SIMPLE loop.
+
+    ``flux_i`` carries its boundary faces the way ``flux_j`` always has -- one
+    entry per face, so ``Ni`` of them when the loop closes and ``Ni+1`` when it
+    does not. That symmetry is what makes the two directions read identically
+    here.
     """
-    return (
-        np.roll(flux_i, -1, axis=0)
-        - flux_i
-        + flux_j[:, 1:]
-        - flux_j[:, :-1]
-    )
+    low_i, high_i = _flux_i_faces(flux_i, faces)
+    return high_i - low_i + flux_j[:, 1:] - flux_j[:, :-1]
+
+
+def _flux_i_faces(flux_i: np.ndarray, faces: FaceGeometry):
+    """``(low, high)`` face fluxes on the two ``i`` sides of every cell."""
+    if faces.periodic_i:
+        return flux_i, np.roll(flux_i, -1, axis=0)
+    return flux_i[:-1], flux_i[1:]

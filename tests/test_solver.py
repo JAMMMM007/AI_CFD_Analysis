@@ -435,7 +435,7 @@ class TestPseudoTime:
         flux_j = np.zeros((faces.shape[0], faces.shape[1] + 1))
 
         diagonal = ops.pseudo_time_diagonal(
-            flux_i, flux_j, metrics.volume,
+            flux_i, flux_j, metrics.volume, faces,
             density=1.0, velocity=1.0, reference_length=1.0, cfl=4.0,
         )
         # Every i face carries +2, so each cell sees 2 out of its east face and
@@ -448,7 +448,7 @@ class TestPseudoTime:
         zero_j = np.zeros((faces.shape[0], faces.shape[1] + 1))
 
         diagonal = ops.pseudo_time_diagonal(
-            zero_i, zero_j, metrics.volume,
+            zero_i, zero_j, metrics.volume, faces,
             density=2.0, velocity=5.0, reference_length=10.0, cfl=1.0,
         )
         assert np.all(diagonal > 0.0)

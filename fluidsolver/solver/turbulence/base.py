@@ -54,6 +54,7 @@ class TurbulenceModel(ABC):
             state.flux_i,
             state.flux_j,
             self.faces.metrics.volume,
+            self.faces,
             density=self.fluid.density,
             velocity=self.boundaries.freestream.velocity,
             reference_length=self.reference_length,
