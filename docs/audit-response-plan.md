@@ -522,7 +522,30 @@ and `mu_t/mu` at 4.06e-01 where the text states 7.4e-3. Both would have moved th
 numbers without fixing what they diagnose, and both were caught by checking rather
 than by reading.
 
-**The three-mesh study has not been re-run** since any of this landed, so the
-observed order of `Cd` is still the audit's 1.261 measured on the old code. Two
-first-order terms have been removed since; whether the order moved is unmeasured,
-and `validation/convergence.py` exists to measure it.
+**The three-mesh study has been re-run, and the order is second.** On a family
+refined by 1.5 in both directions at once -- 180x53, 270x80, 405x119, measured
+ratios of 1.4937 and 1.5046 in Celik's `h` -- the observed order of `Cd` is
+**2.006**, with a GCI of 0.031% and a limit of 1.517935. `Cd_pressure` gives
+2.038 and `Cd_friction` 1.978.
+
+The attribution is controlled rather than asserted. Two things changed between
+the audit's 1.261 and this: the code, and the family. Running the audit's own
+construction on today's code separates them and gives **2.047** by its own
+arithmetic -- same family, same assumed ratio, 1.261 before and 2.047 after. The
+first-order terms removed from the flux definition and the force integral are
+what moved it.
+
+That control also settles something about the family. Its measured refinement
+ratios are 1.2571 and 1.2589, not the 1.5 assumed, and Celik requires at least
+1.3, so `validation/convergence.py` refuses to extrapolate on it -- the refusal
+built into the harness catching the case it was built for. The wake length comes
+out at 0.735 there, reproducing the audit's figure exactly, which is a
+cross-check between two independent implementations.
+
+**The wake is the one that has not moved and does not converge.** Order 1.124 and
+a GCI of 5.745% on the good family, against 0.031% for the drag, and 9.7% from
+its own extrapolated 2.349. None of the audit's findings touched it, and none
+would have: it is a wake-resolution property, which is Stage 6's business. The
+gate now prints that distance beside the value, so a number agreeing with the
+literature because it is right no longer looks like one agreeing because the mesh
+is coarse.

@@ -80,6 +80,22 @@ VELOCITY = 1.0
 #: pressure-velocity coupling and the force integral all in the loop, it now
 #: delivers that.
 #:
+#: **That it is the code and not the family is measured, not assumed.** The audit
+#: reported 1.261 for the same quantity, on a family built differently -- surface
+#: points and first layer scaled by 1.5 with ``growth`` left alone, which adds
+#: only three layers a level and gives 53, 56, 59. Running *that* construction on
+#: today's code gives an order of **2.047** by the audit's own arithmetic. Same
+#: family, same assumed ratio, 1.261 before and 2.047 after: the first-order terms
+#: coming out of the flux definition and the force integral are what moved it.
+#:
+#: The same control says something about the family as well. Its measured
+#: refinement ratios in ``h`` are 1.2571 and 1.2589, not the 1.5 it was assumed to
+#: have, and Celik's procedure requires at least 1.3 -- so ``validation.convergence``
+#: refuses to extrapolate on it at all, which is the refusal working. And the wake
+#: length comes out at 0.735 there, reproducing the audit's 0.735 exactly, which is
+#: as good a cross-check between two independent implementations as this project
+#: has.
+#:
 #: The **wake length still does not converge**: observed order 1.124 and a GCI of
 #: 5.7%, against 0.03% for the drag. Its extrapolated value is 2.349, and the
 #: gate reports 2.12 on the coarsest mesh -- so the agreement with Coutanceau and

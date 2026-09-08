@@ -60,7 +60,7 @@ On the solve page the field plot is the whole point, so it gets the room:
 |---|---|
 | Geometry: NACA 4-digit, circle, square, DXF import | working, tested |
 | Body-fitted O-grid mesher | working, tested |
-| Finite-volume discretisation | working; the operators are second order on orthogonal, stretched and non-orthogonal meshes (manufactured solution). The *solved* order of `Cd` on the cylinder is 1.26 -- see below |
+| Finite-volume discretisation | working, second order: the operators by manufactured solution on orthogonal, stretched and non-orthogonal meshes, and the *solved* `Cd` on the cylinder at an observed 2.006 -- see below |
 | Laminar Navier-Stokes | **validated** against published cylinder benchmarks |
 | k-omega SST | working; NACA 0012 at Re 2e6 converges to 9.85e-07 in 479 iterations on factory defaults |
 | Qt front end | working, tested |
@@ -167,10 +167,16 @@ answer's dependence on the velocity relaxation factor. Both are argued in
 does not yet carry.** The 2026-09-07 physics audit ran the first grid-convergence
 study this project has had, on three systematically refined cylinder meshes, and
 measured the observed order of `Cd` at **1.261** with a Richardson limit of
-1.515358 -- measured on the code as it stood before that response, where the
-reported 1.5142 sat about 0.08% below the solver's own continuum answer. Two
-first-order terms have been removed since and the study has not been re-run, so
-the observed order today is unmeasured. The wake length has not converged at all: observed order 0.735,
+1.515358 -- measured on the code as it stood before that response.
+
+**Both of those have since been re-measured, and the order is now second.** On a
+family refined by 1.5 in both directions at once, the observed order of `Cd` is
+**2.006** with a GCI of 0.031% and a limit of 1.517935. Running the audit's own
+family construction on the current code gives 2.047 by its arithmetic, against
+the 1.261 it reported -- so the change is the two first-order terms coming out of
+the flux definition and the force integral, not the family. The wake length is
+the exception and has not moved: order 1.124, and 9.7% below its extrapolated
+2.349, so its agreement with the measured 2.13 is a coincidence of resolution. The wake length has not converged at all: observed order 0.735,
 limit 2.200. The reported 2.1219 agrees with Coutanceau and Bouard's measured
 2.13 because the mesh is coarse, and the solver's own grid-converged answer sits
 with the computations at 2.20. That is a coincidence being read as agreement.
@@ -183,9 +189,16 @@ rather than quoted:
 .\.venv\Scripts\python.exe -m validation.convergence
 ```
 
-The order is measured, never assumed: a GCI computed at the formal order of 2
-rather than the observed 1.26 comes out 1.87 times narrower, and reporting the
-narrower one is not the conservative choice.
+The order is measured, never assumed. That mattered most when the two disagreed:
+a GCI computed at the formal order of 2 rather than the then-observed 1.26 came
+out 1.87 times narrower, and reporting the narrower one is not the conservative
+choice. They now agree, which is a result rather than a licence to stop
+measuring.
+
+The harness refuses a family it cannot support. Celik's procedure needs a
+refinement ratio of at least 1.3, and the audit's family measures 1.257 -- its
+"1.5" was a property of the inputs, not of the meshes -- so an extrapolation on
+it is declined rather than reported.
 
 `validation/aerofoil.py` is a second gate -- a NACA 2412 at 5 degrees with SST.
 It is **not** a validation case and certifies nothing; its job is to notice

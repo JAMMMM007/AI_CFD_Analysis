@@ -19,7 +19,7 @@ of the record is to stop the same ground being covered twice.
 | 4 | URANS and vortex shedding | not started |
 | 5 | Turbulence and transition models | not started |
 | 6 | Meshing | **part done** — spacing constraint (#5) and the marching Newton; seam, wake and C-grid remain |
-| 7 | Verification, validation and speed | **part done** — GCI machinery and a second gate exist; TMR cases remain |
+| 7 | Verification, validation and speed | **part done** — GCI machinery, a second gate, and the cylinder at an observed order of 2.006 with its uncertainty reported; TMR cases and multigrid remain |
 | 8 | Response to the 2026-09-07 physics audit | **in progress** — see `docs/audit-response-plan.md` |
 
 316 tests. Regression gate: cylinder at Re 40 gives Cd 1.5161, wake 2.1219 D,
