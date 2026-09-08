@@ -1029,6 +1029,97 @@ class TestBoundaries:
         assert not boundaries.far_flux_is_solvable(entirely_inflow)
 
 
+def open_rectangle(nx: int = 7, ny: int = 4, dx: float = 0.5, dy: float = 0.25):
+    """A uniform rectangle, open in ``i``, with its metrics and faces."""
+    x = np.arange(nx + 1) * dx
+    y = np.arange(ny + 1) * dy
+    nodes = np.stack(np.meshgrid(x, y, indexing="ij"), axis=-1)
+    metrics = compute_metrics(nodes, periodic_i=False)
+    return nodes, metrics, build_faces(metrics)
+
+
+class TestOpenFaceFamilies:
+    """That an open ``i`` gets the boundary families a closed one does not need.
+
+    ``wall`` and ``far_field`` already exist because the ``j`` direction has two
+    ends. When ``i`` stops wrapping it has two ends as well, and ``i_start`` and
+    ``i_end`` are the same construction for the same reason -- not a new concept,
+    which is the point worth checking: they must behave like the two that have
+    been in use since the beginning.
+    """
+
+    def test_a_periodic_mesh_has_no_i_boundaries(self):
+        """None rather than empty: there is no such face, not zero of them."""
+        _, _, faces = uniform_mesh(48)
+        assert faces.periodic_i
+        assert faces.i_start is None and faces.i_end is None
+        assert faces.i_faces.area.shape[:2] == faces.shape
+
+    def test_an_open_mesh_splits_i_into_interior_and_two_ends(self):
+        _, _, faces = open_rectangle()
+        assert not faces.periodic_i
+        assert faces.i_faces.area.shape == (6, 4, 2)
+        assert faces.i_start.area.shape == (4, 2)
+        assert faces.i_end.area.shape == (4, 2)
+        # The j family is untouched by any of this.
+        assert faces.j_faces.area.shape == (7, 3, 2)
+        assert faces.wall.area.shape == (7, 2)
+
+    @pytest.mark.parametrize(
+        "family, outward",
+        [
+            ("i_start", [-1.0, 0.0]),
+            ("i_end", [1.0, 0.0]),
+            ("wall", [0.0, -1.0]),
+            ("far_field", [0.0, 1.0]),
+        ],
+    )
+    def test_every_boundary_normal_points_out_of_its_cell(self, family, outward):
+        """The sign convention all four share, and the one to get wrong.
+
+        ``face_i`` points towards increasing ``i``, so at the low end that is
+        *into* the fluid and the outward normal is its negative -- the same
+        inversion ``wall`` needs against ``face_j``, and for the same reason.
+        Getting it backwards would reverse every flux through that boundary and
+        the forces with them.
+
+        ``delta`` runs from the cell centroid to the face centre, so ``delta . n``
+        positive is the independent check: the face really is on the outside of
+        the cell it belongs to.
+        """
+        _, _, faces = open_rectangle()
+        boundary = getattr(faces, family)
+        assert np.allclose(boundary.normal, outward)
+        assert np.all(np.sum(boundary.delta * boundary.normal, axis=-1) > 0.0)
+
+    def test_the_four_boundaries_and_the_interior_faces_close_every_cell(self):
+        """Conservation, assembled the way the operators will assemble it.
+
+        Every cell's outward area vectors must sum to zero, and on an open mesh
+        that sum is drawn from up to four different arrays. This is the identity
+        that the divergence operator telescoping to the boundary flux rests on,
+        and the indexing it needs is exactly what an open ``i`` changes.
+        """
+        _, metrics, faces = open_rectangle()
+        west = np.empty(metrics.centroid.shape)
+        east = np.empty(metrics.centroid.shape)
+        west[1:] = -faces.i_faces.area
+        east[:-1] = faces.i_faces.area
+        west[0] = faces.i_start.area
+        east[-1] = faces.i_end.area
+
+        south = np.empty(metrics.centroid.shape)
+        north = np.empty(metrics.centroid.shape)
+        south[:, 1:] = -faces.j_faces.area
+        north[:, :-1] = faces.j_faces.area
+        south[:, 0] = faces.wall.area
+        north[:, -1] = faces.far_field.area
+
+        closure = west + east + south + north
+        scale = np.linalg.norm(faces.j_faces.area, axis=-1).max()
+        assert np.abs(closure).max() < 1e-14 * scale
+
+
 class TestRhieChowConsistency:
     """That the pressure-velocity damping vanishes when it is supposed to.
 
