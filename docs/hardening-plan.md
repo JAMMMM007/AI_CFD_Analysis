@@ -445,10 +445,43 @@ right. The pressure correction was dropping the non-orthogonal cross term of
 
 ### Stage 6 (rest) — meshing
 
-- **The marched-to-analytic seam.** Still the worst region on an aerofoil mesh:
-  the single face at 60.07 degrees on the y+ 1 mesh is it. The handover happens
-  in one layer, so non-orthogonality jumps from about 3 degrees to the peak and
-  back. Blend the two constructions over several layers instead.
+- **The marched-to-analytic seam — mostly gone, and the proposed remedy does not
+  work.** Two measurements changed this item.
+
+  First, the marching Newton fix did most of it. Handing over further out means
+  handing over where the layer is closer to circular, and the direction mismatch
+  the seam has to absorb fell from 36.2 degrees mean and 63.4 peak to **13.2 mean
+  and 27.1 peak**. The audit predicted this would help and it helped more than it
+  expected.
+
+  Second, the worst face on the y+ 1 NACA 2412 mesh is **no longer the seam**.
+  Measured: the peak of 60.863 degrees is an `i`-face at layer 62, inside the
+  marched region of 63 layers; the blended region's own peak is 44.2 on `i` faces
+  and 30.8 on `j`, with a mean of about 9.1. The description "the single face at
+  60.07 degrees is it" was accurate when written and is not now.
+
+  The remedy the audit proposes -- step the first eight to ten blended layers
+  along a direction rotating from the march's onto the polar ray -- was
+  implemented and **rejected by measurement**. It states that "the construction's
+  one great virtue -- it cannot fold -- is preserved"; it is not. Stepping each
+  point along its own frozen arrival direction produces a non-monotone angular
+  sweep, one grid line overtaking its neighbour, and a guard checking radius and
+  sweep monotonicity refuses it at **every** depth tried, down to a single layer.
+
+  The reason is specific and worth keeping: in the blended region the layer
+  thicknesses are large -- geometric growth carries them out to forty chords in
+  26 layers -- and a large step along a frozen per-point direction crosses lines
+  wherever those directions converge. The march itself does not do this because it
+  solves an implicit system with dissipation each layer, rather than extrapolating
+  a direction. The polar construction is safe for exactly the same reason in
+  reverse: every point moves along its own ray, and rays cannot cross.
+
+  A safe version is possible -- keep the polar radius placement and carry the
+  marching direction's *tangential* component as an angular offset, clamped to
+  preserve ordering -- but it was not built, because the payoff is now small and
+  speculative. If this is picked up again, that is the construction to try, and
+  the thing to check first is whether the peak is still in the marched region,
+  because if it is then this item is aimed at the wrong face.
 - **Wake refinement.** An O-grid wraps the wake and falls below four cells per
   diameter about two diameters downstream, so a shed vortex is smeared within a
   couple of its own spacings. Stage 4 cannot work on that.
