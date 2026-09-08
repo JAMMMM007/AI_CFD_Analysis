@@ -36,10 +36,13 @@ class Coefficients:
     south: np.ndarray
     north: np.ndarray
     source: np.ndarray
+    #: Whether the ``i`` direction wraps, so that ``apply`` knows whether cell
+    #: ``0``'s west neighbour is cell ``Ni-1`` or nothing at all.
+    periodic_i: bool = True
 
     @classmethod
-    def zeros(cls, shape: tuple[int, int]) -> "Coefficients":
-        return cls(*(np.zeros(shape) for _ in range(6)))
+    def zeros(cls, shape: tuple[int, int], periodic_i: bool = True) -> "Coefficients":
+        return cls(*(np.zeros(shape) for _ in range(6)), periodic_i=periodic_i)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -49,13 +52,22 @@ class Coefficients:
         """Matrix-vector product, without going through the sparse matrix.
 
         Used for residuals and for the Rhie-Chow velocity reconstruction, where
-        building a matrix just to multiply by it would be wasteful. Neighbour
-        terms are rolled rather than indexed: ``i`` wraps, and the ``j`` rolls are
-        masked off at the boundaries where those coefficients are zero anyway.
+        building a matrix just to multiply by it would be wasteful.
+
+        The ``j`` terms are sliced rather than rolled because a roll there would
+        wrap the first cell row onto the last, which are opposite ends of the
+        domain. When ``i`` is open the same is true of it, so it is sliced too.
+        The boundary coefficients are zero either way -- nothing writes them --
+        but relying on that would make the result depend on an invariant held
+        somewhere else, and the ``j`` direction has never done so.
         """
         result = self.centre * field
-        result += self.west * np.roll(field, 1, axis=0)
-        result += self.east * np.roll(field, -1, axis=0)
+        if self.periodic_i:
+            result += self.west * np.roll(field, 1, axis=0)
+            result += self.east * np.roll(field, -1, axis=0)
+        else:
+            result[1:] += self.west[1:] * field[:-1]
+            result[:-1] += self.east[:-1] * field[1:]
         result[:, 1:] += self.south[:, 1:] * field[:, :-1]
         result[:, :-1] += self.north[:, :-1] * field[:, 1:]
         return result
@@ -164,10 +176,19 @@ class StructuredMatrix:
     change from one outer iteration to the next, and there are five of those per
     iteration, so re-deriving the pattern each time would dominate the cost of
     assembly.
+
+    **Five bands, whether or not ``i`` wraps.** An open ``i`` direction *removes*
+    couplings -- cell ``0`` has no west neighbour and cell ``Ni-1`` no east one --
+    exactly as ``j`` already has none at its two ends, so the two are masked off
+    the same way and the sparsity pattern keeps its five diagonals. This is why
+    opening ``i`` is much cheaper than the C-grid it is a step towards: a wake cut
+    makes cell ``(i, 0)`` a neighbour of ``(Ni-1-i, 0)``, which is far away in the
+    ``k = i*Nj + j`` ordering and is a genuine sixth and seventh band.
     """
 
-    def __init__(self, shape: tuple[int, int]):
+    def __init__(self, shape: tuple[int, int], periodic_i: bool = True):
         self.shape = shape
+        self.periodic_i = periodic_i
         n_i, n_j = shape
         self.size = n_i * n_j
 
@@ -185,9 +206,17 @@ class StructuredMatrix:
         interior_north = np.ones(shape, dtype=bool)
         interior_north[:, -1] = False
 
+        # The i masks are the same construction as the j ones, and are the whole
+        # of the topology difference here.
+        interior_west = np.ones(shape, dtype=bool)
+        interior_east = np.ones(shape, dtype=bool)
+        if not periodic_i:
+            interior_west[0] = False
+            interior_east[-1] = False
+
         band(everywhere, index, 0)
-        band(everywhere, np.roll(index, 1, axis=0), 1)
-        band(everywhere, np.roll(index, -1, axis=0), 2)
+        band(interior_west, np.roll(index, 1, axis=0), 1)
+        band(interior_east, np.roll(index, -1, axis=0), 2)
         band(interior_south, np.roll(index, 1, axis=1), 3)
         band(interior_north, np.roll(index, -1, axis=1), 4)
 
@@ -196,8 +225,8 @@ class StructuredMatrix:
         self._slot = np.concatenate(order)
         self._mask = [
             everywhere.ravel(),
-            everywhere.ravel(),
-            everywhere.ravel(),
+            interior_west.ravel(),
+            interior_east.ravel(),
             interior_south.ravel(),
             interior_north.ravel(),
         ]

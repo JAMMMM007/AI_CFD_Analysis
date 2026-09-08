@@ -271,7 +271,7 @@ class PressureVelocityCoupling:
         #: raised as the solution settles and dropped again if it stops settling.
         self.cfl = numerics.cfl
         self.gradient = ops.Gradient(faces)
-        self.matrix = StructuredMatrix(faces.shape)
+        self.matrix = StructuredMatrix(faces.shape, faces.periodic_i)
         self.volume = faces.metrics.volume
 
     # ------------------------------------------------------------------
@@ -323,7 +323,7 @@ class PressureVelocityCoupling:
             (state.u, grad_u, wall_u, far_u, 0),
             (state.v, grad_v, wall_v, far_v, 1),
         ):
-            coefficients = Coefficients.zeros(self.faces.shape)
+            coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
             ops.add_convection(
                 coefficients, self.faces, state.flux_i, state.flux_j,
                 field, gradient,
@@ -685,7 +685,7 @@ class PressureVelocityCoupling:
         source and never to the matrix: the five bands are exactly what they were.
         """
         density = self.fluid.density
-        coefficients = Coefficients.zeros(self.faces.shape)
+        coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
 
         coupling_i = density * d_i * self.faces.i_faces.diffusion_factor
         coefficients.centre += coupling_i + np.roll(coupling_i, -1, axis=0)

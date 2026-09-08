@@ -1038,6 +1038,83 @@ def open_rectangle(nx: int = 7, ny: int = 4, dx: float = 0.5, dy: float = 0.25):
     return nodes, metrics, build_faces(metrics)
 
 
+class TestOpenMatrix:
+    """That an open ``i`` removes couplings rather than adding bands.
+
+    This is the claim that makes opening ``i`` cheap and the C-grid expensive. A
+    non-periodic ``i`` gives cell ``0`` no west neighbour and cell ``Ni-1`` no
+    east one, exactly as ``j`` already has none at its two ends, so the sparsity
+    pattern keeps its five diagonals. A C-grid's wake cut would instead make cell
+    ``(i, 0)`` a neighbour of ``(Ni-1-i, 0)`` -- far apart in the ``k = i*Nj + j``
+    ordering, and a genuine sixth and seventh band.
+    """
+
+    @staticmethod
+    def _laplacian(shape, periodic_i):
+        c = Coefficients.zeros(shape, periodic_i=periodic_i)
+        c.centre[:] = 4.0
+        c.south[:, 1:] = -1.0
+        c.north[:, :-1] = -1.0
+        if periodic_i:
+            c.west[:] = c.east[:] = -1.0
+        else:
+            c.west[1:] = -1.0
+            c.east[:-1] = -1.0
+        return c
+
+    def test_it_still_has_five_bands(self):
+        shape = (7, 4)
+        matrix = StructuredMatrix(shape, periodic_i=False).build(
+            self._laplacian(shape, False)
+        )
+        assert np.diff(matrix.indptr).max() <= 5
+
+    def test_opening_i_removes_exactly_the_end_couplings(self):
+        """Two ends times ``Nj`` cells, and nothing else."""
+        shape = (7, 4)
+        closed = StructuredMatrix(shape, periodic_i=True).build(
+            self._laplacian(shape, True)
+        )
+        opened = StructuredMatrix(shape, periodic_i=False).build(
+            self._laplacian(shape, False)
+        )
+        assert closed.nnz - opened.nnz == 2 * shape[1]
+
+    def test_the_corner_cell_couples_only_inward(self):
+        """Cell (0, 0) has no west and no south neighbour, and must show it.
+
+        The sharpest statement of the whole change: on a periodic mesh this cell
+        wraps round to ``Ni-1`` and here it must not.
+        """
+        shape = (7, 4)
+        matrix = StructuredMatrix(shape, periodic_i=False).build(
+            self._laplacian(shape, False)
+        )
+        coupled = {
+            (k // shape[1], k % shape[1])
+            for k in matrix[0].toarray().ravel().nonzero()[0]
+        }
+        assert coupled == {(0, 0), (1, 0), (0, 1)}
+
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_apply_agrees_with_the_assembled_matrix(self, periodic):
+        """``Coefficients.apply`` and the sparse product must be the same operator.
+
+        ``apply`` exists so that residuals and the velocity reconstruction do not
+        have to build a matrix, which means there are two implementations of one
+        thing and they can drift. On an open mesh ``apply`` has to stop rolling in
+        ``i``, and this is what catches it if it does not.
+        """
+        shape = (7, 4)
+        coefficients = self._laplacian(shape, periodic)
+        matrix = StructuredMatrix(shape, periodic_i=periodic).build(coefficients)
+
+        field = np.random.default_rng(0).normal(size=shape)
+        direct = coefficients.apply(field)
+        through_matrix = (matrix @ field.ravel()).reshape(shape)
+        assert np.abs(direct - through_matrix).max() < 1e-14 * np.abs(direct).max()
+
+
 class TestOpenFaceFamilies:
     """That an open ``i`` gets the boundary families a closed one does not need.
 

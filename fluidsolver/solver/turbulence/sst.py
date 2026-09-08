@@ -99,7 +99,7 @@ class KOmegaSST(TurbulenceModel):
     def __init__(self, faces, fluid, boundaries, numerics, reference_length=1.0):
         super().__init__(faces, fluid, boundaries, numerics, reference_length)
         self.gradient = ops.Gradient(faces)
-        self.matrix = StructuredMatrix(faces.shape)
+        self.matrix = StructuredMatrix(faces.shape, faces.periodic_i)
         self.volume = faces.metrics.volume
         self.wall_distance = np.maximum(faces.metrics.wall_distance, 1e-300)
 
@@ -376,7 +376,7 @@ class KOmegaSST(TurbulenceModel):
         # not at y+ 30.
         production = self._limited_production(state, strain)
 
-        coefficients = Coefficients.zeros(self.faces.shape)
+        coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
         diffusivity = self.fluid.viscosity + self._blended(
             blend, SIGMA_K1, SIGMA_K2
         ) * state.eddy_viscosity
@@ -413,7 +413,7 @@ class KOmegaSST(TurbulenceModel):
         gamma = self._blended(blend, GAMMA_1, GAMMA_2)
         beta = self._blended(blend, BETA_1, BETA_2)
 
-        coefficients = Coefficients.zeros(self.faces.shape)
+        coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
         diffusivity = self.fluid.viscosity + self._blended(
             blend, SIGMA_W1, SIGMA_W2
         ) * state.eddy_viscosity
