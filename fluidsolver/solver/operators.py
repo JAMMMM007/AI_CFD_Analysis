@@ -54,6 +54,11 @@ def face_values_j(
     return np.concatenate((wall[:, None], interior, far_field[:, None]), axis=1)
 
 
+def _tangential(offset: np.ndarray, normal: np.ndarray) -> np.ndarray:
+    """``d - (d . n) n``: the part of a boundary offset lying in the face plane."""
+    return offset - np.sum(offset * normal, axis=-1)[:, None] * normal
+
+
 class Gradient:
     """Weighted least-squares cell gradient.
 
@@ -94,6 +99,11 @@ class Gradient:
         north[:, :-1] = centroid[:, 1:] - centroid[:, :-1]
         north[:, -1] = faces.far_field.centre - centroid[:, -1]
 
+        # The tangential part of each boundary offset, for a zero *normal*
+        # gradient condition. See __call__.
+        self._wall_tangential = _tangential(south[:, 0], faces.wall.normal)
+        self._far_tangential = _tangential(north[:, -1], faces.far_field.normal)
+
         self._offsets = np.stack(
             (
                 np.roll(centroid, 1, axis=0) - centroid,
@@ -130,14 +140,58 @@ class Gradient:
         )
 
     def __call__(
-        self, field: np.ndarray, wall: np.ndarray, far_field: np.ndarray
+        self,
+        field: np.ndarray,
+        wall: np.ndarray | None,
+        far_field: np.ndarray | None,
     ) -> np.ndarray:
         """Gradient of a cell field, ``(Ni, Nj, 2)``.
 
-        ``wall`` and ``far_field`` are the values on those boundary faces. For a
-        zero-gradient condition pass the adjacent cell values: the difference is
-        then zero, which is precisely what a vanishing normal gradient asserts.
+        ``wall`` and ``far_field`` are the values on those boundary faces.
+        ``None`` means a zero *normal* gradient there.
+
+        **Passing the adjacent cell value is not the same condition, and this
+        docstring used to say it was.** It said: "For a zero-gradient condition
+        pass the adjacent cell value: the difference is then zero, which is
+        precisely what a vanishing normal gradient asserts." The stencil
+        minimises ``sum_N w_N [(grad phi . d_N) - (phi_N - phi_P)]^2``, so setting
+        ``phi_face = phi_P`` drives the fit towards ``grad phi . d = 0`` -- along
+        the centroid-to-face vector, not along the face normal. Decomposing
+        ``d = |d| (cos(theta) n + sin(theta) t)``,
+
+            grad phi . d = 0   =>   grad phi . n = -tan(theta) (grad phi . t),
+
+        so the reconstructed normal derivative is not zero but ``tan(theta)``
+        times the tangential one. The two coincide only where ``d`` is parallel to
+        ``n``, which on a circle is everywhere -- measured, 0.000 degrees mean and
+        peak -- and on a NACA mesh is nowhere: 0.530 degrees mean and 31.581 peak.
+        Every test this project had ran on the circle.
+
+        With ``None`` the face value is instead transported along the *tangential*
+        part of the offset only,
+
+            phi_face = phi_P + (grad phi)_P . (d - (d . n) n),
+
+        which asserts exactly ``grad phi . n = 0``. It needs a gradient to compute
+        the value that produces the gradient, so it is a one-step fixed point:
+        seed with ``phi_face = phi_P``, rebuild, apply. That lags by one pass and
+        is exact at convergence.
         """
+        if wall is None or far_field is None:
+            seeded = self(
+                field,
+                field[:, 0] if wall is None else wall,
+                field[:, -1] if far_field is None else far_field,
+            )
+            if wall is None:
+                wall = field[:, 0] + np.sum(
+                    seeded[:, 0] * self._wall_tangential, axis=-1
+                )
+            if far_field is None:
+                far_field = field[:, -1] + np.sum(
+                    seeded[:, -1] * self._far_tangential, axis=-1
+                )
+
         south = np.empty_like(field)
         south[:, 1:] = field[:, :-1] - field[:, 1:]
         south[:, 0] = wall - field[:, 0]

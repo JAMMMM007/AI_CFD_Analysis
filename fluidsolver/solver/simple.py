@@ -396,7 +396,7 @@ class PressureVelocityCoupling:
         # mu_t vanishes at the wall, where k does. The far field is left
         # zero-gradient, which it effectively is that far out.
         wall_value = np.full(self.faces.shape[0], self.fluid.viscosity)
-        grad_mu = self.gradient(viscosity, wall_value, viscosity[:, -1])
+        grad_mu = self.gradient(viscosity, wall_value, None)
 
         return (
             grad_mu[..., 0] * grad_u[..., 0] + grad_mu[..., 1] * grad_v[..., 0],

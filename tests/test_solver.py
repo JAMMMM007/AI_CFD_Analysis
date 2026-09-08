@@ -568,6 +568,72 @@ class TestGradient:
         )
         assert np.abs(gradient - exact).max() < 1e-10
 
+    @pytest.mark.parametrize(
+        "mesh, improvement",
+        [(uniform_mesh, None), (sheared_mesh, 1.10)],
+        ids=["orthogonal", "sheared"],
+    )
+    def test_zero_normal_gradient_is_imposed_along_the_normal(self, mesh, improvement):
+        """Regression. Passing the adjacent cell value asserts a different thing.
+
+        The stencil minimises ``sum w_N [(grad phi . d_N) - (phi_N - phi_P)]^2``,
+        so ``phi_face = phi_P`` drives the fit towards ``grad phi . d = 0`` --
+        along the centroid-to-face vector, not along the normal. The two coincide
+        only where ``d`` is parallel to ``n``, and the operator's docstring called
+        them the same thing.
+
+        Checked against an exact gradient rather than against the other
+        condition. ``sheared_mesh`` has a circular wall, so the distance field is
+        ``d = r - 0.5`` and its gradient is the radial unit vector exactly, while
+        the angular shear makes the boundary offset non-parallel to the face
+        normal -- which is the whole condition being tested. ``phi = cos(2 d)``
+        then has ``dphi/dn = 0`` at the wall face exactly and a known gradient
+        everywhere.
+
+        Measured, as the worst wall-row gradient error relative to the exact
+        gradient:
+
+            mesh        n     cell value   tangential   ratio
+            uniform    48     3.7601e-02   3.7601e-02   1.00
+            uniform   192     6.0099e-03   6.0099e-03   1.00
+            sheared    48     6.8223e-02   5.8834e-02   1.16
+            sheared   192     1.3518e-02   1.1944e-02   1.13
+
+        Identical on the orthogonal mesh, to every digit, which is the signature
+        that this is the term it claims to be and not a general improvement. On
+        the sheared one it removes 13 to 16% of the error, consistently across a
+        refinement by four.
+
+        What it does *not* do is change the order -- both sequences run at about
+        1.3. The wall-row gradient's convergence is limited by something else, and
+        ``post.wall_pressure`` records what: the stencil weights go as ``1/|d|^2``
+        and the wall face is the nearest stencil point, so whatever is asserted
+        there dominates the fit.
+        """
+        def error(n):
+            _, metrics, faces = mesh(n)
+            radius = np.linalg.norm(metrics.centroid, axis=-1)
+            distance = radius - 0.5
+            phi = np.cos(2.0 * distance)
+            exact = (-2.0 * np.sin(2.0 * distance))[..., None] * (
+                metrics.centroid / radius[..., None]
+            )
+            operator = ops.Gradient(faces)
+            scale = np.abs(exact[:, 0]).max()
+            return (
+                np.abs(operator(phi, phi[:, 0], phi[:, -1])[:, 0] - exact[:, 0]).max()
+                / scale,
+                np.abs(operator(phi, None, phi[:, -1])[:, 0] - exact[:, 0]).max()
+                / scale,
+            )
+
+        for n in (48, 192):
+            cell, tangential = error(n)
+            if improvement is None:
+                assert tangential == pytest.approx(cell, rel=1e-12)
+            else:
+                assert cell / tangential > improvement
+
     def test_exact_on_a_stretched_boundary_layer_mesh(self):
         grid = build_ogrid(circle(1.0, 200), first_layer=2.4e-5, far_field_radius=40.0)
         metrics = compute_metrics(grid.nodes)

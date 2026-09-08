@@ -292,9 +292,15 @@ def surface_data(
 
 
 def vorticity(state: State, gradient) -> np.ndarray:
-    """``dv/dx - du/dy``, for visualising shear layers and the wake."""
-    grad_u = gradient(state.u, state.u[:, 0] * 0.0, state.u[:, -1])
-    grad_v = gradient(state.v, state.v[:, 0] * 0.0, state.v[:, -1])
+    """``dv/dx - du/dy``, for visualising shear layers and the wake.
+
+    No-slip at the wall, so the wall face value is zero and not a condition on
+    the gradient. The far field is zero-gradient, and is now asked for as such
+    rather than by handing over the adjacent cell value, which asserts something
+    slightly different on a non-orthogonal face.
+    """
+    grad_u = gradient(state.u, state.u[:, 0] * 0.0, None)
+    grad_v = gradient(state.v, state.v[:, 0] * 0.0, None)
     return grad_v[..., 0] - grad_u[..., 1]
 
 

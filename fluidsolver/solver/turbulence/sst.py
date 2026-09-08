@@ -119,11 +119,13 @@ class KOmegaSST(TurbulenceModel):
         far_k, far_omega = self.boundaries.far_turbulence(state.k, state.omega, far_flux)
         inflow = self.boundaries.inflow_mask(far_flux)
 
-        # ``wall_k`` is None, which add_diffusion reads as zero flux. The
-        # gradient operator says the same thing by being handed the adjacent
-        # cell value: the difference across the face is then zero, which is
-        # precisely what a vanishing normal gradient asserts.
-        grad_k = self.gradient(state.k, state.k[:, 0], far_k)
+        # ``wall_k`` is None, which add_diffusion reads as zero flux, and the
+        # gradient operator is told the same thing the same way. It used to be
+        # handed the adjacent cell value instead, which asserts a vanishing
+        # gradient along the centroid-to-face vector rather than along the
+        # normal -- the same condition only where the two are parallel, which on
+        # a circle is everywhere and on an aerofoil is nowhere.
+        grad_k = self.gradient(state.k, None, far_k)
         grad_omega = self.gradient(state.omega, wall_omega, far_omega)
         strain = self.strain_rate(state, self.gradient)
 
