@@ -22,7 +22,7 @@ of the record is to stop the same ground being covered twice.
 | 7 | Verification, validation and speed | **part done** — GCI machinery and a second gate exist; TMR cases remain |
 | 8 | Response to the 2026-09-07 physics audit | **in progress** — see `docs/audit-response-plan.md` |
 
-309 tests. Regression gate: cylinder at Re 40 gives Cd 1.5160, wake 2.1219 D,
+316 tests. Regression gate: cylinder at Re 40 gives Cd 1.5161, wake 2.1219 D,
 separation 53.718 degrees, Cl -0.00000, residual 9.98e-08. `Cd` moved from 1.5142
 by two deliberate changes -- the wall-pressure reconstruction (+1.955e-03) and the
 Rhie-Chow mobility (-2.738e-04) -- each measured on its own and recorded with the
@@ -367,10 +367,41 @@ reported nose-up positive; separation takes its sign from a one-sided wall
 gradient rather than the first cell, worth 0.253 degrees; and the mesh page no
 longer calls a flat-plate correlation the achieved `y+`.
 
-**Still open at the time of writing:** F13, F14, F15 in the near term; F6, F7 and
-F1 in the turbulence closure, with F1 gated behind the NASA TMR flat plate; F2's
-far-field vortex correction; K2's seam; and the grid-convergence study on a
-properly refined family.
+**Landed since:** F14 and F15 (which turned out to be the same defect), F6, F9,
+F2, F13 and F7.
+
+**F2 is the largest of them and it corrects the audit's own formula.** A lifting
+body's bound circulation induces a `1/r` velocity that the bare freestream
+condition imposes away over an arc of length `2 pi R`, so the spurious flux is
+`O(Gamma)` however far out the boundary goes. Superposing the vortex collapses the
+sensitivity to the domain size by a factor of 24.7 in `Cl` and 63 in `Cd` between
+20 and 40 chords. The audit writes the induced field with `Gamma = +Cl U c / 2`,
+which puts the flow *slower* over the suction side; three independent physical
+checks -- faster above, upwash ahead, downwash behind -- fail together with that
+sign and hold together with the other. Taking it as written would have doubled the
+error while still changing the domain sensitivity, just the wrong way.
+
+**F7 corrects the audit's arithmetic as well as the code.** Its suggested ambient
+values, `k_amb = 1e-6 U^2` and `omega_amb = 5 U/L`, are outside two of the three
+NASA TMR bands the same finding quotes: `k` twenty times the top of its band, and
+`mu_t/mu` at 4.06e-01 where the audit states 7.4e-3. The defaults are now
+`I = 5e-5` and a ratio of `1e-3`, inside all three with margin, and `SST-sust`
+holds them there -- `k` arrives at the body at 1.0000 of its set value against
+0.0423 without. Since no fixed default can satisfy bands that scale differently
+from the parameterisation, `health.assess` now measures the case actually being
+run against them.
+
+**Still open:** F1, which is blocked rather than deferred -- deciding the `omega`
+wall constant needs the NASA TMR `2DZP` flat plate, and this mesher builds O-grids
+around closed contours, so a flat plate needs rectangular structured meshing that
+does not exist here. K2's seam, and the grid-convergence study on a properly
+refined family, also remain.
+
+**One thing this response created.** The NACA 2412 no longer reaches `1e-6`: F5's
+correction makes the damping `1/alpha_u` larger and the case plateaus at about
+3.4e-06 with the forces steady to five figures. The gate carries a measured
+`RESIDUAL_FLOOR` for it, which is an admission rather than a fix, and diagnosing
+it is the first thing to do next. The binding equation is `Uy`.
 
 ---
 

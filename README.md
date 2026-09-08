@@ -145,23 +145,32 @@ against the published benchmarks. Nothing is tuned to hit these.
 
 | | computed | published |
 |---|---|---|
-| Re = 20, Cd | 2.023 | 2.00 - 2.09 |
+| Re = 20, Cd | 2.027 | 2.00 - 2.09 |
 | Re = 20, wake L/D | 0.933 | 0.91 - 0.94 |
 | Re = 20, separation from rear | 43.6 deg | 43 - 45 deg |
-| Re = 40, Cd | 1.514 | 1.50 - 1.58 |
+| Re = 40, Cd | 1.516 | 1.50 - 1.58 |
 | Re = 40, wake L/D | 2.122 | 2.13 measured, 2.21 - 2.35 computed |
 | Re = 40, separation from rear | 53.7 deg | 52 - 54 deg |
 
 Lift comes out identically zero, as symmetry requires. The Re = 40 drag splits as
-0.993 pressure and 0.522 friction, against a published split of roughly 0.99 and
+0.994 pressure and 0.522 friction, against a published split of roughly 0.99 and
 0.53.
+
+`Cd` moved from 1.514 to 1.516 during the response to the 2026-09-07 physics
+audit, by two deliberate changes measured separately: the wall-pressure
+reconstruction (+1.955e-03), which removed a first-order term from the force
+integral, and the Rhie-Chow mobility (-2.738e-04), which removed the converged
+answer's dependence on the velocity relaxation factor. Both are argued in
+`docs/audit-response-plan.md`.
 
 **Read those figures with the discretisation uncertainty in mind, which the table
 does not yet carry.** The 2026-09-07 physics audit ran the first grid-convergence
 study this project has had, on three systematically refined cylinder meshes, and
 measured the observed order of `Cd` at **1.261** with a Richardson limit of
-1.515358 -- so the reported 1.5142 sits about 0.08% below the solver's own
-continuum answer. The wake length has not converged at all: observed order 0.735,
+1.515358 -- measured on the code as it stood before that response, where the
+reported 1.5142 sat about 0.08% below the solver's own continuum answer. Two
+first-order terms have been removed since and the study has not been re-run, so
+the observed order today is unmeasured. The wake length has not converged at all: observed order 0.735,
 limit 2.200. The reported 2.1219 agrees with Coutanceau and Bouard's measured
 2.13 because the mesh is coarse, and the solver's own grid-converged answer sits
 with the computations at 2.20. That is a coincidence being read as agreement.
@@ -227,7 +236,7 @@ the sign of `u . n`, whether it fixes velocity or pressure.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-309 tests, about 430 seconds. The centrepiece is a method-of-manufactured-
+316 tests, about 410 seconds. The centrepiece is a method-of-manufactured-
 solutions check on the discrete operators, which measures their *order of
 accuracy* rather than their error: diffusion and the high-order convection
 schemes come out second order, upwind first, which is what each is by

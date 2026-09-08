@@ -462,6 +462,10 @@ successes from the inside.
 | F10 | `Cm` nose-up positive | every reported `Cm` changes sign |
 | F12 | separation from a one-sided wall gradient | 0.253 degrees on the gate |
 | F14 | one wall distance, one definition | subsumed by F15 — see below |
+| F2 | the bound vortex on the far field | domain sensitivity down 24.7x in `Cl`, 63x in `Cd` |
+| F7 | TMR ambient values and `SST-sust` | `k` at the body 0.0423 → 1.0000 of its set value |
+| F9 | compatibility on the source, not the outflow | converged flux balances to 1.6e-14 on its own |
+| F13 | zero gradient along `n`, not `d` | 13–16% of the wall-row gradient error, zero on an orthogonal mesh |
 | F15 | exact point-to-segment distance | the sampled form was 285% high in the worst first-row cell |
 | F16 | the mesh page's `y+` label | no computed number |
 | F17 | `omega` residual excludes the prescribed row | that row was 56.89% of its normaliser |
@@ -501,13 +505,22 @@ measured `RESIDUAL_FLOOR` for this case, which is an admission rather than a fix
 Diagnosing it properly is the first thing to do next, and the binding equation is
 `Uy`.
 
-**Not implemented.** F1 (the `omega` wall constant) is deliberately not touched:
-the decision needs the NASA TMR `2DZP` flat plate, which does not exist here yet,
-and adopting a 9% drag change on authority ahead of that measurement is what
-standing instruction 1 exists to prevent. F2 (the far-field vortex correction),
-F7 (`SST-sust`), F9 (`enforce_global_mass_balance`) and F13 (the zero-gradient
-condition along `d`) remain, as does K2's seam and a grid-convergence study on a
-properly refined family.
+**Not implemented.** F1 (the `omega` wall constant) is blocked rather than
+deferred. Deciding it needs the NASA TMR `2DZP` flat plate, and this mesher builds
+O-grids around closed contours — a flat plate needs rectangular structured
+meshing, which is infrastructure and not a constant. Adopting a 9% drag change on
+authority ahead of that measurement is what standing instruction 1 exists to
+prevent. K2's seam and a grid-convergence study on a properly refined family also
+remain.
+
+**Two more findings about the audit, from the two largest remaining items.** F2's
+induced-velocity formula has the sign inverted: written with `Gamma = +Cl U c/2`
+it makes the flow slower over the suction side, and three independent physical
+checks agree on the other sign. F7's suggested ambient values are outside two of
+the three bands the same finding quotes — `k` twenty times the top of its band,
+and `mu_t/mu` at 4.06e-01 where the text states 7.4e-3. Both would have moved the
+numbers without fixing what they diagnose, and both were caught by checking rather
+than by reading.
 
 **The three-mesh study has not been re-run** since any of this landed, so the
 observed order of `Cd` is still the audit's 1.261 measured on the old code. Two
