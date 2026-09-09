@@ -16,6 +16,12 @@ from fluidsolver.mesh import spacing
 from fluidsolver.mesh.hyperbolic import MeshError, hyperbolic_grid
 from fluidsolver.mesh.metrics import cell_face_areas, compute_metrics
 from fluidsolver.mesh.ogrid import build_ogrid
+from fluidsolver.mesh.rectilinear import (
+    clustered_nodes,
+    flat_plate_grid,
+    plate_wall_mask,
+    rectilinear_grid,
+)
 from fluidsolver.mesh.quality import assess
 from fluidsolver.mesh.spacing import SpacingError
 
@@ -355,6 +361,107 @@ def uniform_rectangle(nx: int = 7, ny: int = 4, dx: float = 0.5, dy: float = 0.2
     x = np.arange(nx + 1) * dx
     y = np.arange(ny + 1) * dy
     return np.stack(np.meshgrid(x, y, indexing="ij"), axis=-1)
+
+
+class TestRectilinearGrids:
+    """Grids on a rectangle, for geometry the O-grid cannot wrap.
+
+    The O-grid closes ``i`` into a loop, which is right around a closed body and
+    impossible for a flat plate or a channel. Those are the shapes the NASA TMR
+    verification cases have, so this is what unblocks them.
+    """
+
+    def test_a_tensor_product_grid_is_exactly_orthogonal(self):
+        """Which is the point of using one for a verification case.
+
+        A mesh that is not a variable is what code verification needs: whatever an
+        observed order comes out as on this grid, the mesh did not contribute to
+        it. Measured on the flat plate: non-orthogonality 0.0000 mean and peak,
+        skewness 1.2e-13.
+        """
+        grid = flat_plate_grid()
+        metrics = compute_metrics(grid.nodes, periodic_i=grid.periodic_i)
+        report = assess(metrics, grid.nodes)
+
+        assert report.max_non_orthogonality_deg < 1e-10
+        assert report.max_skewness < 1e-10
+        assert report.negative_volumes == 0
+        assert report.is_usable
+
+    def test_the_plate_grid_puts_a_node_on_the_leading_edge(self):
+        """The two ``j = 0`` conditions meet there, so it must fall on a face.
+
+        A cell that is half symmetry plane and half no-slip wall has no
+        consistent boundary condition, and the split has to land between cells
+        rather than through one.
+        """
+        grid = flat_plate_grid()
+        x = grid.nodes[:, 0, 0]
+        assert np.isclose(x, 0.0).sum() == 1
+
+        mask = plate_wall_mask(grid)
+        # Every symmetry face is ahead of the edge and every wall face behind it,
+        # with no face straddling it.
+        centres = 0.5 * (grid.nodes[:-1, 0, 0] + grid.nodes[1:, 0, 0])
+        assert np.all(centres[mask] > 0.0)
+        assert np.all(centres[~mask] < 0.0)
+
+    def test_the_wall_normal_distribution_matches_the_o_grid(self):
+        """So that a given ``y+`` means the same thing on both.
+
+        The first cell centre sits at half the first layer, which is the same
+        factor of two ``spacing.y_plus_of`` assumes.
+        """
+        first_layer = 1.0e-5
+        grid = flat_plate_grid(first_layer=first_layer)
+        metrics = compute_metrics(grid.nodes, periodic_i=False)
+        assert metrics.centroid[0, 0, 1] == pytest.approx(0.5 * first_layer, rel=1e-9)
+
+    def test_clustered_nodes_span_exactly_and_start_where_asked(self):
+        nodes = clustered_nodes(0.0, 2.0, 64, 2.0 / 512.0)
+        assert nodes[0] == pytest.approx(0.0)
+        assert nodes[-1] == pytest.approx(2.0, rel=1e-12)
+        steps = np.diff(nodes)
+        assert steps[0] == pytest.approx(2.0 / 512.0, rel=1e-6)
+        assert np.all(steps > 0.0)
+        ratios = steps[1:] / steps[:-1]
+        assert np.allclose(ratios, ratios[0], rtol=1e-9)
+
+    def test_a_uniform_request_gives_uniform_spacing(self):
+        """Rather than a growth ratio of one solved for numerically.
+
+        Asking for the spacing a uniform distribution already has should not send
+        the bisection looking for a ratio it can only approach, and come back with
+        one plus rounding.
+        """
+        nodes = clustered_nodes(0.0, 1.0, 4, 0.25)
+        assert np.allclose(nodes, [0.0, 0.25, 0.5, 0.75, 1.0])
+
+    @pytest.mark.parametrize(
+        "x, y, message",
+        [
+            ([0.0, 1.0, 0.5], [0.0, 1.0], "must increase"),
+            ([0.0, 1.0], [0.0], "at least two nodes"),
+        ],
+    )
+    def test_a_grid_that_would_invert_is_refused(self, x, y, message):
+        with pytest.raises(MeshError, match=message):
+            rectilinear_grid(x, y)
+
+    def test_the_grid_reports_one_more_node_line_than_cells(self):
+        """In both directions, because neither wraps."""
+        grid = flat_plate_grid(upstream_cells=8, plate_cells=16)
+        assert not grid.periodic_i
+        assert grid.nodes.shape[0] == grid.shape[0] + 1
+        assert grid.nodes.shape[1] == grid.shape[1] + 1
+
+    def test_it_offers_case_the_same_surface_the_o_grid_does(self):
+        """``Case`` asks a grid for these and must not have to know which it has."""
+        grid = flat_plate_grid(upstream_cells=8, plate_cells=16)
+        assert isinstance(grid.name, str)
+        assert grid.reference_length > 0.0
+        assert grid.moment_reference.shape == (2,)
+        assert grid.n_cells == grid.shape[0] * grid.shape[1]
 
 
 class TestOpenTopology:

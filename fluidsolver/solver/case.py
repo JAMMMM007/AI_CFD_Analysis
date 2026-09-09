@@ -102,7 +102,9 @@ class Case:
                 f"expected one of {sorted(MODELS)}"
             )
 
-        self.metrics = compute_metrics(self.grid.nodes)
+        self.metrics = compute_metrics(
+            self.grid.nodes, periodic_i=self.grid.periodic_i
+        )
         self.quality: QualityReport = assess(self.metrics, self.grid.nodes)
         if not self.quality.is_usable:
             raise ValueError(
@@ -151,7 +153,7 @@ class Case:
         )
 
         if self.moment_reference is None:
-            self.moment_reference = self.grid.contour.centroid
+            self.moment_reference = self.grid.moment_reference
 
         self.state = State.uniform(self.faces, self.fluid, self.freestream)
         self.history = History()
@@ -171,7 +173,7 @@ class Case:
 
     @property
     def reference_length(self) -> float:
-        return self.grid.contour.reference_length
+        return self.grid.reference_length
 
     @property
     def reynolds(self) -> float:
@@ -337,7 +339,7 @@ class Case:
         forces = self.forces()
         surface = self.surface()
         lines = [
-            f"body            {self.grid.contour.name}",
+            f"body            {self.grid.name}",
             f"mesh            {self.grid.shape[0]} x {self.grid.shape[1]}"
             f" = {self.grid.n_cells} cells",
             f"model           {self.model.name}",

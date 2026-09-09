@@ -74,6 +74,32 @@ class OGrid:
     def n_cells(self) -> int:
         return self.shape[0] * self.shape[1]
 
+    #: The ``i`` direction wraps the body. See
+    #: :attr:`fluidsolver.mesh.metrics.Metrics.periodic_i`.
+    periodic_i = True
+
+    @property
+    def name(self) -> str:
+        return self.contour.name
+
+    @property
+    def reference_length(self) -> float:
+        return self.contour.reference_length
+
+    @property
+    def moment_reference(self) -> np.ndarray:
+        """Where a moment is taken about, by default.
+
+        The area centroid of the body. Published aerofoil moments are quoted
+        about the quarter chord instead, which a caller can pass to ``Case``.
+
+        This, ``name`` and ``reference_length`` are forwarded from the contour so
+        that ``Case`` can ask a grid for them without knowing whether the grid was
+        built around a closed body at all -- a flat plate has no contour and no
+        centroid, and needs the same three answers.
+        """
+        return self.contour.centroid
+
     @property
     def wall(self) -> np.ndarray:
         """``(Ni, 2)`` nodes on the body surface."""

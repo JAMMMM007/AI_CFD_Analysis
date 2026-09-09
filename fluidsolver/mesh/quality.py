@@ -142,8 +142,8 @@ def assess(metrics: Metrics, nodes: np.ndarray) -> QualityReport:
             (orthogonality > _ORTHOGONALITY_WARNING_DEG).mean()
         ),
         max_skewness=float(skewness.max()),
-        max_aspect_ratio=float(_aspect_ratio(nodes).max()),
-        max_expansion_ratio=float(_expansion_ratio(volume).max()),
+        max_aspect_ratio=float(_aspect_ratio(nodes, metrics.periodic_i).max()),
+        max_expansion_ratio=float(_expansion_ratio(volume, metrics.periodic_i).max()),
         min_wall_distance=float(metrics.wall_distance.min()),
     )
 
@@ -157,14 +157,26 @@ def _face_quality(metrics: Metrics) -> tuple[np.ndarray, np.ndarray]:
     """
     centroid = metrics.centroid
 
-    angles, skews = [], []
-    for area, centre, own, neighbour in (
-        (
+    if metrics.periodic_i:
+        i_faces = (
             metrics.face_i_area,
             metrics.face_i_centre,
             centroid,
             np.roll(centroid, 1, axis=0),
-        ),
+        )
+    else:
+        # Interior faces only, and the two sides are slices -- the same shape the
+        # j entry below has always had, because an open i has the same structure.
+        i_faces = (
+            metrics.face_i_area[1:-1],
+            metrics.face_i_centre[1:-1],
+            centroid[1:],
+            centroid[:-1],
+        )
+
+    angles, skews = [], []
+    for area, centre, own, neighbour in (
+        i_faces,
         (
             metrics.face_j_area[:, 1:-1],
             metrics.face_j_centre[:, 1:-1],
@@ -200,17 +212,23 @@ def _face_quality(metrics: Metrics) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(angles), np.concatenate(skews)
 
 
-def _aspect_ratio(nodes: np.ndarray) -> np.ndarray:
+def _aspect_ratio(nodes: np.ndarray, periodic_i: bool = True) -> np.ndarray:
     """Longest cell edge over shortest, per cell."""
-    along_i = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=-1)
-    along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
+    if periodic_i:
+        along_i = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=-1)
+        along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
+        other_j = np.roll(along_j, -1, axis=0)
+    else:
+        along_i = np.linalg.norm(nodes[1:] - nodes[:-1], axis=-1)
+        along_j = np.linalg.norm(nodes[:-1, 1:] - nodes[:-1, :-1], axis=-1)
+        other_j = np.linalg.norm(nodes[1:, 1:] - nodes[1:, :-1], axis=-1)
 
     edges = np.stack(
         (
             along_i[:, :-1],
             along_i[:, 1:],
             along_j,
-            np.roll(along_j, -1, axis=0),
+            other_j,
         ),
         axis=-1,
     )
@@ -218,12 +236,24 @@ def _aspect_ratio(nodes: np.ndarray) -> np.ndarray:
     return edges.max(axis=-1) / np.where(smallest > 0.0, smallest, np.inf)
 
 
-def _expansion_ratio(volume: np.ndarray) -> np.ndarray:
-    """Volume ratio between each cell and its neighbours, always at least 1."""
+def _expansion_ratio(volume: np.ndarray, periodic_i: bool = True) -> np.ndarray:
+    """Volume ratio between each cell and its neighbours, always at least 1.
+
+    A cell at an open ``i`` end compares against itself in that direction, which
+    is a ratio of one and cannot mask a real jump elsewhere. That is what the
+    ``j`` ends have always done, using ``concatenate`` to repeat the edge value.
+    """
+    if periodic_i:
+        i_neighbours = (np.roll(volume, 1, axis=0), np.roll(volume, -1, axis=0))
+    else:
+        i_neighbours = (
+            np.concatenate((volume[:1], volume[:-1]), axis=0),
+            np.concatenate((volume[1:], volume[-1:]), axis=0),
+        )
+
     ratios = []
     for neighbour in (
-        np.roll(volume, 1, axis=0),
-        np.roll(volume, -1, axis=0),
+        *i_neighbours,
         np.concatenate((volume[:, :1], volume[:, :-1]), axis=1),
         np.concatenate((volume[:, 1:], volume[:, -1:]), axis=1),
     ):
