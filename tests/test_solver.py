@@ -33,6 +33,7 @@ from fluidsolver.solver.linalg import (
     solve,
 )
 from fluidsolver.solver.post import compute_forces, wall_shear_stress
+from fluidsolver.solver.simple import Numerics, PressureVelocityCoupling
 
 
 # ----------------------------------------------------------------------
@@ -1377,6 +1378,119 @@ class TestMixedGradientRow:
 
         assert np.allclose(mixed[mask], dirichlet[mask])
         assert np.allclose(mixed[~mask], neumann[~mask])
+
+
+class TestOpenEnds:
+    """The two ``i`` ends of an open mesh, carrying flow in and out.
+
+    They take the far field's characteristic condition rather than a new one:
+    each face decides on the sign of ``u . n``. The part that differs is the
+    sign convention of ``flux_i``, which is outward at the high end and inward
+    at the low one, so most of what is checked here is that nothing downstream
+    was told the wrong direction.
+    """
+
+    FLUID = Fluid(density=1.0, viscosity=0.01, name="test")
+
+    def _box(self, nx=12, ny=6, velocity=2.0):
+        """An open box whose floor is a symmetry plane: nothing to push on."""
+        _, _, faces = open_rectangle(nx=nx, ny=ny)
+        freestream = Freestream(velocity=velocity)
+        boundaries = Boundaries(
+            faces, self.FLUID, freestream, wall_mask=np.zeros(nx, dtype=bool)
+        )
+        coupling = PressureVelocityCoupling(
+            faces, self.FLUID, boundaries, Numerics(scheme="linear"),
+            wall_model=False,
+        )
+        state = State.uniform(faces, self.FLUID, freestream)
+        return faces, boundaries, coupling, state
+
+    def test_a_uniform_stream_enters_at_the_low_end_and_leaves_at_the_high(self):
+        faces, boundaries, _, state = self._box()
+        start, end = boundaries.i_inflow_mask(state.flux_i)
+        assert start.all()
+        assert not end.any()
+        start_fixed, end_fixed = boundaries.i_pressure_is_fixed(state.flux_i)
+        assert not start_fixed.any() and end_fixed.all()
+
+    def test_a_periodic_mesh_has_no_ends_to_ask_about(self):
+        _, _, faces = uniform_mesh(48)
+        boundaries = Boundaries(faces, AIR_15C, Freestream(velocity=30.0))
+        flux_i = np.zeros(faces.shape)
+        assert boundaries.i_inflow_mask(flux_i) == (None, None)
+        assert boundaries.i_velocity(flux_i, flux_i, flux_i) == (
+            (None, None), (None, None)
+        )
+
+    def test_a_uniform_stream_crosses_an_open_box_unchanged(self):
+        """The exact fixed point, and every face of the box has to agree to it.
+
+        Inflow imposes the freestream at the low end, the floor is a symmetry
+        plane the stream slides along, the top carries no flux and so holds the
+        pressure, and the high end extrapolates. Any one of those assembled with
+        the wrong sign or the wrong face would push the field off uniform in the
+        first iteration, and it would not come back to rounding.
+        """
+        faces, _, coupling, state = self._box()
+        for _ in range(20):
+            coupling.iterate(state)
+
+        assert np.abs(state.u - 2.0).max() < 1e-12
+        assert np.abs(state.v).max() < 1e-12
+        assert np.abs(state.pressure).max() < 1e-12
+        # And the mass through the two ends is the same mass.
+        assert np.isclose(state.flux_i[0].sum(), state.flux_i[-1].sum(), rtol=1e-13)
+
+    def test_the_corrected_fluxes_satisfy_the_equation_that_produced_them(self):
+        """``div(F) after correction == A p' - b``, through the open ends too.
+
+        The same identity the O-grid test checks, and for the same reason: the
+        pressure equation puts a Dirichlet coupling on every face that holds the
+        pressure, and the flux update has to apply the correction that coupling
+        asserts. At the low end the outward direction is ``-i``, so a sign slip
+        there leaves an imbalance of exactly ``2 rho D g p'`` in the end column.
+
+        The field is disturbed first so that ``p'`` is not zero, and the high end
+        is checked to be holding the pressure, so that the identity is being
+        asked something rather than holding vacuously.
+        """
+        faces, boundaries, coupling, state = self._box()
+        x = faces.metrics.centroid[..., 0]
+        y = faces.metrics.centroid[..., 1]
+        state.u = state.u + 0.3 * np.sin(np.pi * x / x.max()) * np.cos(y)
+        state.v = state.v + 0.2 * np.sin(2.0 * np.pi * y / y.max())
+        for _ in range(3):
+            coupling.iterate(state)
+
+        _, _, diagonal = coupling.momentum(state)
+        flux_i, flux_j, d_i, d_j = coupling.face_fluxes(state, diagonal)
+        assert boundaries.i_pressure_is_fixed(flux_i)[1].any()
+
+        correction, coefficients, cross_i, cross_j = coupling.pressure_correction(
+            state, flux_i, flux_j, d_i, d_j, diagonal
+        )
+        assert np.abs(correction[-1]).max() > 0.0
+        coupling.apply_correction(
+            state, correction, flux_i, flux_j, d_i, d_j, diagonal, cross_i, cross_j
+        )
+
+        after = ops.divergence(state.flux_i, state.flux_j, faces)
+        expected = coefficients.apply(correction) - coefficients.source
+        scale = np.abs(coefficients.source).max()
+        assert np.abs(after - expected).max() < 1e-10 * scale
+
+    def test_the_pressure_equation_is_not_singular_when_only_an_end_holds_it(self):
+        """The top of a flat-plate domain may be inflow everywhere.
+
+        Then no far-field face holds the pressure, and if the i ends were not
+        counted the source would be projected to zero mean as though the problem
+        were pure Neumann -- which, with the outlet holding it, it is not.
+        """
+        faces, boundaries, _, state = self._box()
+        far_flux = -np.abs(state.flux_j[:, -1]) - 1.0
+        assert not boundaries.far_flux_is_solvable(far_flux)
+        assert boundaries.far_flux_is_solvable(far_flux, state.flux_i)
 
 
 class TestRhieChowConsistency:

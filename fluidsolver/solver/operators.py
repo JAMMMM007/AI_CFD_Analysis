@@ -325,6 +325,8 @@ def add_diffusion(
     far_field_active: np.ndarray | None = None,
     i_start_value: np.ndarray | None = None,
     i_end_value: np.ndarray | None = None,
+    i_start_active: np.ndarray | None = None,
+    i_end_active: np.ndarray | None = None,
 ) -> None:
     """Add ``-div(Gamma grad phi)`` to the coefficients, in place.
 
@@ -392,7 +394,8 @@ def add_diffusion(
         _add_boundary_diffusion(
             coefficients, boundary, index, i_boundary_value(index, i_start_value,
                                                             i_end_value),
-            diffusivity[index], field_gradient[index], None,
+            diffusivity[index], field_gradient[index],
+            i_boundary_value(index, i_start_active, i_end_active),
         )
 
 
@@ -445,6 +448,8 @@ def add_convection(
     far_field_value: np.ndarray | None,
     wall_value: np.ndarray | None = None,
     scheme: str = "linear",
+    i_start_value: np.ndarray | None = None,
+    i_end_value: np.ndarray | None = None,
 ) -> None:
     """Add ``div(rho u phi)`` to the coefficients, in place.
 
@@ -493,6 +498,18 @@ def add_convection(
     coefficients.centre[:, 0] += np.maximum(wall_flux, 0.0)
     if wall_value is not None:
         coefficients.source[:, 0] += np.maximum(-wall_flux, 0.0) * wall_value
+
+    # The i ends, the same way. ``flux_i`` is signed towards increasing i, which
+    # is outward at the high end and inward at the low one -- the same inversion
+    # the wall has against the far field above.
+    if not faces.periodic_i:
+        for outward, index, value in (
+            (-flux_i[0], 0, i_start_value),
+            (flux_i[-1], -1, i_end_value),
+        ):
+            coefficients.centre[index] += np.maximum(outward, 0.0)
+            if value is not None:
+                coefficients.source[index] += np.maximum(-outward, 0.0) * value
 
     # Remove the part of the convective term that only exists because continuity
     # is not yet satisfied.

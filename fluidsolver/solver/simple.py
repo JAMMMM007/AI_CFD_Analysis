@@ -289,14 +289,20 @@ class PressureVelocityCoupling:
         wall_u, wall_v = self.boundaries.wall_velocity(state.u, state.v)
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
         inflow = self.boundaries.inflow_mask(far_flux)
+        # Both pairs are (None, None) on a mesh wrapped around a body.
+        ends_u, ends_v = self.boundaries.i_velocity(state.u, state.v, state.flux_i)
+        ends_inflow = self.boundaries.i_inflow_mask(state.flux_i)
 
         viscosity = self.fluid.viscosity + state.eddy_viscosity
-        grad_u = self.gradient(state.u, wall_u, far_u)
-        grad_v = self.gradient(state.v, wall_v, far_v)
+        grad_u = self.gradient(state.u, wall_u, far_u, *ends_u)
+        grad_v = self.gradient(state.v, wall_v, far_v, *ends_v)
 
         wall_pressure = state.pressure[:, 0]
         far_pressure = self.boundaries.far_pressure(state.pressure, far_flux)
-        grad_p = self.gradient(state.pressure, wall_pressure, far_pressure)
+        grad_p = self.gradient(
+            state.pressure, wall_pressure, far_pressure,
+            *self.boundaries.i_pressure(state.pressure, state.flux_i),
+        )
 
         transpose = self._transpose_stress(viscosity, grad_u, grad_v)
 
@@ -319,21 +325,24 @@ class PressureVelocityCoupling:
         )
 
         components = []
-        for field, gradient, wall, far, index in (
-            (state.u, grad_u, wall_u, far_u, 0),
-            (state.v, grad_v, wall_v, far_v, 1),
+        for field, gradient, wall, far, ends, index in (
+            (state.u, grad_u, wall_u, far_u, ends_u, 0),
+            (state.v, grad_v, wall_v, far_v, ends_v, 1),
         ):
             coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
             ops.add_convection(
                 coefficients, self.faces, state.flux_i, state.flux_j,
                 field, gradient,
                 far_field_value=far, scheme=self.numerics.scheme,
+                i_start_value=ends[0], i_end_value=ends[1],
             )
             ops.add_diffusion(
                 coefficients, self.faces, viscosity, gradient,
                 wall_value=wall, far_field_value=far,
                 wall_diffusivity=wall_viscosity,
                 far_field_active=inflow,
+                i_start_value=ends[0], i_end_value=ends[1],
+                i_start_active=ends_inflow[0], i_end_active=ends_inflow[1],
             )
             # Pressure gradient and the transpose half of the viscous stress.
             coefficients.source += (
@@ -573,7 +582,10 @@ class PressureVelocityCoupling:
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
         far_pressure = self.boundaries.far_pressure(state.pressure, far_flux)
 
-        grad_p = self.gradient(state.pressure, state.pressure[:, 0], far_pressure)
+        grad_p = self.gradient(
+            state.pressure, state.pressure[:, 0], far_pressure,
+            *self.boundaries.i_pressure(state.pressure, state.flux_i),
+        )
 
         # Two mobilities, and they are different quantities that happen to share
         # a symbol in the literature.
@@ -612,12 +624,23 @@ class PressureVelocityCoupling:
             + damping_flux_i
         )
         if not self.faces.periodic_i:
-            # The two ends are impermeable until a boundary condition says
-            # otherwise, and are assembled into the face array the way the wall
-            # and far-field j fluxes are below -- so that flux_i carries one
-            # entry per face, exactly as flux_j does.
-            closed = np.zeros((1, self.faces.shape[1]))
-            flux_i = np.concatenate((closed, flux_i, closed), axis=0)
+            # The two ends carry whatever their boundary velocity carries, the
+            # way the far field does below, and are assembled into the face array
+            # so that flux_i has one entry per face exactly as flux_j does. The
+            # low end's stored area points outward, which is -i, so its flux in
+            # the +i convention is the negative of the outward one.
+            (start_u, end_u), (start_v, end_v) = self.boundaries.i_velocity(
+                state.u, state.v, state.flux_i
+            )
+            start = -self.fluid.density * (
+                start_u * self.faces.i_start.area[:, 0]
+                + start_v * self.faces.i_start.area[:, 1]
+            )
+            end = self.fluid.density * (
+                end_u * self.faces.i_end.area[:, 0]
+                + end_v * self.faces.i_end.area[:, 1]
+            )
+            flux_i = np.concatenate((start[None], flux_i, end[None]), axis=0)
 
         # --- j faces (interior only; boundaries handled below) ---
         d_j = self.faces.j_faces.interpolate(mobility[:, 1:], mobility[:, :-1])
@@ -714,6 +737,9 @@ class PressureVelocityCoupling:
         # holds the velocity instead, the flux there is already fixed and the
         # correction through that face is zero.
         coefficients.centre[:, -1] += self._far_field_coupling(flux_j, diagonal)
+        # And the same at whichever i-end faces hold the pressure.
+        for index, coupling in self._i_end_couplings(flux_i, diagonal):
+            coefficients.centre[index] += coupling
 
         imbalance = -ops.divergence(flux_i, flux_j, self.faces)
         fixed = self.boundaries.far_pressure_is_fixed(flux_j[:, -1])
@@ -731,7 +757,7 @@ class PressureVelocityCoupling:
         # This replaces a multiplicative rescaling of every outflow face, which
         # was justified by this compatibility condition, did not need to be, and
         # was still doing it at convergence -- see Boundaries.far_flux_is_solvable.
-        if not self.boundaries.far_flux_is_solvable(flux_j[:, -1]):
+        if not self.boundaries.far_flux_is_solvable(flux_j[:, -1], flux_i):
             total = self.volume.sum()
             imbalance = imbalance - self.volume * (imbalance.sum() / total)
 
@@ -760,7 +786,7 @@ class PressureVelocityCoupling:
             )
             if self.numerics.pressure_correctors:
                 cross_i, cross_j = self._correction_cross_flux(
-                    correction, d_i, d_j, fixed
+                    correction, d_i, d_j, fixed, flux_i
                 )
 
         # The source is left describing the cross flux that is actually applied,
@@ -785,6 +811,7 @@ class PressureVelocityCoupling:
         d_i: np.ndarray,
         d_j: np.ndarray,
         fixed: np.ndarray,
+        flux_i: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """``-rho D_f (grad p')_f . T`` on every interior face, zero on boundaries.
 
@@ -800,6 +827,7 @@ class PressureVelocityCoupling:
             correction,
             correction[:, 0],
             np.where(fixed, 0.0, correction[:, -1]),
+            *self._i_end_correction(correction, flux_i),
         )
 
         cross_i = -density * d_i * np.sum(
@@ -842,6 +870,49 @@ class PressureVelocityCoupling:
             0.0,
         )
 
+    def _i_end_couplings(self, flux_i: np.ndarray, diagonal: np.ndarray):
+        """``[(row index, rho D g)]`` for the i ends, zero where velocity is held.
+
+        :meth:`_far_field_coupling` for the two ends of an open mesh, and empty on
+        a mesh that wraps. Shared by both halves of the pressure step for the
+        reason that one is: the matrix and the flux update must describe the same
+        correction through the same face.
+        """
+        if self.faces.periodic_i:
+            return []
+        fixed = self.boundaries.i_pressure_is_fixed(flux_i)
+        couplings = []
+        for (boundary, index), held in zip(
+            ((self.faces.i_start, 0), (self.faces.i_end, -1)), fixed
+        ):
+            couplings.append(
+                (
+                    index,
+                    np.where(
+                        held,
+                        self.fluid.density
+                        * (self.volume[index] / diagonal[index])
+                        * boundary.diffusion_factor,
+                        0.0,
+                    ),
+                )
+            )
+        return couplings
+
+    def _i_end_correction(self, correction: np.ndarray, flux_i):
+        """The i-end face values of ``p'``: zero where held, the cell's elsewhere.
+
+        Empty on a mesh that wraps, so it can be splatted into a gradient call
+        either way.
+        """
+        if self.faces.periodic_i or flux_i is None:
+            return ()
+        start, end = self.boundaries.i_pressure_is_fixed(flux_i)
+        return (
+            np.where(start, 0.0, correction[0]),
+            np.where(end, 0.0, correction[-1]),
+        )
+
     def apply_correction(
         self,
         state: State,
@@ -879,6 +950,7 @@ class PressureVelocityCoupling:
             correction,
             correction[:, 0],
             np.where(fixed, 0.0, correction[:, -1]),
+            *self._i_end_correction(correction, flux_i),
         )
         mobility = self.volume / diagonal
         state.u -= mobility * correction_gradient[..., 0]
@@ -894,6 +966,11 @@ class PressureVelocityCoupling:
         else:
             state.flux_i = flux_i.copy()
             state.flux_i[1:-1] -= correction_i
+            # Through the ends that hold the pressure, the correction the matrix
+            # accounted for. Outward is -i at the low end, hence the signs.
+            (_, start), (_, end) = self._i_end_couplings(flux_i, diagonal)
+            state.flux_i[0] -= start * correction[0]
+            state.flux_i[-1] += end * correction[-1]
         state.flux_j = flux_j.copy()
         state.flux_j[:, 1:-1] -= (
             density
@@ -958,7 +1035,11 @@ class PressureVelocityCoupling:
 
         # Continuity residual, scaled by the mass actually flowing through the
         # domain so that it reads as a fraction rather than as kg/s.
+        # On an open mesh most of that mass enters and leaves through the i
+        # ends -- on a flat plate the top boundary carries almost none of it.
         reference = np.abs(state.flux_j[:, -1]).sum()
+        if not self.faces.periodic_i:
+            reference += np.abs(state.flux_i[0]).sum() + np.abs(state.flux_i[-1]).sum()
         continuity = float(
             np.abs(imbalance).sum() / (reference if reference > 0.0 else 1.0)
         )

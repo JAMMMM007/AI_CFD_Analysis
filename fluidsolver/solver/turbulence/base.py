@@ -79,9 +79,10 @@ class TurbulenceModel(ABC):
         far_flux = state.flux_j[:, -1]
         wall_u, wall_v = self.boundaries.wall_velocity(state.u, state.v)
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
+        ends_u, ends_v = self.boundaries.i_velocity(state.u, state.v, state.flux_i)
 
-        grad_u = gradient(state.u, wall_u, far_u)
-        grad_v = gradient(state.v, wall_v, far_v)
+        grad_u = gradient(state.u, wall_u, far_u, *ends_u)
+        grad_v = gradient(state.v, wall_v, far_v, *ends_v)
 
         return np.sqrt(
             2.0 * (grad_u[..., 0] ** 2 + grad_v[..., 1] ** 2)
@@ -102,7 +103,8 @@ class TurbulenceModel(ABC):
         far_flux = state.flux_j[:, -1]
         wall_u, wall_v = self.boundaries.wall_velocity(state.u, state.v)
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
+        ends_u, ends_v = self.boundaries.i_velocity(state.u, state.v, state.flux_i)
 
-        grad_u = gradient(state.u, wall_u, far_u)
-        grad_v = gradient(state.v, wall_v, far_v)
+        grad_u = gradient(state.u, wall_u, far_u, *ends_u)
+        grad_v = gradient(state.v, wall_v, far_v, *ends_v)
         return np.abs(grad_v[..., 0] - grad_u[..., 1])

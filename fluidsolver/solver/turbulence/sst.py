@@ -146,6 +146,10 @@ class KOmegaSST(TurbulenceModel):
         wall_k, wall_omega = self.boundaries.wall_turbulence(state.u, state.v)
         far_k, far_omega = self.boundaries.far_turbulence(state.k, state.omega, far_flux)
         inflow = self.boundaries.inflow_mask(far_flux)
+        ends_k, ends_omega = self.boundaries.i_turbulence(
+            state.k, state.omega, state.flux_i
+        )
+        ends_inflow = self.boundaries.i_inflow_mask(state.flux_i)
 
         # ``wall_k`` is None, which add_diffusion reads as zero flux, and the
         # gradient operator is told the same thing the same way. It used to be
@@ -153,7 +157,7 @@ class KOmegaSST(TurbulenceModel):
         # gradient along the centroid-to-face vector rather than along the
         # normal -- the same condition only where the two are parallel, which on
         # a circle is everywhere and on an aerofoil is nowhere.
-        grad_k = self.gradient(state.k, None, far_k)
+        grad_k = self.gradient(state.k, None, far_k, *ends_k)
         # ``wall_omega`` is the near-wall asymptote and means nothing on a
         # symmetry face, where omega instead has a vanishing normal derivative.
         # ``solid`` picks between the two face by face; it is all-True on a mesh
@@ -163,6 +167,7 @@ class KOmegaSST(TurbulenceModel):
             state.omega,
             wall_omega,
             far_omega,
+            *ends_omega,
             wall_active=None if self.boundaries.wall_mask is None else solid,
         )
         strain = self.strain_rate(state, self.gradient)
@@ -171,10 +176,12 @@ class KOmegaSST(TurbulenceModel):
         cross_diffusion = self._cross_diffusion(state, grad_k, grad_omega, blend)
 
         residual_k = self._solve_k(
-            state, strain, blend, grad_k, wall_k, far_k, inflow
+            state, strain, blend, grad_k, wall_k, far_k, inflow,
+            ends=ends_k, ends_inflow=ends_inflow,
         )
         residual_omega = self._solve_omega(
-            state, strain, blend, cross_diffusion, grad_omega, wall_omega, far_omega, inflow
+            state, strain, blend, cross_diffusion, grad_omega, wall_omega, far_omega, inflow,
+            ends=ends_omega, ends_inflow=ends_inflow,
         )
 
         # Relax the eddy viscosity rather than replacing it outright. It is the
@@ -362,7 +369,8 @@ class KOmegaSST(TurbulenceModel):
         )
 
     def _solve_k(
-        self, state, strain, blend, grad_k, wall_k, far_k, inflow
+        self, state, strain, blend, grad_k, wall_k, far_k, inflow,
+        ends=(None, None), ends_inflow=(None, None),
     ) -> float:
         """Turbulent kinetic energy."""
         density = self.fluid.density
@@ -402,10 +410,13 @@ class KOmegaSST(TurbulenceModel):
         ops.add_convection(
             coefficients, self.faces, state.flux_i, state.flux_j, state.k, grad_k,
             far_field_value=far_k, scheme=self.numerics.turbulence_scheme,
+            i_start_value=ends[0], i_end_value=ends[1],
         )
         ops.add_diffusion(
             coefficients, self.faces, diffusivity, grad_k,
             wall_value=wall_k, far_field_value=far_k, far_field_active=inflow,
+            i_start_value=ends[0], i_end_value=ends[1],
+            i_start_active=ends_inflow[0], i_end_active=ends_inflow[1],
         )
 
         # Destruction is linear in k, so it belongs on the diagonal rather than in
@@ -422,7 +433,7 @@ class KOmegaSST(TurbulenceModel):
 
     def _solve_omega(
         self, state, strain, blend, cross_diffusion, grad_omega, wall_omega,
-        far_omega, inflow,
+        far_omega, inflow, ends=(None, None), ends_inflow=(None, None),
     ) -> float:
         """Specific dissipation rate."""
         density = self.fluid.density
@@ -439,6 +450,7 @@ class KOmegaSST(TurbulenceModel):
         ops.add_convection(
             coefficients, self.faces, state.flux_i, state.flux_j, state.omega, grad_omega,
             far_field_value=far_omega, scheme=self.numerics.turbulence_scheme,
+            i_start_value=ends[0], i_end_value=ends[1],
         )
         # No wall value here: omega is prescribed in the wall-adjacent cell
         # rather than on the face, so the face carries no diffusive flux of its
@@ -446,6 +458,8 @@ class KOmegaSST(TurbulenceModel):
         ops.add_diffusion(
             coefficients, self.faces, diffusivity, grad_omega,
             wall_value=None, far_field_value=far_omega, far_field_active=inflow,
+            i_start_value=ends[0], i_end_value=ends[1],
+            i_start_active=ends_inflow[0], i_end_active=ends_inflow[1],
         )
 
         # Destruction is quadratic; linearising it as beta rho omega_old * omega

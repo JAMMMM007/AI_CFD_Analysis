@@ -153,7 +153,7 @@ class Boundaries:
             self.reference_length
         )
 
-    def far_vortex_velocity(self) -> np.ndarray:
+    def far_vortex_velocity(self, centres: np.ndarray | None = None) -> np.ndarray:
         """Velocity the bound vortex induces at each far-field face centre.
 
         **The sign is derived, not copied, because the obvious source has it the
@@ -177,10 +177,12 @@ class Boundaries:
 
         which is what this returns.
         """
+        if centres is None:
+            centres = self.faces.far_field.centre
         if self.circulation == 0.0:
-            return np.zeros_like(self.faces.far_field.centre)
+            return np.zeros_like(centres)
 
-        offset = self.faces.far_field.centre - self.vortex_centre
+        offset = centres - self.vortex_centre
         radius_squared = np.sum(offset * offset, axis=-1)
         rotated = np.stack((offset[:, 1], -offset[:, 0]), axis=-1)
         return (self.circulation / (2.0 * np.pi)) * rotated / np.maximum(
@@ -496,6 +498,92 @@ class Boundaries:
         )
 
     # ------------------------------------------------------------------
+    # The i ends
+    # ------------------------------------------------------------------
+    #
+    # An open mesh has two more boundaries, and they take the far field's
+    # condition: each face decides for itself on the sign of u . n. An inlet is
+    # that condition on a boundary that happens to be inflow everywhere, and an
+    # outlet one that happens to be outflow, so nothing here is told which end is
+    # which -- a flat plate's left end selects inflow for itself and its right
+    # end outflow.
+    #
+    # Every method returns a ``(start, end)`` pair, and ``(None, None)`` on a
+    # mesh whose i direction wraps, which the operators read as "no such
+    # boundary". The one thing that differs from the far field is the sign of the
+    # stored flux: ``flux_i`` is signed towards increasing i, which is outward at
+    # the high end and *inward* at the low one. It is turned into an outward flux
+    # here, once, so the condition itself never sees the difference.
+
+    def i_outward_flux(self, flux_i: np.ndarray):
+        """Mass flux leaving the domain through each i end, per face."""
+        if self.faces.periodic_i:
+            return None, None
+        return -flux_i[0], flux_i[-1]
+
+    def i_inflow_mask(self, flux_i: np.ndarray):
+        """True on i-end faces where fluid is entering."""
+        start, end = self.i_outward_flux(flux_i)
+        if start is None:
+            return None, None
+        return self.inflow_mask(start), self.inflow_mask(end)
+
+    def _i_end_faces(self):
+        return (self.faces.i_start, 0), (self.faces.i_end, -1)
+
+    def i_velocity(self, u: np.ndarray, v: np.ndarray, flux_i: np.ndarray):
+        """``((u_start, u_end), (v_start, v_end))``: freestream in, interior out.
+
+        The bound vortex is superposed on inflow faces exactly as it is on the far
+        field, and for the same reason; it is zero on a non-lifting case.
+        """
+        if self.faces.periodic_i:
+            return (None, None), (None, None)
+        stream = self.freestream.vector
+        entering = self.i_inflow_mask(flux_i)
+        values_u, values_v = [], []
+        for (boundary, index), inflow in zip(self._i_end_faces(), entering):
+            induced = self.far_vortex_velocity(boundary.centre)
+            values_u.append(np.where(inflow, stream[0] + induced[:, 0], u[index]))
+            values_v.append(np.where(inflow, stream[1] + induced[:, 1], v[index]))
+        return tuple(values_u), tuple(values_v)
+
+    def i_pressure(self, p: np.ndarray, flux_i: np.ndarray):
+        """Bernoulli's pressure where flow leaves, extrapolated where it enters."""
+        if self.faces.periodic_i:
+            return None, None
+        stream = self.freestream.vector
+        entering = self.i_inflow_mask(flux_i)
+        values = []
+        for (boundary, index), inflow in zip(self._i_end_faces(), entering):
+            outer = stream + self.far_vortex_velocity(boundary.centre)
+            bernoulli = 0.5 * self.fluid.density * (
+                self.freestream.velocity**2 - np.sum(outer * outer, axis=-1)
+            )
+            values.append(np.where(inflow, p[index], bernoulli))
+        return tuple(values)
+
+    def i_pressure_is_fixed(self, flux_i: np.ndarray):
+        """i-end faces where the pressure correction is pinned to zero."""
+        start, end = self.i_inflow_mask(flux_i)
+        if start is None:
+            return None, None
+        return ~start, ~end
+
+    def i_turbulence(self, k: np.ndarray, omega: np.ndarray, flux_i: np.ndarray):
+        """``((k_start, k_end), (omega_start, omega_end))``."""
+        if self.faces.periodic_i:
+            return (None, None), (None, None)
+        entering = self.i_inflow_mask(flux_i)
+        k_inflow = self.freestream.turbulent_kinetic_energy()
+        omega_inflow = self.freestream.specific_dissipation(self.fluid)
+        values_k, values_omega = [], []
+        for (_, index), inflow in zip(self._i_end_faces(), entering):
+            values_k.append(np.where(inflow, k_inflow, k[index]))
+            values_omega.append(np.where(inflow, omega_inflow, omega[index]))
+        return tuple(values_k), tuple(values_omega)
+
+    # ------------------------------------------------------------------
     # Fluxes
     # ------------------------------------------------------------------
 
@@ -508,7 +596,9 @@ class Boundaries:
             self.faces.far_field.area * self.freestream.vector, axis=-1
         )
 
-    def far_flux_is_solvable(self, far_flux: np.ndarray) -> bool:
+    def far_flux_is_solvable(
+        self, far_flux: np.ndarray, flux_i: np.ndarray | None = None
+    ) -> bool:
         """Whether the pressure equation needs its source projecting to zero mean.
 
         It does only when *no* far-field face holds the pressure -- that is, when
@@ -540,4 +630,14 @@ class Boundaries:
         entirely inflow -- and it said nothing when it did. The factor was
         unbounded as the outflow went to zero.
         """
-        return bool(np.any(self.far_pressure_is_fixed(far_flux)))
+        if bool(np.any(self.far_pressure_is_fixed(far_flux))):
+            return True
+        # On an open mesh the i ends can hold the pressure too, and on a flat
+        # plate they are where it is held: the top boundary carries almost no
+        # flux, and the outlet carries all of it.
+        if flux_i is None:
+            return False
+        return any(
+            fixed is not None and bool(np.any(fixed))
+            for fixed in self.i_pressure_is_fixed(flux_i)
+        )
