@@ -21,7 +21,7 @@ The transported equations:
     D(rho k)/Dt     = P~_k - beta* rho k omega
                       + div[(mu + sigma_k mu_t) grad k]
 
-    D(rho omega)/Dt = gamma rho S^2 - beta rho omega^2
+    D(rho omega)/Dt = gamma P~_k / nu_t - beta rho omega^2
                       + div[(mu + sigma_w mu_t) grad omega]
                       + 2(1 - F1) rho sigma_w2 (1/omega) grad k . grad omega
 
@@ -99,13 +99,41 @@ class KOmegaSST(TurbulenceModel):
     def __init__(self, faces, fluid, boundaries, numerics, reference_length=1.0):
         super().__init__(faces, fluid, boundaries, numerics, reference_length)
         self.gradient = ops.Gradient(faces)
-        self.matrix = StructuredMatrix(faces.shape)
+        self.matrix = StructuredMatrix(faces.shape, faces.periodic_i)
         self.volume = faces.metrics.volume
         self.wall_distance = np.maximum(faces.metrics.wall_distance, 1e-300)
 
         freestream = boundaries.freestream
         self._k_floor = K_FLOOR_FRACTION * freestream.turbulent_kinetic_energy()
         self._omega_floor = OMEGA_FLOOR_FRACTION * freestream.specific_dissipation(fluid)
+
+        #: The ambient ``(k, omega)`` the sustaining terms hold the freestream at.
+        #:
+        #: SST-sust, which the NASA Turbulence Modeling Resource specifies as a
+        #: named variant of SST-2003. Without it the freestream turbulence decays
+        #: on its way to the body: in the freestream ``F1 -> 0``, production
+        #: vanishes, and the two equations reduce to
+        #:
+        #:     U dk/dx = -beta* k omega,   U domega/dx = -beta_2 omega^2,
+        #:
+        #: whose solution falls as ``(1 + beta_2 omega_0 x / U)^(-beta*/beta_2)``.
+        #: Over forty chords at the old defaults that is a factor of 11 in
+        #: ``omega`` and 14 in ``k``, so a user asking for 0.1% intensity got
+        #: 0.027% at the body -- and *how much* they got depended on where the
+        #: far-field boundary had been put, which makes a numerical parameter into
+        #: a physical one and compounds the far-field error the vortex correction
+        #: exists to remove.
+        #:
+        #: Adding ``beta* rho k_amb omega_amb`` and ``beta rho omega_amb^2`` to the
+        #: two sources cancels the destruction exactly at the ambient level, so the
+        #: ambient state is a fixed point of the model rather than an initial
+        #: condition for a decay. It is a *source*, not a floor: nothing is clipped
+        #: and the field is free to fall below the ambient level wherever the
+        #: physics takes it there.
+        self._ambient = (
+            freestream.turbulent_kinetic_energy(),
+            freestream.specific_dissipation(fluid),
+        )
 
     # ------------------------------------------------------------------
 
@@ -118,23 +146,42 @@ class KOmegaSST(TurbulenceModel):
         wall_k, wall_omega = self.boundaries.wall_turbulence(state.u, state.v)
         far_k, far_omega = self.boundaries.far_turbulence(state.k, state.omega, far_flux)
         inflow = self.boundaries.inflow_mask(far_flux)
+        ends_k, ends_omega = self.boundaries.i_turbulence(
+            state.k, state.omega, state.flux_i
+        )
+        ends_inflow = self.boundaries.i_inflow_mask(state.flux_i)
 
-        # ``wall_k`` is None, which add_diffusion reads as zero flux. The
-        # gradient operator says the same thing by being handed the adjacent
-        # cell value: the difference across the face is then zero, which is
-        # precisely what a vanishing normal gradient asserts.
-        grad_k = self.gradient(state.k, state.k[:, 0], far_k)
-        grad_omega = self.gradient(state.omega, wall_omega, far_omega)
+        # ``wall_k`` is None, which add_diffusion reads as zero flux, and the
+        # gradient operator is told the same thing the same way. It used to be
+        # handed the adjacent cell value instead, which asserts a vanishing
+        # gradient along the centroid-to-face vector rather than along the
+        # normal -- the same condition only where the two are parallel, which on
+        # a circle is everywhere and on an aerofoil is nowhere.
+        grad_k = self.gradient(state.k, None, far_k, *ends_k)
+        # ``wall_omega`` is the near-wall asymptote and means nothing on a
+        # symmetry face, where omega instead has a vanishing normal derivative.
+        # ``solid`` picks between the two face by face; it is all-True on a mesh
+        # wrapped around a body, where this is the condition it always was.
+        solid = self.boundaries.solid_wall
+        grad_omega = self.gradient(
+            state.omega,
+            wall_omega,
+            far_omega,
+            *ends_omega,
+            wall_active=None if self.boundaries.wall_mask is None else solid,
+        )
         strain = self.strain_rate(state, self.gradient)
 
         blend = self._blending_f1(state, grad_k, grad_omega)
         cross_diffusion = self._cross_diffusion(state, grad_k, grad_omega, blend)
 
         residual_k = self._solve_k(
-            state, strain, blend, grad_k, wall_k, far_k, inflow
+            state, strain, blend, grad_k, wall_k, far_k, inflow,
+            ends=ends_k, ends_inflow=ends_inflow,
         )
         residual_omega = self._solve_omega(
-            state, strain, blend, cross_diffusion, grad_omega, wall_omega, far_omega, inflow
+            state, strain, blend, cross_diffusion, grad_omega, wall_omega, far_omega, inflow,
+            ends=ends_omega, ends_inflow=ends_inflow,
         )
 
         # Relax the eddy viscosity rather than replacing it outright. It is the
@@ -241,8 +288,89 @@ class KOmegaSST(TurbulenceModel):
     # Transport equations
     # ------------------------------------------------------------------
 
+    def _limited_production(self, state: State, strain: np.ndarray) -> np.ndarray:
+        """``P~_k = min(mu_t S^2, 10 beta* rho k omega)``, Menter's limited production.
+
+        Shared, because SST-2003 applies this same limited quantity to *both*
+        transport equations and the ``omega`` equation was not getting it. See
+        :meth:`_solve_omega`.
+
+        The wall-adjacent row takes its strain from the two-layer near-wall
+        profile rather than from the discrete gradient, which is the *average*
+        across the cell and overstates the local one by ``kappa U+`` once the cell
+        leaves the viscous sublayer. See ``Boundaries.wall_velocity_gradient``: it
+        reduces to the resolved value exactly on a wall-resolved mesh, so this
+        changes nothing at ``y+ ~ 1`` and is the difference between converging and
+        not at ``y+ 30``.
+        """
+        density = self.fluid.density
+        omega = np.maximum(state.omega, self._omega_floor)
+        return np.minimum(
+            state.eddy_viscosity * self._production_strain(state, strain) ** 2,
+            PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega,
+        )
+
+    def _production_strain(self, state: State, strain: np.ndarray) -> np.ndarray:
+        """The strain the production terms use, with the wall row overridden.
+
+        Only where the row is a solid wall. The two-layer profile the override
+        comes from describes a boundary layer, and a symmetry plane has none: the
+        resolved strain is simply correct there, and asserting a log-layer one
+        would manufacture turbulence in a stream that is not sheared at all.
+        """
+        production_strain = strain.copy()
+        production_strain[:, 0] = np.where(
+            self.boundaries.solid_wall,
+            self.boundaries.wall_velocity_gradient(state.u, state.v),
+            strain[:, 0],
+        )
+        return production_strain
+
+    def _limited_production_over_nu_t(
+        self, state: State, strain: np.ndarray
+    ) -> np.ndarray:
+        """``P~_k / nu_t``, which is ``rho S^2`` only while the limiter is inactive.
+
+        The ``omega`` production. SST-2003 specifies ``gamma P~_k / nu_t`` with the
+        *limited* ``k`` production, and the limiter applying to both equations.
+        This code had ``gamma rho S^2``, which is the erratum in Menter, Kuntz and
+        Langtry (2003) that the NASA Turbulence Modeling Resource records:
+
+            "In the omega equation (2nd part of eqn (1) in the paper), the
+            production term was incorrectly given as alpha rho S^2 ... Instead, it
+            should have read alpha P~_k / nu_t ... the Pk term has a tilde over it,
+            which refers to the limited value of the k production term
+            min(P, 10 beta* rho omega k)."
+
+        The two forms coincide wherever the limiter is inactive, because
+        ``P_k / nu_t = (mu_t S^2)/(mu_t/rho) = rho S^2`` exactly. They differ
+        precisely where ``mu_t S^2 > 10 beta* rho k omega``, and there the coded
+        form was larger by the ratio the limiter was cutting. The consequence was
+        that Menter's stagnation-point limiter -- which this project's Stage 0 went
+        to some trouble to make active at all -- was switched off for one of the
+        two equations it is specified to act on, so ``omega`` was over-produced
+        relative to ``k`` exactly where the anomaly it exists to control lives.
+
+        Written as ``min(S^2, 10 beta* rho k omega / mu_t)`` rather than as a
+        division of ``P~_k``, so that a vanishing ``mu_t`` selects ``S^2`` instead
+        of dividing by zero. That is the arrangement, not a guard bolted on: at
+        ``mu_t = 0`` the limit is ``+inf`` and the minimum is the strain term,
+        which is the correct limit and not merely a safe one.
+        """
+        density = self.fluid.density
+        omega = np.maximum(state.omega, self._omega_floor)
+        eddy = state.eddy_viscosity
+
+        limit = PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega
+        positive = eddy > 0.0
+        return np.minimum(
+            self._production_strain(state, strain) ** 2,
+            np.where(positive, limit / np.where(positive, eddy, 1.0), np.inf),
+        )
+
     def _solve_k(
-        self, state, strain, blend, grad_k, wall_k, far_k, inflow
+        self, state, strain, blend, grad_k, wall_k, far_k, inflow,
+        ends=(None, None), ends_inflow=(None, None),
     ) -> float:
         """Turbulent kinetic energy."""
         density = self.fluid.density
@@ -272,17 +400,9 @@ class KOmegaSST(TurbulenceModel):
         # reduces to the resolved value exactly on a wall-resolved mesh, so this
         # changes nothing at y+ ~ 1 and is the difference between converging and
         # not at y+ 30.
-        production_strain = strain.copy()
-        production_strain[:, 0] = self.boundaries.wall_velocity_gradient(
-            state.u, state.v
-        )
+        production = self._limited_production(state, strain)
 
-        production = np.minimum(
-            state.eddy_viscosity * production_strain**2,
-            PRODUCTION_LIMIT * BETA_STAR * density * np.maximum(state.k, 0.0) * omega,
-        )
-
-        coefficients = Coefficients.zeros(self.faces.shape)
+        coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
         diffusivity = self.fluid.viscosity + self._blended(
             blend, SIGMA_K1, SIGMA_K2
         ) * state.eddy_viscosity
@@ -290,10 +410,13 @@ class KOmegaSST(TurbulenceModel):
         ops.add_convection(
             coefficients, self.faces, state.flux_i, state.flux_j, state.k, grad_k,
             far_field_value=far_k, scheme=self.numerics.turbulence_scheme,
+            i_start_value=ends[0], i_end_value=ends[1],
         )
         ops.add_diffusion(
             coefficients, self.faces, diffusivity, grad_k,
             wall_value=wall_k, far_field_value=far_k, far_field_active=inflow,
+            i_start_value=ends[0], i_end_value=ends[1],
+            i_start_active=ends_inflow[0], i_end_active=ends_inflow[1],
         )
 
         # Destruction is linear in k, so it belongs on the diagonal rather than in
@@ -301,12 +424,16 @@ class KOmegaSST(TurbulenceModel):
         # cannot drive k negative; as an explicit source it could.
         coefficients.centre += BETA_STAR * density * omega * self.volume
         coefficients.source += production * self.volume
+        # SST-sust: cancel the destruction at the ambient level exactly, so the
+        # freestream values stop decaying. See _ambient.
+        k_amb, omega_amb = self._ambient
+        coefficients.source += BETA_STAR * density * k_amb * omega_amb * self.volume
 
         return self._solve_and_clip(coefficients, state, "k", self._k_floor)
 
     def _solve_omega(
         self, state, strain, blend, cross_diffusion, grad_omega, wall_omega,
-        far_omega, inflow,
+        far_omega, inflow, ends=(None, None), ends_inflow=(None, None),
     ) -> float:
         """Specific dissipation rate."""
         density = self.fluid.density
@@ -315,7 +442,7 @@ class KOmegaSST(TurbulenceModel):
         gamma = self._blended(blend, GAMMA_1, GAMMA_2)
         beta = self._blended(blend, BETA_1, BETA_2)
 
-        coefficients = Coefficients.zeros(self.faces.shape)
+        coefficients = Coefficients.zeros(self.faces.shape, self.faces.periodic_i)
         diffusivity = self.fluid.viscosity + self._blended(
             blend, SIGMA_W1, SIGMA_W2
         ) * state.eddy_viscosity
@@ -323,6 +450,7 @@ class KOmegaSST(TurbulenceModel):
         ops.add_convection(
             coefficients, self.faces, state.flux_i, state.flux_j, state.omega, grad_omega,
             far_field_value=far_omega, scheme=self.numerics.turbulence_scheme,
+            i_start_value=ends[0], i_end_value=ends[1],
         )
         # No wall value here: omega is prescribed in the wall-adjacent cell
         # rather than on the face, so the face carries no diffusive flux of its
@@ -330,12 +458,20 @@ class KOmegaSST(TurbulenceModel):
         ops.add_diffusion(
             coefficients, self.faces, diffusivity, grad_omega,
             wall_value=None, far_field_value=far_omega, far_field_active=inflow,
+            i_start_value=ends[0], i_end_value=ends[1],
+            i_start_active=ends_inflow[0], i_end_active=ends_inflow[1],
         )
 
         # Destruction is quadratic; linearising it as beta rho omega_old * omega
         # keeps it implicit and unconditionally stable.
         coefficients.centre += beta * density * omega * self.volume
-        coefficients.source += gamma * density * strain**2 * self.volume
+        # SST-sust, the omega half. See _ambient.
+        coefficients.source += beta * density * self._ambient[1] ** 2 * self.volume
+        # gamma P~_k / nu_t, not gamma rho S^2. See the module docstring.
+        coefficients.source += (
+            gamma * density * self._limited_production_over_nu_t(state, strain)
+            * self.volume
+        )
 
         # Cross-diffusion changes sign. The positive part is a source; the
         # negative part is split off and made implicit, so it can never push
@@ -346,7 +482,8 @@ class KOmegaSST(TurbulenceModel):
         ) * self.volume
 
         return self._solve_and_clip(
-            coefficients, state, "omega", self._omega_floor, fixed_wall=wall_omega
+            coefficients, state, "omega", self._omega_floor, fixed_wall=wall_omega,
+            solid=self.boundaries.solid_wall,
         )
 
     def _solve_and_clip(
@@ -356,11 +493,15 @@ class KOmegaSST(TurbulenceModel):
         name: str,
         floor: float,
         fixed_wall: np.ndarray | None = None,
+        solid: np.ndarray | None = None,
     ) -> float:
         """Relax, solve, and clip the result to stay positive.
 
         ``fixed_wall`` prescribes the wall-adjacent cell value outright, by
-        replacing its row with the identity. This is how Menter's ``omega``
+        replacing its row with the identity. ``solid`` restricts that to the part
+        of the row that is solid wall: a symmetry face has no near-wall asymptote
+        to prescribe, so those cells are solved like any other. It defaults to
+        the whole row, which is what a mesh wrapped around a body has. This is how Menter's ``omega``
         condition is meant to be applied: ``6 nu / (beta1 d1^2)`` is the
         asymptotic solution evaluated *at the first cell centre*, not a value on
         the surface. Imposing it as a Dirichlet face value instead drives an
@@ -381,11 +522,21 @@ class KOmegaSST(TurbulenceModel):
         was doing.
         """
         current = getattr(state, name)
+        if solid is None:
+            solid = np.ones(coefficients.centre.shape[0], dtype=bool)
 
         if fixed_wall is not None:
-            self._fix_wall_row(coefficients, fixed_wall)
+            self._fix_wall_row(coefficients, fixed_wall, solid)
 
-        residual = coefficients.residual(current)
+        # The wall row is prescribed rather than solved, so it is excluded from
+        # the residual. See Coefficients.residual: left in, it supplied 57% of
+        # omega's normaliser and 65% of its imbalance, and what it was measuring
+        # was how far its own boundary condition had moved.
+        solved = None
+        if fixed_wall is not None:
+            solved = np.ones(coefficients.centre.shape, dtype=bool)
+            solved[:, 0] = ~solid
+        residual = coefficients.residual(current, solved)
 
         # Damped with the same local step the momentum equations use, so that k
         # and omega move at the pace of the velocity field driving them. The
@@ -397,7 +548,7 @@ class KOmegaSST(TurbulenceModel):
             coefficients.add_pseudo_time(current, pseudo_time)
         coefficients.under_relax(current, self.numerics.relax_turbulence)
         if fixed_wall is not None:
-            self._pin_wall_row(coefficients, fixed_wall)
+            self._pin_wall_row(coefficients, fixed_wall, solid)
 
         matrix = self.matrix.build(coefficients)
         value, _ = solve(
@@ -411,26 +562,39 @@ class KOmegaSST(TurbulenceModel):
         return residual
 
     @staticmethod
-    def _fix_wall_row(coefficients: Coefficients, fixed_wall: np.ndarray) -> None:
-        """Replace the wall-adjacent row with the identity, once."""
+    def _fix_wall_row(
+        coefficients: Coefficients, fixed_wall: np.ndarray, solid: np.ndarray
+    ) -> None:
+        """Replace the solid part of the wall-adjacent row with the identity, once.
+
+        ``solid`` is all-True on a mesh wrapped around a body, where every
+        ``np.where`` below reduces to the assignment it replaced.
+        """
         for band in (
             coefficients.west, coefficients.east,
             coefficients.south, coefficients.north,
         ):
-            band[:, 0] = 0.0
-        # The cell above no longer has a neighbour to solve for; fold its
-        # coupling into the source so the equation there stays correct.
-        coefficients.source[:, 1] -= coefficients.south[:, 1] * fixed_wall
-        coefficients.south[:, 1] = 0.0
-        KOmegaSST._pin_wall_row(coefficients, fixed_wall)
+            band[:, 0] = np.where(solid, 0.0, band[:, 0])
+        # A cell above a prescribed one no longer has a neighbour to solve for;
+        # fold its coupling into the source so the equation there stays correct.
+        # A cell above a symmetry face keeps its neighbour and is untouched.
+        coefficients.source[:, 1] -= np.where(
+            solid, coefficients.south[:, 1] * fixed_wall, 0.0
+        )
+        coefficients.south[:, 1] = np.where(solid, 0.0, coefficients.south[:, 1])
+        KOmegaSST._pin_wall_row(coefficients, fixed_wall, solid)
 
     @staticmethod
-    def _pin_wall_row(coefficients: Coefficients, fixed_wall: np.ndarray) -> None:
+    def _pin_wall_row(
+        coefficients: Coefficients, fixed_wall: np.ndarray, solid: np.ndarray
+    ) -> None:
         """Restore the identity on the wall row, after something has scaled it.
 
         Separate from :meth:`_fix_wall_row` because it is idempotent and that one
         is not: folding the ``south`` coupling into the row above may happen once
         and only once.
         """
-        coefficients.centre[:, 0] = 1.0
-        coefficients.source[:, 0] = fixed_wall
+        coefficients.centre[:, 0] = np.where(solid, 1.0, coefficients.centre[:, 0])
+        coefficients.source[:, 0] = np.where(
+            solid, fixed_wall, coefficients.source[:, 0]
+        )

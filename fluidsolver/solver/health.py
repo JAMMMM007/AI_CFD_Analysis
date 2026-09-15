@@ -44,13 +44,17 @@ every case it is for.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from fluidsolver.mesh import spacing
 from fluidsolver.mesh.metrics import Metrics
-from fluidsolver.solver.fluid import Fluid, Freestream
+from fluidsolver.solver.fluid import (
+    Fluid,
+    Freestream,
+    ambient_turbulence_bands,
+)
 
 #: Median cell Peclet number above which a laminar run is refused. The laminar
 #: cylinder converged at 98 and died at 3.2e4; this sits between them, nearer the
@@ -93,6 +97,13 @@ class HealthReport:
     peak_peclet: float
     estimated_y_plus: float
     cells: int
+    #: ``{name: (value, low, high)}`` for the three ambient turbulence
+    #: quantities. A default that satisfies the NASA TMR bands at one Reynolds
+    #: number does not satisfy them at another -- the bands scale with ``U/L``
+    #: and ``U mu / (rho L)`` while the parameterisation scales with ``U^2`` --
+    #: so the values are checked against the bands for the case actually being
+    #: run rather than assumed to be right because the defaults were.
+    ambient_turbulence: dict = field(default_factory=dict)
 
     @property
     def laminar(self) -> bool:
@@ -132,6 +143,22 @@ class HealthReport:
                 f"laminar solution to a turbulent problem, not an approximation of "
                 f"one. Use k-omega SST unless a laminar reference is what you want."
             )
+        for name, (value, low, high) in self.ambient_turbulence.items():
+            if not low <= value <= high:
+                issues.append(
+                    f"freestream {name} is {value:.3e}, outside the "
+                    f"[{low:.3e}, {high:.3e}] the NASA Turbulence Modeling "
+                    f"Resource specifies for external aerodynamics at this "
+                    f"Reynolds number. Ambient turbulence "
+                    f"{'above' if value > high else 'below'} the band "
+                    + (
+                        "puts a floor under the eddy viscosity everywhere, "
+                        "including inside any potential core and in the near wake."
+                        if value > high
+                        else "leaves the model with nothing to amplify, so a "
+                        "boundary layer may stay laminar for numerical reasons."
+                    )
+                )
         if not self.laminar and self.estimated_y_plus > _Y_PLUS_WARN:
             issues.append(
                 f"first cell at y+ of about {self.estimated_y_plus:.2f}, against "
@@ -168,12 +195,23 @@ def cell_peclet(metrics: Metrics, nodes: np.ndarray, fluid: Fluid, velocity: flo
     spacing that decides whether convection can be resolved -- taking the short
     edge would report every such cell as comfortable when the opposite is true.
     """
-    along_i = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=-1)
-    along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
-    size = np.maximum(
-        0.5 * (along_i[:, :-1] + along_i[:, 1:]),
-        0.5 * (along_j + np.roll(along_j, -1, axis=0)),
-    )
+    if metrics.periodic_i:
+        along_i = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=-1)
+        along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
+        size = np.maximum(
+            0.5 * (along_i[:, :-1] + along_i[:, 1:]),
+            0.5 * (along_j + np.roll(along_j, -1, axis=0)),
+        )
+    else:
+        # The roll above would join the last node line to the first -- on a flat
+        # plate an edge from the outlet back to the inlet -- and report a cell as
+        # long as the domain, which is what the peak Peclet number would then be.
+        along_i = np.linalg.norm(nodes[1:] - nodes[:-1], axis=-1)
+        along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
+        size = np.maximum(
+            0.5 * (along_i[:, :-1] + along_i[:, 1:]),
+            0.5 * (along_j[:-1] + along_j[1:]),
+        )
     return fluid.density * velocity * size / fluid.viscosity
 
 
@@ -203,4 +241,7 @@ def assess(
             fluid.viscosity,
         ),
         cells=int(metrics.volume.size),
+        ambient_turbulence={}
+        if model_name == "laminar"
+        else ambient_turbulence_bands(freestream, fluid, reference_length),
     )

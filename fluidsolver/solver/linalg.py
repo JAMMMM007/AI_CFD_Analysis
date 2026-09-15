@@ -36,10 +36,13 @@ class Coefficients:
     south: np.ndarray
     north: np.ndarray
     source: np.ndarray
+    #: Whether the ``i`` direction wraps, so that ``apply`` knows whether cell
+    #: ``0``'s west neighbour is cell ``Ni-1`` or nothing at all.
+    periodic_i: bool = True
 
     @classmethod
-    def zeros(cls, shape: tuple[int, int]) -> "Coefficients":
-        return cls(*(np.zeros(shape) for _ in range(6)))
+    def zeros(cls, shape: tuple[int, int], periodic_i: bool = True) -> "Coefficients":
+        return cls(*(np.zeros(shape) for _ in range(6)), periodic_i=periodic_i)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -49,13 +52,22 @@ class Coefficients:
         """Matrix-vector product, without going through the sparse matrix.
 
         Used for residuals and for the Rhie-Chow velocity reconstruction, where
-        building a matrix just to multiply by it would be wasteful. Neighbour
-        terms are rolled rather than indexed: ``i`` wraps, and the ``j`` rolls are
-        masked off at the boundaries where those coefficients are zero anyway.
+        building a matrix just to multiply by it would be wasteful.
+
+        The ``j`` terms are sliced rather than rolled because a roll there would
+        wrap the first cell row onto the last, which are opposite ends of the
+        domain. When ``i`` is open the same is true of it, so it is sliced too.
+        The boundary coefficients are zero either way -- nothing writes them --
+        but relying on that would make the result depend on an invariant held
+        somewhere else, and the ``j`` direction has never done so.
         """
         result = self.centre * field
-        result += self.west * np.roll(field, 1, axis=0)
-        result += self.east * np.roll(field, -1, axis=0)
+        if self.periodic_i:
+            result += self.west * np.roll(field, 1, axis=0)
+            result += self.east * np.roll(field, -1, axis=0)
+        else:
+            result[1:] += self.west[1:] * field[:-1]
+            result[:-1] += self.east[:-1] * field[1:]
         result[:, 1:] += self.south[:, 1:] * field[:, :-1]
         result[:, :-1] += self.north[:, :-1] * field[:, 1:]
         return result
@@ -64,9 +76,17 @@ class Coefficients:
         """Apply implicit (Patankar) under-relaxation in place.
 
         ``a_P/alpha`` on the diagonal with ``(1-alpha)/alpha a_P phi_old`` added to
-        the source. Written this way the converged solution is untouched -- at
-        convergence ``phi = phi_old`` and the two added terms cancel exactly -- so
-        the relaxation factor changes only the path, never the answer.
+        the source. Written this way the solution *of this equation* is untouched
+        -- at convergence ``phi = phi_old`` and the two added terms cancel exactly.
+
+        That is a statement about one equation and it used to be written as though
+        it were a statement about the solver. It is not. The relaxed diagonal
+        leaves this object and is used to build the Rhie-Chow mobility
+        ``D_f = alpha_u V / a_P``, whose damping term does *not* vanish at
+        convergence, so ``alpha_u`` reached the converged answer by a route that
+        has nothing to do with Patankar's cancellation -- measured at 2.76e-04 in
+        the cylinder's ``Cd`` across ``alpha_u`` 0.70 to 0.40. See
+        :meth:`PressureVelocityCoupling.face_fluxes`, which now removes it.
         """
         if not 0.0 < factor <= 1.0:
             raise ValueError(f"relaxation factor must be in (0, 1], got {factor}")
@@ -96,18 +116,50 @@ class Coefficients:
         self.centre += diagonal
         self.source += diagonal * field
 
-    def residual(self, field: np.ndarray) -> float:
+    def residual(self, field: np.ndarray, solved: np.ndarray | None = None) -> float:
         """Scaled residual of the current field, in the usual finite-volume sense.
 
         The raw imbalance ``|b - A phi|`` has the units of the equation and says
         nothing on its own -- it is small for a momentum equation on a fine mesh
         whether or not the solution is converged. Normalising by the variation the
         operator produces across the field gives a number that starts near one and
-        falls as the solution settles, comparably between equations.
+        falls as the solution settles, comparably between equations. This is the
+        standard finite-volume scaling and is not an invention here; it is
+        OpenFOAM's ``normFactor``.
+
+        ``solved`` marks the cells whose equation is genuinely being solved. Rows
+        that have been replaced by the identity are *prescribed*, not solved, and
+        including them measures how far a boundary condition moved since the last
+        iteration rather than how well any transport equation was satisfied.
+
+        That is not a small correction for ``omega``. Measured inside
+        ``_solve_and_clip`` on the NACA 2412, with the wall row's share separated
+        out:
+
+            iteration 100   wall row is 53.7% of the normaliser, 70.4% of the imbalance
+            iteration 300               56.9%                     66.2%
+            iteration 400               56.9%                     65.3%
+
+        The wall value is of order ``8e6`` against a field mean near ``1.2e5``, so
+        a single prescribed row per surface cell dominated both sums. ``k`` is
+        clean by the same measurement -- its wall row is 0.3% of the normaliser --
+        so this is specifically a consequence of the identity substitution and not
+        of the normalisation.
+
+        This finishes a repair that was started and not completed. The residual
+        used to be measured *before* the substitution, on the unsubstituted wall
+        equation that is then thrown away, and that put a floor of order 1e-1
+        under every run. Moving the measurement after the substitution removed the
+        floor; it left the prescribed row inside both sums, where it is still
+        measuring its own boundary condition.
         """
         imbalance = np.abs(self.source - self.apply(field))
         uniform = self.apply(np.full_like(field, field.mean()))
         scale = np.abs(self.apply(field) - uniform) + np.abs(self.source - uniform)
+
+        if solved is not None:
+            imbalance = imbalance[solved]
+            scale = scale[solved]
 
         total = scale.sum()
         if total <= 0.0:
@@ -124,10 +176,19 @@ class StructuredMatrix:
     change from one outer iteration to the next, and there are five of those per
     iteration, so re-deriving the pattern each time would dominate the cost of
     assembly.
+
+    **Five bands, whether or not ``i`` wraps.** An open ``i`` direction *removes*
+    couplings -- cell ``0`` has no west neighbour and cell ``Ni-1`` no east one --
+    exactly as ``j`` already has none at its two ends, so the two are masked off
+    the same way and the sparsity pattern keeps its five diagonals. This is why
+    opening ``i`` is much cheaper than the C-grid it is a step towards: a wake cut
+    makes cell ``(i, 0)`` a neighbour of ``(Ni-1-i, 0)``, which is far away in the
+    ``k = i*Nj + j`` ordering and is a genuine sixth and seventh band.
     """
 
-    def __init__(self, shape: tuple[int, int]):
+    def __init__(self, shape: tuple[int, int], periodic_i: bool = True):
         self.shape = shape
+        self.periodic_i = periodic_i
         n_i, n_j = shape
         self.size = n_i * n_j
 
@@ -145,9 +206,17 @@ class StructuredMatrix:
         interior_north = np.ones(shape, dtype=bool)
         interior_north[:, -1] = False
 
+        # The i masks are the same construction as the j ones, and are the whole
+        # of the topology difference here.
+        interior_west = np.ones(shape, dtype=bool)
+        interior_east = np.ones(shape, dtype=bool)
+        if not periodic_i:
+            interior_west[0] = False
+            interior_east[-1] = False
+
         band(everywhere, index, 0)
-        band(everywhere, np.roll(index, 1, axis=0), 1)
-        band(everywhere, np.roll(index, -1, axis=0), 2)
+        band(interior_west, np.roll(index, 1, axis=0), 1)
+        band(interior_east, np.roll(index, -1, axis=0), 2)
         band(interior_south, np.roll(index, 1, axis=1), 3)
         band(interior_north, np.roll(index, -1, axis=1), 4)
 
@@ -156,8 +225,8 @@ class StructuredMatrix:
         self._slot = np.concatenate(order)
         self._mask = [
             everywhere.ravel(),
-            everywhere.ravel(),
-            everywhere.ravel(),
+            interior_west.ravel(),
+            interior_east.ravel(),
             interior_south.ravel(),
             interior_north.ravel(),
         ]

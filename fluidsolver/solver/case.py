@@ -16,6 +16,7 @@ from fluidsolver.mesh import spacing
 from fluidsolver.mesh.metrics import compute_metrics
 from fluidsolver.mesh.ogrid import OGrid, build_ogrid
 from fluidsolver.mesh.quality import QualityReport, assess
+from fluidsolver.mesh.rectilinear import RectilinearGrid
 from fluidsolver.solver import post
 from fluidsolver.solver.bc import Boundaries
 from fluidsolver.solver.faces import build_faces
@@ -81,9 +82,15 @@ class MeshSettings:
 
 @dataclass
 class Case:
-    """A meshed, configured, runnable case."""
+    """A meshed, configured, runnable case.
 
-    grid: OGrid
+    ``grid`` is either an O-grid wrapped around a body or a rectilinear grid
+    with two open ends. ``Case`` asks it for the same handful of things --
+    ``nodes``, ``periodic_i``, ``wall_mask``, a name and two reference
+    quantities -- and never needs to know which it has.
+    """
+
+    grid: OGrid | RectilinearGrid
     fluid: Fluid
     freestream: Freestream
     numerics: Numerics = field(default_factory=Numerics)
@@ -102,7 +109,11 @@ class Case:
                 f"expected one of {sorted(MODELS)}"
             )
 
-        self.metrics = compute_metrics(self.grid.nodes)
+        self.metrics = compute_metrics(
+            self.grid.nodes,
+            periodic_i=self.grid.periodic_i,
+            wall_mask=self.grid.wall_mask,
+        )
         self.quality: QualityReport = assess(self.metrics, self.grid.nodes)
         if not self.quality.is_usable:
             raise ValueError(
@@ -130,7 +141,11 @@ class Case:
             )
 
         self.faces = build_faces(self.metrics)
-        self.boundaries = Boundaries(self.faces, self.fluid, self.freestream)
+        self.boundaries = Boundaries(
+            self.faces, self.fluid, self.freestream,
+            reference_length=self.reference_length,
+            wall_mask=self.grid.wall_mask,
+        )
         self.coupling = PressureVelocityCoupling(
             self.faces,
             self.fluid,
@@ -148,9 +163,11 @@ class Case:
         )
 
         if self.moment_reference is None:
-            self.moment_reference = self.grid.contour.centroid
+            self.moment_reference = self.grid.moment_reference
 
-        self.state = State.uniform(self.faces, self.fluid, self.freestream)
+        self.state = State.uniform(
+            self.faces, self.fluid, self.freestream, wall_mask=self.grid.wall_mask
+        )
         self.history = History()
         self.iteration = 0
         self.cfl_ramp = CflRamp(self.numerics)
@@ -168,7 +185,7 @@ class Case:
 
     @property
     def reference_length(self) -> float:
-        return self.grid.contour.reference_length
+        return self.grid.reference_length
 
     @property
     def reynolds(self) -> float:
@@ -231,6 +248,14 @@ class Case:
             )
 
         forces = self.forces()
+
+        # Hand the far field the circulation the solution now carries, for the
+        # next iteration's inflow condition. Lagged by one iteration and exact at
+        # the fixed point; a cold start has Cl = 0, so the correction switches
+        # itself on as the circulation develops rather than being asserted from
+        # an initial guess. See Boundaries.far_velocity.
+        self.boundaries.set_circulation(forces.lift_coefficient)
+
         self.iteration += 1
         residuals = Residuals(
             iteration=self.iteration,
@@ -310,11 +335,13 @@ class Case:
             self.reference_length,
             self.moment_reference,
             self._wall_model,
+            solid=self.boundaries.solid_wall,
         )
 
     def surface(self) -> post.SurfaceData:
         return post.surface_data(
-            self.state, self.faces, self.fluid, self.freestream, self._wall_model
+            self.state, self.faces, self.fluid, self.freestream, self._wall_model,
+            solid=self.boundaries.solid_wall,
         )
 
     def separation_points(self) -> np.ndarray:
@@ -326,7 +353,7 @@ class Case:
         forces = self.forces()
         surface = self.surface()
         lines = [
-            f"body            {self.grid.contour.name}",
+            f"body            {self.grid.name}",
             f"mesh            {self.grid.shape[0]} x {self.grid.shape[1]}"
             f" = {self.grid.n_cells} cells",
             f"model           {self.model.name}",

@@ -5,10 +5,15 @@ geometric work is done once here and reused by momentum, pressure and both
 turbulence equations.
 
 The mesh is structured, so faces come in two families. ``i``-faces separate a cell
-from its neighbour at ``i-1`` and wrap around the body; ``j``-faces separate it
-from ``j-1`` and terminate on the wall at one end and the far field at the other.
-Interior faces have a cell on both sides; boundary faces have one, and their far
-side is supplied by a boundary condition.
+from its neighbour at ``i-1``; ``j``-faces separate it from ``j-1`` and terminate
+on the wall at one end and the far field at the other. Interior faces have a cell
+on both sides; boundary faces have one, and their far side is supplied by a
+boundary condition.
+
+Whether the ``i`` family has boundaries depends on the topology. Around a closed
+body it wraps, so every ``i`` face is interior. On a plate or in a channel it does
+not, and the two ends become ``i_start`` and ``i_end`` -- the same construction as
+``wall`` and ``far_field``, because it is the same situation.
 
 Two geometric quantities do the real work, and both exist because a body-fitted
 mesh is not orthogonal:
@@ -100,34 +105,80 @@ class BoundaryFaces:
 
 @dataclass(frozen=True)
 class FaceGeometry:
-    """All the faces of a mesh, grouped by family."""
+    """All the faces of a mesh, grouped by family.
+
+    ``i_start`` and ``i_end`` are ``None`` on a periodic mesh, where the ``i``
+    direction closes on itself and has no ends. They are the ``i`` counterparts
+    of ``wall`` and ``far_field``, and they exist for the same reason and are
+    used the same way: a face with a cell on one side only, whose far side comes
+    from a boundary condition.
+    """
 
     i_faces: InteriorFaces
     j_faces: InteriorFaces
     wall: BoundaryFaces
     far_field: BoundaryFaces
     metrics: Metrics
+    i_start: BoundaryFaces | None = None
+    i_end: BoundaryFaces | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
         return self.metrics.shape
 
+    @property
+    def periodic_i(self) -> bool:
+        return self.metrics.periodic_i
+
 
 def build_faces(metrics: Metrics) -> FaceGeometry:
-    """Precompute the geometry of every face in the mesh."""
+    """Precompute the geometry of every face in the mesh.
+
+    On a periodic mesh every ``i`` face is interior and there are exactly ``Ni``
+    of them per row, because the last is shared with the first cell. On an open
+    one there are ``Ni+1``: ``Ni-1`` interior, plus one at each end that carries a
+    boundary condition -- exactly as the ``j`` direction has always worked, with
+    ``Nj-1`` interior faces between ``wall`` and ``far_field``.
+    """
     centroid = metrics.centroid
 
-    # i-faces: owner (i, j), neighbour (i-1, j). Periodic, so every one is
-    # interior and there are exactly Ni of them per row.
-    i_faces = _interior(
-        area=metrics.face_i_area,
-        centre=metrics.face_i_centre,
-        owner=centroid,
-        neighbour=np.roll(centroid, 1, axis=0),
-    )
+    if metrics.periodic_i:
+        # i-faces: owner (i, j), neighbour (i-1, j). Periodic, so every one is
+        # interior and there are exactly Ni of them per row.
+        i_faces = _interior(
+            area=metrics.face_i_area,
+            centre=metrics.face_i_centre,
+            owner=centroid,
+            neighbour=np.roll(centroid, 1, axis=0),
+        )
+        i_start = i_end = None
+    else:
+        # Interior i-faces run between cells i-1 and i, for i = 1 .. Ni-1, so
+        # they are the node lines with a cell on both sides.
+        i_faces = _interior(
+            area=metrics.face_i_area[1:-1],
+            centre=metrics.face_i_centre[1:-1],
+            owner=centroid[1:],
+            neighbour=centroid[:-1],
+        )
+        # face_i points towards increasing i, so at the low end that is *into*
+        # the fluid and the outward-from-the-cell direction is its negative. At
+        # the high end the two already agree. This mirrors the wall and far-field
+        # construction below exactly.
+        i_start = _boundary(
+            area=-metrics.face_i_area[0],
+            centre=metrics.face_i_centre[0],
+            cell=centroid[0],
+        )
+        i_end = _boundary(
+            area=metrics.face_i_area[-1],
+            centre=metrics.face_i_centre[-1],
+            cell=centroid[-1],
+        )
 
     # j-faces: owner (i, j), neighbour (i, j-1), for j = 1 .. Nj-1. The first and
-    # last j-faces are boundaries and are handled separately.
+    # last j-faces are boundaries and are handled separately. This is the pattern
+    # the open i direction above follows.
     j_faces = _interior(
         area=metrics.face_j_area[:, 1:-1],
         centre=metrics.face_j_centre[:, 1:-1],
@@ -149,7 +200,9 @@ def build_faces(metrics: Metrics) -> FaceGeometry:
         cell=centroid[:, -1],
     )
 
-    return FaceGeometry(i_faces, j_faces, wall, far_field, metrics)
+    return FaceGeometry(
+        i_faces, j_faces, wall, far_field, metrics, i_start=i_start, i_end=i_end
+    )
 
 
 def _interior(

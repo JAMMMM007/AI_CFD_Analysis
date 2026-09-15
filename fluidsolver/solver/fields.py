@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from fluidsolver.solver import bc
 from fluidsolver.solver.bc import Boundaries
 from fluidsolver.solver.faces import FaceGeometry
 from fluidsolver.solver.fluid import Fluid, Freestream
@@ -33,7 +34,11 @@ class State:
 
     @classmethod
     def uniform(
-        cls, faces: FaceGeometry, fluid: Fluid, freestream: Freestream
+        cls,
+        faces: FaceGeometry,
+        fluid: Fluid,
+        freestream: Freestream,
+        wall_mask: np.ndarray | None = None,
     ) -> "State":
         """Freestream velocity everywhere, with ``omega`` given its wall profile.
 
@@ -56,18 +61,49 @@ class State:
 
         Seeding ``omega`` with the near-wall asymptote it is heading for anyway
         removes the discontinuity and costs one line.
+
+        **Two wall distances, and they are not interchangeable.** This used to
+        evaluate ``bc.py``'s asymptote formula on ``metrics.wall_distance``, which
+        is a different quantity from the one ``bc.py`` evaluates it on, with the
+        two constants copied across as bare literals. Both distances are correct
+        for their own purpose: ``metrics.wall_distance`` is the true minimum
+        distance to the surface polyline, which is what SST's blending functions
+        need, and ``faces.wall.wall_normal_distance`` is the perpendicular
+        distance from a cell to *its own* wall face, which is what a wall gradient
+        or a ``y+`` needs. Mixing them mixes the purposes.
+
+        Measured on the NACA 2412 mesh, the two disagree in the first cell row by
+        a ratio down to 0.851965. Since ``omega ~ 1/d^2`` that is 37.8%: the seed
+        in the worst wall cells sat 38% below the value the boundary condition
+        would impose on the first iteration. The effect is transient -- the wall
+        row is overwritten by the identity substitution on the first
+        ``model.update`` -- so this is a start-up inconsistency rather than a
+        converged-solution error, and on the cylinder the ratio is exactly 1 and
+        there is nothing to see, which is why the gate never showed it.
+
+        The wall row now comes from :meth:`Boundaries.wall_turbulence` directly,
+        so there is one definition of the wall ``omega`` and it lives in ``bc.py``.
+        Away from the wall the polyline distance is still the right one, and the
+        constant is imported rather than copied.
         """
         shape = faces.shape
         stream = freestream.vector
-        boundaries = Boundaries(faces, fluid, freestream)
+        boundaries = Boundaries(faces, fluid, freestream, wall_mask=wall_mask)
 
         k = np.full(shape, freestream.turbulent_kinetic_energy())
-        # omega -> 6 nu / (beta1 y^2) approaching a wall; far away the freestream
-        # value dominates and this term is negligible.
+        # omega -> factor nu / (beta1 y^2) approaching a wall; far away the
+        # freestream value dominates and this term is negligible.
         distance = np.maximum(faces.metrics.wall_distance, 1e-300)
-        omega = freestream.specific_dissipation(fluid) + 6.0 * fluid.kinematic_viscosity / (
-            0.075 * distance**2
+        omega = freestream.specific_dissipation(fluid) + (
+            bc.OMEGA_WALL_FACTOR * fluid.kinematic_viscosity / (bc.BETA_1 * distance**2)
         )
+        # The wall row is not seeded from the polyline distance but from the
+        # boundary condition itself, so the opening iteration does not have to
+        # move it.
+        _, wall_omega = boundaries.wall_turbulence()
+        # Only under solid faces: a symmetry face has no near-wall asymptote, and
+        # the wall distance there is already measured to the plate.
+        omega[:, 0] = np.where(boundaries.solid_wall, wall_omega, omega[:, 0])
 
         state = cls(
             u=np.full(shape, stream[0]),
@@ -81,9 +117,10 @@ class State:
         )
         # No mass crosses the wall, ever.
         state.flux_j[:, 0] = 0.0
-        state.flux_j[:, -1] = boundaries.enforce_global_mass_balance(
-            boundaries.far_flux_from_freestream()
-        )
+        # A uniform freestream through a closed boundary balances exactly by the
+        # divergence theorem, to rounding, so there is nothing to correct here --
+        # and the first pressure solve would correct it if there were.
+        state.flux_j[:, -1] = boundaries.far_flux_from_freestream()
         return state
 
     @property
@@ -124,6 +161,17 @@ class Residuals:
     each equation was solved with the *current* pressure, but SIMPLE guarantees
     that anyway; it is the mass imbalance that says whether pressure and velocity
     have actually agreed with each other.
+
+    **``worst`` is a convenience, not a norm.** Each of the five figures is scaled
+    against its own equation's own operator, so they are individually meaningful
+    and mutually incommensurable: a maximum over them answers "has everything
+    stopped moving" and not "how large is the error". Measured over 300 iterations
+    of the NACA 2412, the binding equation is ``Uy`` on 73% of iterations, ``k``
+    on 27%, ``Ux`` on 0.3% and ``omega`` on none of them, so in practice the
+    stopping criterion is set by the ``v`` momentum equation and the rest are
+    along for the ride. That is a reasonable thing to stop on; it is not a
+    quantity to report as *the* residual, and it should not be compared between
+    two runs on different meshes as though it were.
     """
 
     iteration: int

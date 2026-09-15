@@ -1,7 +1,19 @@
-"""Boundary conditions on the two boundaries an O-grid has.
+"""Boundary conditions on the boundaries a structured mesh has.
 
 **The wall** is straightforward: no slip, no flux, and the turbulence conditions
 that come with integrating k-omega SST to the wall.
+
+**Part of it may be a symmetry plane instead**, which is what a flat-plate case
+needs ahead of its leading edge and what ``Boundaries.wall_mask`` selects.
+Symmetry is not a fourth kind of condition, it is the wall's condition with the
+tangential target changed: the mirrored face value
+
+    u_face = u_cell - (u_cell . n) n
+
+carried by the interior viscosity through the same diffusive coupling. The
+tangential flux is then identically zero -- no shear -- and the normal part is
+``-mu g (u_cell . n)``, which drives the face-normal velocity to zero. Both of
+those are what a symmetry plane means, and neither needs new machinery.
 
 **The far field** is not, and the treatment here matters more than it looks. The
 outer boundary is a single closed circle, so the same boundary carries the
@@ -40,8 +52,11 @@ from fluidsolver.solver.fluid import Fluid, Freestream
 # first cell instead, at a point where the asymptote is simply valid, so the
 # factor does not belong: including it puts omega ten times too high in the
 # stiffest cell of the mesh.
-_OMEGA_WALL_FACTOR = 6.0
-_BETA_1 = 0.075
+#: Public, because ``fields.State.uniform`` seeds ``omega`` with the same
+#: asymptote and used to carry its own copy of both numbers. One definition,
+#: in the module that owns the boundary condition.
+OMEGA_WALL_FACTOR = 6.0
+BETA_1 = 0.075
 _BETA_STAR = 0.09
 
 # von Karman's constant and the additive constant of the smooth-wall log law,
@@ -84,14 +99,123 @@ class Boundaries:
     fluid: Fluid
     freestream: Freestream
 
+    #: Which ``j = 0`` faces are solid wall, ``True`` where they are. ``None``
+    #: means all of them, which is what a mesh wrapped around a body has and is
+    #: the only thing an O-grid case ever passes.
+    wall_mask: np.ndarray | None = None
+
+    #: Reference length, for the bound circulation. Only the far-field vortex
+    #: correction uses it, and only through ``Gamma = Cl U c / 2``.
+    reference_length: float = 1.0
+    #: Bound circulation, positive for positive lift, updated once per outer
+    #: iteration from the lift the solution currently carries. Zero disables the
+    #: far-field vortex correction entirely, which is what a non-lifting case
+    #: settles at on its own and what every case starts from.
+    circulation: float = 0.0
+    #: Where the bound vortex is placed. Defaults to the centroid of the wall
+    #: face centres. The quarter chord is the textbook choice; at forty chords
+    #: the difference between the two is ``O(c/R)`` of a term that is itself
+    #: ``O(c/R)``, so it is second order in exactly the quantity being corrected.
+    vortex_centre: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.vortex_centre is None:
+            self.vortex_centre = self.faces.wall.centre.mean(axis=0)
+
+    @property
+    def solid_wall(self) -> np.ndarray:
+        """The mask as an array, ``True`` everywhere when there is none.
+
+        Callers that only need to *weight* something by it can use this without
+        branching, and get an all-``True`` array that leaves their arithmetic
+        exactly where it was.
+        """
+        if self.wall_mask is None:
+            return np.ones(self.faces.shape[0], dtype=bool)
+        return self.wall_mask
+
+    def _mirrored_velocity(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """The first cell's velocity with its wall-normal component removed."""
+        normal = self.faces.wall.normal
+        velocity = np.stack((u[:, 0], v[:, 0]), axis=-1)
+        return velocity - np.sum(velocity * normal, axis=-1)[:, None] * normal
+
+    def set_circulation(self, lift_coefficient: float) -> None:
+        """``Gamma = Cl U c / 2``, from Kutta-Joukowski.
+
+        ``L = rho U Gamma`` and ``Cl = L / (rho U^2 c / 2)`` together give
+        ``Gamma = Cl U c / 2``. Called once per outer iteration with the lift the
+        solution currently has, so the correction is lagged by one iteration and
+        exact at the fixed point. A cold start has ``Cl = 0`` and the correction
+        switches itself on as the circulation develops.
+        """
+        self.circulation = 0.5 * lift_coefficient * self.freestream.velocity * (
+            self.reference_length
+        )
+
+    def far_vortex_velocity(self, centres: np.ndarray | None = None) -> np.ndarray:
+        """Velocity the bound vortex induces at each far-field face centre.
+
+        **The sign is derived, not copied, because the obvious source has it the
+        other way round.** A point vortex of counter-clockwise strength ``G`` at
+        ``r_0`` induces ``(G / 2 pi) (-(y - y_0), (x - x_0)) / |r - r_0|^2``. Put
+        ``G = +Gamma`` with ``Gamma = Cl U c / 2`` -- which is how the physics
+        audit writes it -- and evaluate above a lifting body: the induced velocity
+        comes out along ``-x``, so the flow is *slower* over the suction side.
+        That is the wrong way round, and two independent checks say so:
+
+            above the body   u must be > 0   (faster where the pressure is lower)
+            ahead of it      v must be > 0   (upwash)
+            behind it        v must be < 0   (downwash)
+
+        All three fail together with ``G = +Gamma`` and hold together with
+        ``G = -Gamma``. The bound vortex of a body lifting along ``+y`` in a
+        freestream along ``+x`` is *clockwise*. Written out with ``Gamma``
+        positive for positive lift, that is
+
+            u_induced = (Gamma / 2 pi) ( (y - y_0), -(x - x_0) ) / |r - r_0|^2
+
+        which is what this returns.
+        """
+        if centres is None:
+            centres = self.faces.far_field.centre
+        if self.circulation == 0.0:
+            return np.zeros_like(centres)
+
+        offset = centres - self.vortex_centre
+        radius_squared = np.sum(offset * offset, axis=-1)
+        rotated = np.stack((offset[:, 1], -offset[:, 0]), axis=-1)
+        return (self.circulation / (2.0 * np.pi)) * rotated / np.maximum(
+            radius_squared, 1e-300
+        )[:, None]
+
     # ------------------------------------------------------------------
     # Wall
     # ------------------------------------------------------------------
 
-    def wall_velocity(self) -> tuple[np.ndarray, np.ndarray]:
-        """No slip: both components zero on the surface."""
+    def wall_velocity(
+        self, u: np.ndarray | None = None, v: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """No slip on a solid face; the mirrored velocity on a symmetry one.
+
+        ``u`` and ``v`` are needed only where :attr:`wall_mask` says a face is
+        not solid, because that is the only case whose answer depends on the
+        flow. A wall-only boundary returns zeros without looking at them, which
+        is why they are optional and why nothing on the O-grid path moved.
+        """
         zero = np.zeros(self.faces.shape[0])
-        return zero, zero.copy()
+        if self.wall_mask is None:
+            return zero, zero.copy()
+        if u is None or v is None:
+            raise ValueError(
+                "a boundary with a symmetry plane in it needs the velocity "
+                "field: the face value there is the flow's own tangential part"
+            )
+        mirrored = self._mirrored_velocity(u, v)
+        return (
+            np.where(self.wall_mask, 0.0, mirrored[:, 0]),
+            np.where(self.wall_mask, 0.0, mirrored[:, 1]),
+        )
 
     def wall_tangential_velocity(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         """Speed of the first cell centre along the surface."""
@@ -154,8 +278,18 @@ class Boundaries:
         return friction
 
     def wall_shear(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """``tau_w = rho u_tau^2``, the traction the surface exerts on the flow."""
-        return self.fluid.density * self.friction_velocity(u, v) ** 2
+        """``tau_w = rho u_tau^2``, the traction the surface exerts on the flow.
+
+        Zero on a symmetry face, which is what symmetry *means*: the normal
+        derivative of the tangential velocity vanishes there, so there is no
+        shear. A friction velocity computed from the tangential cell speed would
+        be perfectly finite and entirely fictitious, and it would be integrated
+        into a drag, so it is masked out rather than left to be.
+        """
+        shear = self.fluid.density * self.friction_velocity(u, v) ** 2
+        if self.wall_mask is None:
+            return shear
+        return np.where(self.wall_mask, shear, 0.0)
 
     def wall_velocity_gradient(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         """``dU/dy`` at the first cell centre, from the two-layer profile.
@@ -187,7 +321,9 @@ class Boundaries:
         logarithmic = friction / (_KAPPA * distance)
         return np.minimum(viscous, logarithmic)
 
-    def wall_viscosity(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    def wall_viscosity(
+        self, u: np.ndarray, v: np.ndarray, interior: np.ndarray | None = None
+    ) -> np.ndarray:
         """Effective viscosity on the wall face that reproduces ``tau_w``.
 
         The momentum equation imposes no-slip through a diffusive flux
@@ -214,7 +350,15 @@ class Boundaries:
         distance = self.faces.wall.wall_normal_distance
         speed = np.maximum(self.wall_tangential_velocity(u, v), _SPEED_FLOOR)
         shear = self.wall_shear(u, v)
-        return np.maximum(shear * distance / speed, self.fluid.viscosity)
+        blended = np.maximum(shear * distance / speed, self.fluid.viscosity)
+        if self.wall_mask is None:
+            return blended
+        # A symmetry face takes the interior viscosity instead. The wall function
+        # has nothing to say there -- no boundary layer, no log law -- and the
+        # flux that face does carry is the normal-velocity penalty, which is an
+        # ordinary viscous term and wants the ordinary viscosity.
+        interior = self.fluid.viscosity if interior is None else interior
+        return np.where(self.wall_mask, blended, interior)
 
     def wall_turbulence(
         self, u: np.ndarray | None = None, v: np.ndarray | None = None
@@ -248,9 +392,9 @@ class Boundaries:
         """
         distance = self.faces.wall.wall_normal_distance
         viscous = (
-            _OMEGA_WALL_FACTOR
+            OMEGA_WALL_FACTOR
             * self.fluid.kinematic_viscosity
-            / (_BETA_1 * distance**2)
+            / (BETA_1 * distance**2)
         )
         if u is None or v is None:
             return None, viscous
@@ -271,23 +415,71 @@ class Boundaries:
     def far_velocity(
         self, u: np.ndarray, v: np.ndarray, far_flux: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Freestream where flow enters, extrapolated where it leaves."""
+        """Freestream plus the bound vortex where flow enters; extrapolated where
+        it leaves.
+
+        **Why the freestream alone is not good enough.** A lifting body carries a
+        bound circulation, and outside the viscous region the flow it sets up is
+
+            u = U_inf + Gamma/(2 pi r) e_theta + O(r^-2),
+
+        so imposing ``u = U_inf`` on the boundary imposes an error of
+        ``-u_vortex`` there. Its size is ``Cl c / (4 pi R)`` -- for ``Cl = 0.75``
+        at forty chords, 1.5 parts in a thousand of the freestream, which sounds
+        negligible. It is not, because it is imposed as a velocity over an arc of
+        length ``2 pi R``, so the spurious volume flux it removes is ``O(Gamma)``:
+        the whole circulation, however far away the boundary is put.
+
+        The error is therefore ``O(1/R)`` in every integrated coefficient, and
+        that is the prediction to test rather than assume -- halving ``R`` should
+        double it. Measured on this solver, the NACA 2412 at 5 degrees between 20
+        and 40 chords: see ``docs/audit-response-plan.md``.
+
+        With the vortex superposed the leading term is gone and the error falls to
+        ``O(1/R^2)``. This is the standard treatment since Thomas and Salas
+        (1986); Vassberg and Jameson (2010) give the grid-convergence evidence for
+        how far out one has to go without it, which is several hundred chords for
+        0.1% in ``Cl``.
+
+        Only inflow faces get it. Outflow faces extrapolate the interior velocity
+        and always did; imposing anything there would over-specify the problem.
+        """
         entering = self.inflow_mask(far_flux)
         stream = self.freestream.vector
+        induced = self.far_vortex_velocity()
         return (
-            np.where(entering, stream[0], u[:, -1]),
-            np.where(entering, stream[1], v[:, -1]),
+            np.where(entering, stream[0] + induced[:, 0], u[:, -1]),
+            np.where(entering, stream[1] + induced[:, 1], v[:, -1]),
         )
 
     def far_pressure(self, p: np.ndarray, far_flux: np.ndarray) -> np.ndarray:
-        """Zero where flow leaves, extrapolated where it enters.
+        """The vortex's Bernoulli pressure where flow leaves, extrapolated where
+        it enters.
 
-        Fixing the pressure on the outflow is also what makes the pressure
-        equation solvable at all: with a pure Neumann condition everywhere the
-        pressure would be determined only up to a constant, and the matrix would
-        be singular.
+        Fixing the pressure on the outflow is what makes the pressure equation
+        solvable at all: with a pure Neumann condition everywhere the pressure
+        would be determined only up to a constant and the matrix would be
+        singular.
+
+        The value fixed there used to be zero, which is right only if the
+        far-field velocity is the freestream. Once the bound vortex is superposed
+        it is not, and the matching pressure follows from Bernoulli along a
+        streamline from infinity:
+
+            p_far = (rho / 2) ( U_inf^2 - |u_far|^2 ).
+
+        Imposing the corrected velocity while leaving the pressure pinned at zero
+        would assert a boundary state that does not satisfy the outer flow's own
+        momentum equation, which is a worse inconsistency than the one being
+        removed. With ``Gamma = 0`` this reduces to zero exactly, so a non-lifting
+        case is untouched.
         """
-        return np.where(self.inflow_mask(far_flux), p[:, -1], 0.0)
+        stream = self.freestream.vector
+        far = stream + self.far_vortex_velocity()
+        bernoulli = 0.5 * self.fluid.density * (
+            self.freestream.velocity**2 - np.sum(far * far, axis=-1)
+        )
+        return np.where(self.inflow_mask(far_flux), p[:, -1], bernoulli)
 
     def far_pressure_is_fixed(self, far_flux: np.ndarray) -> np.ndarray:
         """Faces where the pressure correction is pinned to zero."""
@@ -306,6 +498,92 @@ class Boundaries:
         )
 
     # ------------------------------------------------------------------
+    # The i ends
+    # ------------------------------------------------------------------
+    #
+    # An open mesh has two more boundaries, and they take the far field's
+    # condition: each face decides for itself on the sign of u . n. An inlet is
+    # that condition on a boundary that happens to be inflow everywhere, and an
+    # outlet one that happens to be outflow, so nothing here is told which end is
+    # which -- a flat plate's left end selects inflow for itself and its right
+    # end outflow.
+    #
+    # Every method returns a ``(start, end)`` pair, and ``(None, None)`` on a
+    # mesh whose i direction wraps, which the operators read as "no such
+    # boundary". The one thing that differs from the far field is the sign of the
+    # stored flux: ``flux_i`` is signed towards increasing i, which is outward at
+    # the high end and *inward* at the low one. It is turned into an outward flux
+    # here, once, so the condition itself never sees the difference.
+
+    def i_outward_flux(self, flux_i: np.ndarray):
+        """Mass flux leaving the domain through each i end, per face."""
+        if self.faces.periodic_i:
+            return None, None
+        return -flux_i[0], flux_i[-1]
+
+    def i_inflow_mask(self, flux_i: np.ndarray):
+        """True on i-end faces where fluid is entering."""
+        start, end = self.i_outward_flux(flux_i)
+        if start is None:
+            return None, None
+        return self.inflow_mask(start), self.inflow_mask(end)
+
+    def _i_end_faces(self):
+        return (self.faces.i_start, 0), (self.faces.i_end, -1)
+
+    def i_velocity(self, u: np.ndarray, v: np.ndarray, flux_i: np.ndarray):
+        """``((u_start, u_end), (v_start, v_end))``: freestream in, interior out.
+
+        The bound vortex is superposed on inflow faces exactly as it is on the far
+        field, and for the same reason; it is zero on a non-lifting case.
+        """
+        if self.faces.periodic_i:
+            return (None, None), (None, None)
+        stream = self.freestream.vector
+        entering = self.i_inflow_mask(flux_i)
+        values_u, values_v = [], []
+        for (boundary, index), inflow in zip(self._i_end_faces(), entering):
+            induced = self.far_vortex_velocity(boundary.centre)
+            values_u.append(np.where(inflow, stream[0] + induced[:, 0], u[index]))
+            values_v.append(np.where(inflow, stream[1] + induced[:, 1], v[index]))
+        return tuple(values_u), tuple(values_v)
+
+    def i_pressure(self, p: np.ndarray, flux_i: np.ndarray):
+        """Bernoulli's pressure where flow leaves, extrapolated where it enters."""
+        if self.faces.periodic_i:
+            return None, None
+        stream = self.freestream.vector
+        entering = self.i_inflow_mask(flux_i)
+        values = []
+        for (boundary, index), inflow in zip(self._i_end_faces(), entering):
+            outer = stream + self.far_vortex_velocity(boundary.centre)
+            bernoulli = 0.5 * self.fluid.density * (
+                self.freestream.velocity**2 - np.sum(outer * outer, axis=-1)
+            )
+            values.append(np.where(inflow, p[index], bernoulli))
+        return tuple(values)
+
+    def i_pressure_is_fixed(self, flux_i: np.ndarray):
+        """i-end faces where the pressure correction is pinned to zero."""
+        start, end = self.i_inflow_mask(flux_i)
+        if start is None:
+            return None, None
+        return ~start, ~end
+
+    def i_turbulence(self, k: np.ndarray, omega: np.ndarray, flux_i: np.ndarray):
+        """``((k_start, k_end), (omega_start, omega_end))``."""
+        if self.faces.periodic_i:
+            return (None, None), (None, None)
+        entering = self.i_inflow_mask(flux_i)
+        k_inflow = self.freestream.turbulent_kinetic_energy()
+        omega_inflow = self.freestream.specific_dissipation(self.fluid)
+        values_k, values_omega = [], []
+        for (_, index), inflow in zip(self._i_end_faces(), entering):
+            values_k.append(np.where(inflow, k_inflow, k[index]))
+            values_omega.append(np.where(inflow, omega_inflow, omega[index]))
+        return tuple(values_k), tuple(values_omega)
+
+    # ------------------------------------------------------------------
     # Fluxes
     # ------------------------------------------------------------------
 
@@ -318,23 +596,48 @@ class Boundaries:
             self.faces.far_field.area * self.freestream.vector, axis=-1
         )
 
-    def enforce_global_mass_balance(self, far_flux: np.ndarray) -> np.ndarray:
-        """Scale the outflow so that what leaves equals what enters.
+    def far_flux_is_solvable(
+        self, far_flux: np.ndarray, flux_i: np.ndarray | None = None
+    ) -> bool:
+        """Whether the pressure equation needs its source projecting to zero mean.
 
-        The pressure-correction equation is a discrete Poisson problem, and it has
-        a solution only if its source integrates to zero -- that is, only if the
-        boundary fluxes balance. Extrapolating velocity onto the outflow gives no
-        guarantee of that, and even a small imbalance makes the pressure solve
-        drift or fail. Rescaling the outflow to match the inflow restores
-        solvability, and the correction vanishes as the solution converges.
+        It does only when *no* far-field face holds the pressure -- that is, when
+        the boundary is inflow everywhere, so the pressure correction sees a pure
+        Neumann problem with a singular matrix and a compatibility condition.
+
+        This replaces ``enforce_global_mass_balance``, which rescaled every
+        outflow face by ``M_in / M_out`` on the stated grounds that "the
+        pressure-correction equation is a discrete Poisson problem, and it has a
+        solution only if its source integrates to zero". That is the compatibility
+        condition of a *pure Neumann* problem, and this one is not pure Neumann:
+        ``PressureVelocityCoupling._far_field_coupling`` adds a Dirichlet coupling
+        to ``p' = 0`` on the diagonal of every cell behind an outflow face, and a
+        matrix with any Dirichlet row is non-singular. The stated reason did not
+        apply.
+
+        What the rescaling did instead was impose global conservation on an
+        extrapolated outflow, and it did so **at convergence**. Nothing forces the
+        raw extrapolated flux to balance the inflow, so the factor settles at some
+        ``c != 1`` and stays: measured on the converged Re 40 cylinder,
+        ``0.999747534``, rescaling every outflow face by -0.0252% for ever. By
+        this project's own standard -- anything active at convergence is part of
+        the model, whatever it is labelled -- that made it an undocumented
+        boundary condition.
+
+        It also declined to act in exactly the situation it was written for. Its
+        guard returned the flux untouched when either total was non-positive,
+        which is the start-up transient or a boundary that has gone almost
+        entirely inflow -- and it said nothing when it did. The factor was
+        unbounded as the outflow went to zero.
         """
-        entering = far_flux < 0.0
-        inflow = -far_flux[entering].sum()
-        outflow = far_flux[~entering].sum()
-
-        if outflow <= 0.0 or inflow <= 0.0:
-            return far_flux
-
-        balanced = far_flux.copy()
-        balanced[~entering] *= inflow / outflow
-        return balanced
+        if bool(np.any(self.far_pressure_is_fixed(far_flux))):
+            return True
+        # On an open mesh the i ends can hold the pressure too, and on a flat
+        # plate they are where it is held: the top boundary carries almost no
+        # flux, and the outlet carries all of it.
+        if flux_i is None:
+            return False
+        return any(
+            fixed is not None and bool(np.any(fixed))
+            for fixed in self.i_pressure_is_fixed(flux_i)
+        )

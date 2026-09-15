@@ -120,6 +120,33 @@ class TestMeshPage:
         assert mesh.has_mesh()
         assert "inverted cells        0" in mesh.summary.text()
 
+    def test_the_first_cell_readout_does_not_claim_to_be_the_achieved_y_plus(
+        self, window
+    ):
+        """Regression. It read ``y+ approx 1.00`` and called the number achieved.
+
+        What it prints is ``spacing.y_plus_of``, which inverts the sizing rule and
+        so returns the *target* back, computed from a flat-plate correlation with
+        no knowledge of the pressure gradient or the stagnation point. Measured on
+        the NACA 2412 at 5 degrees, Re 2.03e6, it reads 1.00 where the solver
+        delivers 0.301 to 2.301 -- a factor of 7.6 across the surface, presented
+        as one exact figure at the moment the user is judging whether the mesh
+        resolves the wall well enough for the turbulence model.
+
+        The achieved distribution is not missing from the interface; the run page
+        has carried it from ``post.surface_data`` all along. Only this label was
+        wrong, and only about which of the two it was showing.
+        """
+        mesh = window.page_widgets[2]
+        window.page_widgets[1].kind.setCurrentIndex(1)  # circle
+        mesh.surface_points.setValue(96)
+        mesh.far_field.setValue(20.0)
+        mesh.build()
+
+        text = mesh.summary.text()
+        assert "achieved" not in text
+        assert "y+ target" in text and "estimate" in text
+
     def test_changing_a_setting_invalidates_the_mesh(self, window):
         mesh = window.page_widgets[2]
         window.page_widgets[1].kind.setCurrentIndex(1)

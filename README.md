@@ -60,9 +60,9 @@ On the solve page the field plot is the whole point, so it gets the room:
 |---|---|
 | Geometry: NACA 4-digit, circle, square, DXF import | working, tested |
 | Body-fitted O-grid mesher | working, tested |
-| Finite-volume discretisation | working, second order (verified by manufactured solution) |
+| Finite-volume discretisation | working, second order: the operators by manufactured solution on orthogonal, stretched and non-orthogonal meshes, and the *solved* `Cd` on the cylinder at an observed 2.006 -- see below |
 | Laminar Navier-Stokes | **validated** against published cylinder benchmarks |
-| k-omega SST | converges to 2.8e-05, but **the divergence monitor aborts it on factory defaults** -- see below |
+| k-omega SST | working; NACA 0012 at Re 2e6 converges to 9.85e-07 in 479 iterations on factory defaults |
 | Qt front end | working, tested |
 
 **The turbulence model was blamed for four bugs that were not in it.** The
@@ -107,32 +107,28 @@ monotonically, Re_eff = 2000 to 1.6e-5 -- and the NACA 0012 at Re = 2e6 with SST
 reaches 8.3e-4 by iteration 200 with a peak eddy-viscosity ratio of 90 where the
 flat-plate estimate is 84.
 
-**It then gets worse before it gets better, and that transient is now the
-problem.** As the eddy-viscosity ratio passes 100 the residual climbs back to a
-peak of 1.8e-1 around iteration 400, then recovers monotonically and settles:
+**That case now converges, and two earlier descriptions of it here were wrong.**
+On factory defaults with the divergence monitor armed it reaches 9.85e-07 at
+iteration 479, with `Cd` = 0.009076, `Cl` = -5e-5 against the zero symmetry
+requires, and an eddy-viscosity ratio steady at 117.7.
 
-```
-iterations    median residual
- 300 -  500      2.68e-02   (peak 1.78e-01)
- 500 -  800      2.53e-03
- 800 - 1100      4.73e-05
-1100 - 1500      2.81e-05
-```
+An earlier version of this file reported a bounded limit cycle around 1e-2 that
+never settled. A later one reported a residual excursion to 1.8e-1 near iteration
+400 followed by a recovery, and said the divergence monitor stopped the run at
+iteration 367 in the middle of it -- "a false positive on the primary use case and
+the first thing to fix". Neither reproduces. The 2026-09-07 physics audit ran the
+case on that same commit with the monitor armed and got 1600 iterations without an
+exception and a post-transient peak of 7.45e-03; the monitor's own trip condition
+requires a ratio of 100 against a run that peaks at 1.8. The item has been
+withdrawn from the hardening plan, and the monitor is left alone until a real
+false positive appears.
 
-By iteration 1100 it is converged in every sense that matters -- `Cd` = 0.009487
-with a standard deviation of 2e-6 over the last 400 iterations, `Cl` = -8e-6
-against the zero symmetry requires, eddy-viscosity ratio steady at 117. An
-earlier version of this file reported a bounded limit cycle at around 1e-2 that
-never settled; that is no longer what happens, and the change is down to the
-`mu_t S^2` production correction and the wall treatment. `Cd` = 0.0095 against a
-published 0.008 is a separate matter, and is what transition modelling is for.
-
-**The catch: on factory defaults you never see any of that.** The divergence
-monitor added in Stage 2 stops the run at iteration 367, in the middle of the
-excursion, because the residual is more than a hundred times the best the run had
-managed by then. The recovery is real and the monitor cannot see it. This is a
-false positive on the primary use case and it is the first thing to fix -- see
-`docs/handover.md`. Until then a run that trips it is not necessarily lost.
+What was real on that case was a residual plateau near 4e-05 that never reached
+tolerance, so the run would exhaust `max_iterations` while its forces sat steady in
+the sixth decimal. Its cause was the pressure correction dropping the
+non-orthogonal cross term of `(grad p')_f . S`, and with that restored the plateau
+is gone. `Cd` = 0.0091 against a published 0.008 is a separate matter, and is what
+transition modelling is for.
 
 So: the turbulence model's algebra checks out against every analytic property it
 is derived from, and the coupled iteration converges when it is allowed to. The
@@ -149,16 +145,66 @@ against the published benchmarks. Nothing is tuned to hit these.
 
 | | computed | published |
 |---|---|---|
-| Re = 20, Cd | 2.023 | 2.00 - 2.09 |
+| Re = 20, Cd | 2.027 | 2.00 - 2.09 |
 | Re = 20, wake L/D | 0.933 | 0.91 - 0.94 |
 | Re = 20, separation from rear | 43.6 deg | 43 - 45 deg |
-| Re = 40, Cd | 1.514 | 1.50 - 1.58 |
+| Re = 40, Cd | 1.516 | 1.50 - 1.58 |
 | Re = 40, wake L/D | 2.122 | 2.13 measured, 2.21 - 2.35 computed |
 | Re = 40, separation from rear | 53.7 deg | 52 - 54 deg |
 
 Lift comes out identically zero, as symmetry requires. The Re = 40 drag splits as
-0.993 pressure and 0.522 friction, against a published split of roughly 0.99 and
+0.994 pressure and 0.522 friction, against a published split of roughly 0.99 and
 0.53.
+
+`Cd` moved from 1.514 to 1.516 during the response to the 2026-09-07 physics
+audit, by two deliberate changes measured separately: the wall-pressure
+reconstruction (+1.955e-03), which removed a first-order term from the force
+integral, and the Rhie-Chow mobility (-2.738e-04), which removed the converged
+answer's dependence on the velocity relaxation factor. Both are argued in
+`docs/audit-response-plan.md`.
+
+**Read those figures with the discretisation uncertainty in mind, which the table
+does not yet carry.** The 2026-09-07 physics audit ran the first grid-convergence
+study this project has had, on three systematically refined cylinder meshes, and
+measured the observed order of `Cd` at **1.261** with a Richardson limit of
+1.515358 -- measured on the code as it stood before that response.
+
+**Both of those have since been re-measured, and the order is now second.** On a
+family refined by 1.5 in both directions at once, the observed order of `Cd` is
+**2.006** with a GCI of 0.031% and a limit of 1.517935. Running the audit's own
+family construction on the current code gives 2.047 by its arithmetic, against
+the 1.261 it reported -- so the change is the two first-order terms coming out of
+the flux definition and the force integral, not the family. The wake length is
+the exception and has not moved: order 1.124, and 9.7% below its extrapolated
+2.349, so its agreement with the measured 2.13 is a coincidence of resolution. The wake length has not converged at all: observed order 0.735,
+limit 2.200. The reported 2.1219 agrees with Coutanceau and Bouard's measured
+2.13 because the mesh is coarse, and the solver's own grid-converged answer sits
+with the computations at 2.20. That is a coincidence being read as agreement.
+
+`validation/convergence.py` now computes observed order, Richardson limit and the
+ASME (Celik et al. 2008) GCI from a mesh family, so those numbers can be produced
+rather than quoted:
+
+```
+.\.venv\Scripts\python.exe -m validation.convergence
+```
+
+The order is measured, never assumed. That mattered most when the two disagreed:
+a GCI computed at the formal order of 2 rather than the then-observed 1.26 came
+out 1.87 times narrower, and reporting the narrower one is not the conservative
+choice. They now agree, which is a result rather than a licence to stop
+measuring.
+
+The harness refuses a family it cannot support. Celik's procedure needs a
+refinement ratio of at least 1.3, and the audit's family measures 1.257 -- its
+"1.5" was a property of the inputs, not of the meshes -- so an extrapolation on
+it is declined rather than reported.
+
+`validation/aerofoil.py` is a second gate -- a NACA 2412 at 5 degrees with SST.
+It is **not** a validation case and certifies nothing; its job is to notice
+change. The cylinder cannot do that job alone, because its mesh is orthogonal to
+0.0000 degrees and it carries no circulation, which makes it structurally blind
+to any error proportional to either.
 
 ## How it works
 
@@ -203,12 +249,21 @@ the sign of `u . n`, whether it fixes velocity or pressure.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-188 tests. The centrepiece is a method-of-manufactured-solutions check on the
-discrete operators, which measures their *order of accuracy* rather than their
-error: diffusion and the high-order convection schemes come out second order,
-upwind first, which is what each is by construction. A scheme that is second
-order on paper and first order in practice has a bug, and this is the only test
-that says so.
+316 tests, about 410 seconds. The centrepiece is a method-of-manufactured-
+solutions check on the discrete operators, which measures their *order of
+accuracy* rather than their error: diffusion and the high-order convection
+schemes come out second order, upwind first, which is what each is by
+construction. A scheme that is second order on paper and first order in practice
+has a bug, and this is the only test that says so.
+
+It now runs on three mesh families rather than one. The original is an
+orthogonal, unstretched circle -- non-orthogonality 0.0000 degrees mean and peak,
+aspect ratio 2.5 -- which is not the kind of mesh the solver runs on. A stretched
+family and an analytically sheared one (36.5 degrees of non-orthogonality, held
+constant under refinement) were added, and the interior order survives both:
+1.87 to 1.94 across diffusion, convection and the two together. The boundary rows
+are now measured rather than excluded, and they are *zeroth* order, not the first
+order previously claimed -- see `tests/test_solver.py`.
 
 Many tests are regressions for specific defects found during development, and
 each records which. Those are worth reading -- they are the parts of a CFD code

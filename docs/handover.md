@@ -58,13 +58,13 @@ decision so far.
 The virtual environment lives at the repository root, outside any worktree:
 
 ```bash
-C:/AI_CFD_Analysis/.venv/Scripts/python.exe -m pytest -q
+.venv/Scripts/python.exe -m pytest -q
 ```
 
-252 tests, about 100 seconds. The GUI needs a real graphical session:
+316 tests, about 410 seconds. The GUI needs a real graphical session:
 
 ```bash
-C:/AI_CFD_Analysis/.venv/Scripts/python.exe -m fluidsolver
+.venv/Scripts/python.exe -m fluidsolver
 ```
 
 **The regression gate.** Laminar flow over a cylinder at Re 40 -- the
@@ -72,7 +72,7 @@ best-documented benchmark in incompressible CFD, and nothing in the code is
 tuned to hit it:
 
 ```bash
-C:/AI_CFD_Analysis/.venv/Scripts/python.exe -m validation.cylinder
+.venv/Scripts/python.exe -m validation.cylinder
 ```
 
 ```
@@ -110,7 +110,7 @@ fluidsolver/
     post.py         forces, surface data, separation
     turbulence/     laminar, SST 2003
   gui/        Qt front end; five pages, background solve thread
-tests/        252 tests
+tests/        316 tests
 validation/   cylinder.py -- the regression gate
 docs/         this file, hardening-plan.md, compressible.md, optional-deps.md
 ```

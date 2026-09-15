@@ -74,6 +74,34 @@ class OGrid:
     def n_cells(self) -> int:
         return self.shape[0] * self.shape[1]
 
+    #: The ``i`` direction wraps the body. See
+    #: :attr:`fluidsolver.mesh.metrics.Metrics.periodic_i`.
+    periodic_i = True
+    #: The whole ``j = 0`` row is the body. See ``RectilinearGrid.wall_mask``.
+    wall_mask = None
+
+    @property
+    def name(self) -> str:
+        return self.contour.name
+
+    @property
+    def reference_length(self) -> float:
+        return self.contour.reference_length
+
+    @property
+    def moment_reference(self) -> np.ndarray:
+        """Where a moment is taken about, by default.
+
+        The area centroid of the body. Published aerofoil moments are quoted
+        about the quarter chord instead, which a caller can pass to ``Case``.
+
+        This, ``name`` and ``reference_length`` are forwarded from the contour so
+        that ``Case`` can ask a grid for them without knowing whether the grid was
+        built around a closed body at all -- a flat plate has no contour and no
+        centroid, and needs the same three answers.
+        """
+        return self.contour.centroid
+
     @property
     def wall(self) -> np.ndarray:
         """``(Ni, 2)`` nodes on the body surface."""
@@ -109,8 +137,14 @@ def build_ogrid(
         cell centre lands at the ``y+`` the turbulence model needs.
     far_field_radius
         Radius of the outer boundary, measured from the body centroid. Thirty to
-        fifty reference lengths is usual for a lifting case; less than about
-        twenty and the boundary starts to interfere with the circulation.
+        fifty reference lengths is usual for a lifting case.
+
+        That range assumes the far field carries the bound vortex, which
+        ``Boundaries.far_velocity`` now does. Without it the interference is
+        larger than "starts to interfere" suggests and it decays only as ``1/R``:
+        measured on a NACA 2412 at 5 degrees with the freestream imposed bare,
+        forty chords costs 1.24% of ``Cl`` and 10.1% of ``Cd``, and reaching 0.1%
+        in ``Cl`` that way would need several hundred.
     growth
         Geometric growth ratio between successive wall-normal layers.
     transition_distance

@@ -28,6 +28,20 @@ What each number tests is different, which is the point of checking all three:
 drag integrates pressure and shear over the whole surface, the wake length tests
 the momentum balance well away from the wall, and the separation angle tests the
 near-wall shear directly.
+
+**Each is printed with the discretisation error on this mesh.** The band decides
+pass or fail, as it always has; the extra column says how far the value sits from
+the answer the same solver gives as the mesh is refined to nothing. That
+distinction is the whole reason for it. ``Cd`` lands 0.12% below its
+grid-converged value and the wake length 9.7% below its own, so one of the three
+agrees with the literature because it is right and another agrees because the
+mesh is coarse -- and without the column they look alike. ASME V&V 20 validates a
+result at a stated uncertainty rather than against a fixed percentage, and this
+is the stated uncertainty.
+
+The figures come from ``python -m validation.convergence`` and are recorded per
+Reynolds number, because a study belongs to the case it was run on. Only Re 40 has
+one; Re 20 prints the bands alone. See :data:`GRID_CONVERGENCE`.
 """
 
 from __future__ import annotations
@@ -43,6 +57,63 @@ from fluidsolver.solver.simple import Numerics
 
 DIAMETER = 1.0
 VELOCITY = 1.0
+
+#: What a three-mesh study says this gate's own mesh is worth.
+#:
+#: ``{quantity: (observed order, Richardson limit, GCI on the finest mesh)}``,
+#: from ``python -m validation.convergence`` -- three meshes refined by 1.5 in
+#: both directions at once, 180x53, 270x80 and 405x119, each converged to 1e-8.
+#: The measured refinement ratios in Celik's ``h`` are 1.4937 and 1.5046, so the
+#: family really is refined by what it claims.
+#:
+#: The gate runs the *coarsest* of the three, so what it reports is not the
+#: fine-grid GCI but the distance from its own answer to the extrapolated one.
+#: That is a measured discretisation error rather than an estimate of one, and it
+#: is the number that belongs beside a value being compared with experiment: ASME
+#: V&V 20 validates a result at a stated uncertainty, not against a fixed
+#: percentage.
+#:
+#: Two of these deserve reading before the drag does.
+#:
+#: ``Cd`` comes out at an observed order of **2.006**. The scheme is formally
+#: second order and, on a solved field with the boundary conditions, the
+#: pressure-velocity coupling and the force integral all in the loop, it now
+#: delivers that.
+#:
+#: **That it is the code and not the family is measured, not assumed.** The audit
+#: reported 1.261 for the same quantity, on a family built differently -- surface
+#: points and first layer scaled by 1.5 with ``growth`` left alone, which adds
+#: only three layers a level and gives 53, 56, 59. Running *that* construction on
+#: today's code gives an order of **2.047** by the audit's own arithmetic. Same
+#: family, same assumed ratio, 1.261 before and 2.047 after: the first-order terms
+#: coming out of the flux definition and the force integral are what moved it.
+#:
+#: The same control says something about the family as well. Its measured
+#: refinement ratios in ``h`` are 1.2571 and 1.2589, not the 1.5 it was assumed to
+#: have, and Celik's procedure requires at least 1.3 -- so ``validation.convergence``
+#: refuses to extrapolate on it at all, which is the refusal working. And the wake
+#: length comes out at 0.735 there, reproducing the audit's 0.735 exactly, which is
+#: as good a cross-check between two independent implementations as this project
+#: has.
+#:
+#: The **wake length still does not converge**: observed order 1.124 and a GCI of
+#: 5.7%, against 0.03% for the drag. Its extrapolated value is 2.349, and the
+#: gate reports 2.12 on the coarsest mesh -- so the agreement with Coutanceau and
+#: Bouard's measured 2.13 is a coincidence of resolution, and the solver's own
+#: converged answer sits with the computations at 2.21 to 2.35. That was true
+#: when the audit found it and it is still true.
+#: Keyed by Reynolds number, because a study is a property of the case it was
+#: run on and not of the geometry. Only Re 40 has one; Re 20 prints no column
+#: rather than borrowing its neighbour's, which the first version of this did --
+#: it showed the Re 20 drag of 2.027 as being 33% from a "grid-converged" 1.518
+#: that belongs to a different flow.
+GRID_CONVERGENCE = {
+    40: {
+        "Cd": (2.006, 1.517935, 0.00031),
+        "wake": (1.124, 2.348867, 0.05745),
+        "separation": (5.661, 53.830074, 0.00024),
+    }
+}
 
 # (Cd range, wake length L/D range, separation angle from the rear, in degrees)
 REFERENCE = {
@@ -65,13 +136,17 @@ class CylinderResult:
 
     def compare(self) -> str:
         drag, wake, angle = REFERENCE[int(round(self.reynolds))]
+        study = GRID_CONVERGENCE.get(int(round(self.reynolds)), {})
         return "\n".join(
             [
                 f"Re = {self.reynolds:.0f}   ({self.iterations} iterations, "
                 f"residual {self.residual:.2e})",
-                _line("Cd", self.drag_coefficient, drag),
-                _line("wake L/D", self.wake_length, wake),
-                _line("separation (from rear)", self.separation_angle_deg, angle, "deg"),
+                _line("Cd", self.drag_coefficient, drag,
+                      study=study, quantity="Cd"),
+                _line("wake L/D", self.wake_length, wake,
+                      study=study, quantity="wake"),
+                _line("separation (from rear)", self.separation_angle_deg, angle,
+                      "deg", study=study, quantity="separation"),
                 f"  {'Cl (symmetry)':<24} {self.lift_coefficient:+9.5f}   "
                 f"expect 0",
                 f"  {'Cd split':<24} pressure {self.pressure_drag:.4f}, "
@@ -96,11 +171,37 @@ def _within(value: float, bounds: tuple[float, float], slack: float = 0.05) -> b
     return low - margin <= value <= high + margin
 
 
-def _line(name: str, value: float, bounds: tuple[float, float], unit: str = "") -> str:
+def _line(
+    name: str,
+    value: float,
+    bounds: tuple[float, float],
+    unit: str = "",
+    study: dict | None = None,
+    quantity: str | None = None,
+) -> str:
+    """One reported quantity, with the discretisation error on this mesh beside it.
+
+    The band still decides pass or fail. The extrapolated column is there so that
+    a reader can tell a value that sits inside the band because it is right from
+    one that sits inside because the mesh is coarse -- which is exactly the
+    distinction the wake length fails.
+
+    ``study`` is the grid-convergence result *for this Reynolds number*, and is
+    empty for a case that has not had one. Nothing is printed then. The first
+    version of this looked the quantity up by name alone and so showed the Re 20
+    drag against the Re 40 limit -- 2.027 reported as 33% from a converged 1.518
+    belonging to a different flow. An uncertainty attached to the wrong case is
+    worse than none.
+    """
     mark = "ok " if _within(value, bounds) else "OFF"
-    return (
+    line = (
         f"  {name:<24} {value:9.4f}{unit:<4}  expect {bounds[0]}-{bounds[1]}  [{mark}]"
     )
+    if not study or quantity not in study:
+        return line
+    order, limit, _ = study[quantity]
+    error = 100.0 * (value - limit) / abs(limit)
+    return line + f"   grid-converged {limit:.4f} ({error:+.3f}%, order {order:.2f})"
 
 
 def wake_length(case: Case) -> float:
