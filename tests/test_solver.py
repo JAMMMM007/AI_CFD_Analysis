@@ -1197,6 +1197,188 @@ class TestOpenFaceFamilies:
         assert np.abs(closure).max() < 1e-14 * scale
 
 
+class TestSymmetryPlane:
+    """A ``j = 0`` row that is part solid wall and part symmetry plane.
+
+    Which is what a flat plate needs: the TMR ``2DZP`` case puts a symmetry
+    plane ahead of the leading edge, because without one the plate starts at a
+    singularity. The two conditions meet on a face, so the row carries both.
+
+    Symmetry is not a fourth kind of boundary here. It is the wall's condition
+    with the tangential target changed from zero to whatever the cell has, so
+    what these tests check is that the change is complete -- every quantity the
+    wall row feeds, not just the velocity.
+    """
+
+    @staticmethod
+    def _plate(nx=8, ny=4):
+        """An open rectangle whose ``j = 0`` row is symmetry then wall."""
+        _, _, faces = open_rectangle(nx=nx, ny=ny)
+        mask = np.zeros(nx, dtype=bool)
+        mask[nx // 2:] = True
+        boundaries = Boundaries(
+            faces, AIR_15C, Freestream(velocity=10.0), wall_mask=mask
+        )
+        return faces, boundaries, mask
+
+    def test_a_uniform_stream_sees_no_wall_on_the_symmetry_half(self):
+        """The face value equals the cell value, so the diffusive flux is zero.
+
+        This is the whole condition in one line. A stream parallel to the plane
+        must be able to slide along it without the boundary taking any momentum
+        out, and the mirrored face value is what makes the coupling
+        ``mu g (u_face - u_cell)`` vanish identically rather than nearly.
+        """
+        faces, boundaries, mask = self._plate()
+        u = np.full(faces.shape, 10.0)
+        v = np.zeros(faces.shape)
+
+        wall_u, wall_v = boundaries.wall_velocity(u, v)
+        assert np.allclose(wall_u[~mask], 10.0)
+        assert np.allclose(wall_v[~mask], 0.0)
+        # And the solid half is still no slip.
+        assert np.allclose(wall_u[mask], 0.0)
+        assert np.allclose(wall_v[mask], 0.0)
+
+    def test_the_normal_component_is_the_part_that_gets_removed(self):
+        """Not the tangential one. The face normal here is ``-y``."""
+        faces, boundaries, mask = self._plate()
+        u = np.full(faces.shape, 3.0)
+        v = np.full(faces.shape, -2.0)
+
+        wall_u, wall_v = boundaries.wall_velocity(u, v)
+        assert np.allclose(wall_u[~mask], 3.0)
+        assert np.allclose(wall_v[~mask], 0.0)
+
+    def test_a_symmetry_face_carries_no_shear_and_no_friction_drag(self):
+        """A friction velocity there would be finite, and fictitious.
+
+        ``friction_velocity`` takes the tangential speed of the first cell, which
+        on a symmetry plane is the full freestream. Left unmasked it produces a
+        perfectly plausible wall shear along a boundary that is not a surface,
+        and ``compute_forces`` integrates it into the drag.
+        """
+        faces, boundaries, mask = self._plate()
+        u = np.full(faces.shape, 10.0)
+        v = np.zeros(faces.shape)
+
+        shear = boundaries.wall_shear(u, v)
+        assert np.all(shear[~mask] == 0.0)
+        assert np.all(shear[mask] > 0.0)
+
+    def test_the_wall_function_viscosity_is_not_applied_off_the_plate(self):
+        """The interior value is, because the flux there is an ordinary one."""
+        faces, boundaries, mask = self._plate()
+        u = np.full(faces.shape, 10.0)
+        v = np.zeros(faces.shape)
+        interior = np.full(faces.shape[0], 7.0)
+
+        viscosity = boundaries.wall_viscosity(u, v, interior)
+        assert np.allclose(viscosity[~mask], 7.0)
+        assert np.all(viscosity[mask] >= AIR_15C.viscosity)
+
+    def test_the_force_integral_counts_only_the_solid_half(self):
+        """A symmetry plane carries pressure and is not a surface to push on.
+
+        This is the failure that would be quietest: the plane's pressure is real,
+        its area vector is real, and integrating it gives a drag that looks
+        plausible and is entirely an artefact of where the domain was cut.
+        """
+        faces, boundaries, mask = self._plate()
+        state = State.uniform(faces, AIR_15C, boundaries.freestream)
+        state.pressure[:] = 5.0
+
+        masked = compute_forces(
+            state, faces, AIR_15C, boundaries.freestream, 1.0, np.zeros(2),
+            boundaries,
+        )
+        whole = compute_forces(
+            state, faces, AIR_15C, boundaries.freestream, 1.0, np.zeros(2),
+            Boundaries(faces, AIR_15C, boundaries.freestream),
+        )
+        area = faces.wall.area
+        assert np.allclose(
+            masked.pressure_force, 5.0 * area[mask].sum(axis=0)
+        )
+        assert not np.allclose(masked.pressure_force, whole.pressure_force)
+
+    def test_solid_wall_is_all_true_without_a_mask(self):
+        """So that a weight built from it leaves an O-grid's arithmetic alone."""
+        _, _, faces = uniform_mesh(48)
+        boundaries = Boundaries(faces, AIR_15C, Freestream(velocity=30.0))
+        assert boundaries.solid_wall.all()
+        assert boundaries.solid_wall.shape == (faces.shape[0],)
+
+    def test_a_masked_boundary_refuses_to_guess_the_velocity(self):
+        """Because on the symmetry half the answer depends on the flow."""
+        _, boundaries, _ = self._plate()
+        with pytest.raises(ValueError, match="needs the velocity"):
+            boundaries.wall_velocity()
+
+
+class TestMixedGradientRow:
+    """A gradient whose wall row is Dirichlet on some faces and Neumann on others.
+
+    ``omega`` is the field that needs this: the near-wall asymptote is prescribed
+    on the solid part of the row and means nothing on the symmetry part, where
+    the normal derivative vanishes instead. Without a per-face choice the
+    asymptote -- which is ``6 nu / (beta1 d^2)`` and therefore enormous on a fine
+    mesh -- would be asserted on a face that has no boundary layer behind it.
+    """
+
+    def test_the_mask_reproduces_both_pure_conditions_at_its_extremes(self):
+        _, _, faces = open_rectangle()
+        gradient = ops.Gradient(faces)
+        field = np.linspace(0.0, 1.0, faces.shape[0] * faces.shape[1]).reshape(
+            faces.shape
+        )
+        wall = np.full(faces.shape[0], 0.25)
+        far = field[:, -1]
+        ends = (field[0], field[-1])
+
+        dirichlet = gradient(field, wall, far, *ends)
+        neumann = gradient(field, None, far, *ends)
+
+        all_solid = gradient(
+            field, wall, far, *ends,
+            wall_active=np.ones(faces.shape[0], dtype=bool),
+        )
+        none_solid = gradient(
+            field, wall, far, *ends,
+            wall_active=np.zeros(faces.shape[0], dtype=bool),
+        )
+        assert np.allclose(all_solid, dirichlet)
+        assert np.allclose(none_solid, neumann)
+
+    def test_each_half_of_a_mixed_row_matches_its_own_pure_condition(self):
+        """The two halves must not contaminate each other.
+
+        The gradient is a per-cell least-squares fit, so a cell's answer depends
+        only on its own stencil; the mask is therefore a face-by-face choice and
+        not a blend. That is worth checking rather than assuming, because the
+        seeded pass that produces the zero-normal-gradient value is computed for
+        the whole row at once.
+        """
+        nx = 8
+        _, _, faces = open_rectangle(nx=nx)
+        gradient = ops.Gradient(faces)
+        field = np.linspace(0.0, 1.0, faces.shape[0] * faces.shape[1]).reshape(
+            faces.shape
+        )
+        wall = np.full(nx, 0.25)
+        far = field[:, -1]
+        ends = (field[0], field[-1])
+        mask = np.zeros(nx, dtype=bool)
+        mask[nx // 2:] = True
+
+        mixed = gradient(field, wall, far, *ends, wall_active=mask)
+        dirichlet = gradient(field, wall, far, *ends)
+        neumann = gradient(field, None, far, *ends)
+
+        assert np.allclose(mixed[mask], dirichlet[mask])
+        assert np.allclose(mixed[~mask], neumann[~mask])
+
+
 class TestRhieChowConsistency:
     """That the pressure-velocity damping vanishes when it is supposed to.
 

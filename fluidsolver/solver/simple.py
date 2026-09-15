@@ -286,7 +286,7 @@ class PressureVelocityCoupling:
         share it: they differ only in their sources.
         """
         far_flux = state.flux_j[:, -1]
-        wall_u, wall_v = self.boundaries.wall_velocity()
+        wall_u, wall_v = self.boundaries.wall_velocity(state.u, state.v)
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
         inflow = self.boundaries.inflow_mask(far_flux)
 
@@ -313,7 +313,7 @@ class PressureVelocityCoupling:
         # molecular even where the viscous branch was exact, and moved the
         # Re 40 cylinder's converged residual in its third digit.
         wall_viscosity = (
-            self.boundaries.wall_viscosity(state.u, state.v)
+            self.boundaries.wall_viscosity(state.u, state.v, viscosity[:, 0])
             if self.wall_model
             else None
         )
@@ -569,7 +569,7 @@ class PressureVelocityCoupling:
         Also returns the two ``D`` coefficients the pressure equation needs.
         """
         far_flux = state.flux_j[:, -1]
-        wall_u, wall_v = self.boundaries.wall_velocity()
+        wall_u, wall_v = self.boundaries.wall_velocity(state.u, state.v)
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
         far_pressure = self.boundaries.far_pressure(state.pressure, far_flux)
 

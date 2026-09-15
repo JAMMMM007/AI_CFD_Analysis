@@ -154,7 +154,17 @@ class KOmegaSST(TurbulenceModel):
         # normal -- the same condition only where the two are parallel, which on
         # a circle is everywhere and on an aerofoil is nowhere.
         grad_k = self.gradient(state.k, None, far_k)
-        grad_omega = self.gradient(state.omega, wall_omega, far_omega)
+        # ``wall_omega`` is the near-wall asymptote and means nothing on a
+        # symmetry face, where omega instead has a vanishing normal derivative.
+        # ``solid`` picks between the two face by face; it is all-True on a mesh
+        # wrapped around a body, where this is the condition it always was.
+        solid = self.boundaries.solid_wall
+        grad_omega = self.gradient(
+            state.omega,
+            wall_omega,
+            far_omega,
+            wall_active=None if self.boundaries.wall_mask is None else solid,
+        )
         strain = self.strain_rate(state, self.gradient)
 
         blend = self._blending_f1(state, grad_k, grad_omega)
@@ -294,10 +304,18 @@ class KOmegaSST(TurbulenceModel):
         )
 
     def _production_strain(self, state: State, strain: np.ndarray) -> np.ndarray:
-        """The strain the production terms use, with the wall row overridden."""
+        """The strain the production terms use, with the wall row overridden.
+
+        Only where the row is a solid wall. The two-layer profile the override
+        comes from describes a boundary layer, and a symmetry plane has none: the
+        resolved strain is simply correct there, and asserting a log-layer one
+        would manufacture turbulence in a stream that is not sheared at all.
+        """
         production_strain = strain.copy()
-        production_strain[:, 0] = self.boundaries.wall_velocity_gradient(
-            state.u, state.v
+        production_strain[:, 0] = np.where(
+            self.boundaries.solid_wall,
+            self.boundaries.wall_velocity_gradient(state.u, state.v),
+            strain[:, 0],
         )
         return production_strain
 
@@ -450,7 +468,8 @@ class KOmegaSST(TurbulenceModel):
         ) * self.volume
 
         return self._solve_and_clip(
-            coefficients, state, "omega", self._omega_floor, fixed_wall=wall_omega
+            coefficients, state, "omega", self._omega_floor, fixed_wall=wall_omega,
+            solid=self.boundaries.solid_wall,
         )
 
     def _solve_and_clip(
@@ -460,11 +479,15 @@ class KOmegaSST(TurbulenceModel):
         name: str,
         floor: float,
         fixed_wall: np.ndarray | None = None,
+        solid: np.ndarray | None = None,
     ) -> float:
         """Relax, solve, and clip the result to stay positive.
 
         ``fixed_wall`` prescribes the wall-adjacent cell value outright, by
-        replacing its row with the identity. This is how Menter's ``omega``
+        replacing its row with the identity. ``solid`` restricts that to the part
+        of the row that is solid wall: a symmetry face has no near-wall asymptote
+        to prescribe, so those cells are solved like any other. It defaults to
+        the whole row, which is what a mesh wrapped around a body has. This is how Menter's ``omega``
         condition is meant to be applied: ``6 nu / (beta1 d1^2)`` is the
         asymptotic solution evaluated *at the first cell centre*, not a value on
         the surface. Imposing it as a Dirichlet face value instead drives an
@@ -485,9 +508,11 @@ class KOmegaSST(TurbulenceModel):
         was doing.
         """
         current = getattr(state, name)
+        if solid is None:
+            solid = np.ones(coefficients.centre.shape[0], dtype=bool)
 
         if fixed_wall is not None:
-            self._fix_wall_row(coefficients, fixed_wall)
+            self._fix_wall_row(coefficients, fixed_wall, solid)
 
         # The wall row is prescribed rather than solved, so it is excluded from
         # the residual. See Coefficients.residual: left in, it supplied 57% of
@@ -496,7 +521,7 @@ class KOmegaSST(TurbulenceModel):
         solved = None
         if fixed_wall is not None:
             solved = np.ones(coefficients.centre.shape, dtype=bool)
-            solved[:, 0] = False
+            solved[:, 0] = ~solid
         residual = coefficients.residual(current, solved)
 
         # Damped with the same local step the momentum equations use, so that k
@@ -509,7 +534,7 @@ class KOmegaSST(TurbulenceModel):
             coefficients.add_pseudo_time(current, pseudo_time)
         coefficients.under_relax(current, self.numerics.relax_turbulence)
         if fixed_wall is not None:
-            self._pin_wall_row(coefficients, fixed_wall)
+            self._pin_wall_row(coefficients, fixed_wall, solid)
 
         matrix = self.matrix.build(coefficients)
         value, _ = solve(
@@ -523,26 +548,39 @@ class KOmegaSST(TurbulenceModel):
         return residual
 
     @staticmethod
-    def _fix_wall_row(coefficients: Coefficients, fixed_wall: np.ndarray) -> None:
-        """Replace the wall-adjacent row with the identity, once."""
+    def _fix_wall_row(
+        coefficients: Coefficients, fixed_wall: np.ndarray, solid: np.ndarray
+    ) -> None:
+        """Replace the solid part of the wall-adjacent row with the identity, once.
+
+        ``solid`` is all-True on a mesh wrapped around a body, where every
+        ``np.where`` below reduces to the assignment it replaced.
+        """
         for band in (
             coefficients.west, coefficients.east,
             coefficients.south, coefficients.north,
         ):
-            band[:, 0] = 0.0
-        # The cell above no longer has a neighbour to solve for; fold its
-        # coupling into the source so the equation there stays correct.
-        coefficients.source[:, 1] -= coefficients.south[:, 1] * fixed_wall
-        coefficients.south[:, 1] = 0.0
-        KOmegaSST._pin_wall_row(coefficients, fixed_wall)
+            band[:, 0] = np.where(solid, 0.0, band[:, 0])
+        # A cell above a prescribed one no longer has a neighbour to solve for;
+        # fold its coupling into the source so the equation there stays correct.
+        # A cell above a symmetry face keeps its neighbour and is untouched.
+        coefficients.source[:, 1] -= np.where(
+            solid, coefficients.south[:, 1] * fixed_wall, 0.0
+        )
+        coefficients.south[:, 1] = np.where(solid, 0.0, coefficients.south[:, 1])
+        KOmegaSST._pin_wall_row(coefficients, fixed_wall, solid)
 
     @staticmethod
-    def _pin_wall_row(coefficients: Coefficients, fixed_wall: np.ndarray) -> None:
+    def _pin_wall_row(
+        coefficients: Coefficients, fixed_wall: np.ndarray, solid: np.ndarray
+    ) -> None:
         """Restore the identity on the wall row, after something has scaled it.
 
         Separate from :meth:`_fix_wall_row` because it is idempotent and that one
         is not: folding the ``south`` coupling into the row above may happen once
         and only once.
         """
-        coefficients.centre[:, 0] = 1.0
-        coefficients.source[:, 0] = fixed_wall
+        coefficients.centre[:, 0] = np.where(solid, 1.0, coefficients.centre[:, 0])
+        coefficients.source[:, 0] = np.where(
+            solid, fixed_wall, coefficients.source[:, 0]
+        )

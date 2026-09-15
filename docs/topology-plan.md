@@ -92,3 +92,92 @@ Nothing on the periodic path. No number in either gate, no test in `tests/`
 whose mesh is an O-grid. If any of them moves, that is a regression and not a
 result. Stated here so that a moving number is a signal rather than something to
 rationalise afterwards.
+
+## Step 6b: what an open boundary actually is
+
+Step 6a built the mesh. This is what has to be true at its four edges, and the
+survey came first because the answer changes the shape of the work.
+
+The solver's boundary vocabulary is **positional**: `wall` means `j = 0` and
+`far_field` means `j = -1`, and every consumer -- `momentum`, `face_fluxes`,
+`pressure_correction`, both turbulence equations, the force integral -- is
+written in those terms. The 2DZP plate needs four boundaries and one of them is
+*mixed*, so the vocabulary has to stop being positional. What makes that
+tractable is that there are only **three kinds** of condition in the whole
+solver, and two of them are already written:
+
+1. **Solid wall.** No slip, no flux, wall functions, `omega` pinned in the
+   adjacent cell. Written, at `j = 0`.
+2. **Characteristic open boundary.** Each face decides on the sign of `u . n`:
+   inflow fixes velocity and turbulence and floats pressure, outflow fixes
+   pressure and floats velocity. Written, at `j = -1`, under the name
+   `far_field`. Inflow and outflow are not separate conditions -- an inlet is
+   this condition on a boundary that happens to be inflow everywhere, and the
+   code will select that for itself.
+3. **Symmetry.** New. No flux, no shear, zero normal gradient for scalars.
+
+So the plate needs no new *physics* at its `i` ends or its top: those are three
+more instances of (2). It needs (3), and it needs (1) and (3) to coexist along
+one row.
+
+### Symmetry is a wall with the shear removed
+
+The finite-volume statement is the mirrored face value
+
+    u_face = u_cell - (u_cell . n) n
+
+carried by the interior viscosity through the same diffusive coupling the
+no-slip wall uses. The tangential flux is then identically zero -- no shear --
+and the normal part is `-mu g (u_cell . n)`, a penalty driving the face-normal
+velocity to zero. That is exactly what a solid wall's condition reduces to when
+the tangential target stops being zero and starts being whatever the cell has,
+which is why this is a *mask over the wall row* rather than a fourth code path.
+
+Everything the wall row does therefore needs the mask:
+
+| what | solid | symmetry |
+|---|---|---|
+| `wall_velocity` | `0, 0` | `u_cell - (u_cell.n) n` |
+| `wall_viscosity` | blended `mu_wall` | interior `mu + mu_t` |
+| `wall_turbulence` `omega` | pinned in the cell | not pinned; zero gradient |
+| `k` | zero flux | zero flux -- already the same |
+| `wall_velocity_gradient` | two-layer profile | the resolved strain |
+| force integral | contributes | does not: it is not the body |
+
+The last line is the one that would be silently wrong. `compute_forces`
+integrates the whole `j = 0` row, so a plate would report the symmetry plane's
+pressure as part of its drag.
+
+### What the `i` ends need that the far field did not
+
+The characteristic condition is written against `flux_j[:, -1]`, whose sign
+convention is outward because `j = -1` is the high end. At `i = 0` the outward
+direction is *decreasing* `i`, so the same test on `flux_i[0]` has the opposite
+sign. `faces.i_start` already stores the outward area vector -- it was built
+negated in step 2, mirroring `wall` against `face_j` -- so the fix belongs at
+the one place the flux is read, not inside the condition.
+
+Beyond that the `i` ends need what the far field already has and step 5 left
+impermeable:
+
+* `face_fluxes` must build `flux_i[0]` and `flux_i[-1]` from the boundary
+  velocity instead of writing zeros.
+* `add_convection` must carry the two end faces. It does not: `interior_i` is
+  `flux_i[1:-1]` and the ends are dropped.
+* `pressure_correction` and `apply_correction` need the Dirichlet coupling that
+  `_far_field_coupling` provides at an outflow face, at whichever `i` end holds
+  the pressure.
+* `add_diffusion` already takes `i_start_value` and `i_end_value` from step 3.
+
+### Order, and what each commit must show
+
+* **A. Symmetry as a masked wall.** A shear flow over a symmetry plane feels no
+  wall: measured shear zero to rounding, and a uniform stream stays uniform.
+* **B. The `i` ends carry flow.** Mass in equals mass out on a channel with no
+  body in it, and a uniform stream crosses an open box unchanged.
+* **C. A plate case runs.** `Case` accepts a `RectilinearGrid`, and the run
+  converges.
+
+The invariant stands: the periodic path stays bit-identical. It is checked the
+same way step 6a was checked, against `%.17e` on the cylinder's metrics, `Cd`,
+`Cl`, wake length, separation angle and iteration count.

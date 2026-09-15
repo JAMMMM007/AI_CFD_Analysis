@@ -223,14 +223,27 @@ def compute_forces(
     moment_reference: np.ndarray,
     boundaries=None,
 ) -> Forces:
-    """Integrate pressure and friction over the body."""
+    """Integrate pressure and friction over the body.
+
+    Over the *body*, which on a mixed ``j = 0`` boundary is not the whole row.
+    A symmetry plane ahead of a flat plate carries a perfectly real pressure and
+    is not a surface the flow pushes on, so its faces are weighted out. The
+    weight is all ones without a mask, so an O-grid case integrates exactly what
+    it always did.
+    """
     area = faces.wall.area
     length = faces.wall.length
+    solid = (
+        np.ones(len(area))
+        if boundaries is None
+        else boundaries.solid_wall.astype(float)
+    )
 
-    face_pressure = wall_pressure(state, faces)
+    face_pressure = wall_pressure(state, faces) * solid
     pressure_force = np.sum(face_pressure[:, None] * area, axis=0)
 
     traction, _ = wall_shear_stress(state, faces, fluid, boundaries)
+    length = length * solid
     viscous_force = np.sum(traction * length[:, None], axis=0)
 
     # Nose-up positive, which is the negative of the mesh-frame z moment.

@@ -77,7 +77,7 @@ class TurbulenceModel(ABC):
             2 S_ij S_ij = 2[(du/dx)^2 + (dv/dy)^2] + (du/dy + dv/dx)^2
         """
         far_flux = state.flux_j[:, -1]
-        wall_u, wall_v = self.boundaries.wall_velocity()
+        wall_u, wall_v = self.boundaries.wall_velocity(state.u, state.v)
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
 
         grad_u = gradient(state.u, wall_u, far_u)
@@ -100,7 +100,7 @@ class TurbulenceModel(ABC):
         the *signed* version, for plotting.
         """
         far_flux = state.flux_j[:, -1]
-        wall_u, wall_v = self.boundaries.wall_velocity()
+        wall_u, wall_v = self.boundaries.wall_velocity(state.u, state.v)
         far_u, far_v = self.boundaries.far_velocity(state.u, state.v, far_flux)
 
         grad_u = gradient(state.u, wall_u, far_u)

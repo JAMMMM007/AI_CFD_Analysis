@@ -1,7 +1,19 @@
-"""Boundary conditions on the two boundaries an O-grid has.
+"""Boundary conditions on the boundaries a structured mesh has.
 
 **The wall** is straightforward: no slip, no flux, and the turbulence conditions
 that come with integrating k-omega SST to the wall.
+
+**Part of it may be a symmetry plane instead**, which is what a flat-plate case
+needs ahead of its leading edge and what ``Boundaries.wall_mask`` selects.
+Symmetry is not a fourth kind of condition, it is the wall's condition with the
+tangential target changed: the mirrored face value
+
+    u_face = u_cell - (u_cell . n) n
+
+carried by the interior viscosity through the same diffusive coupling. The
+tangential flux is then identically zero -- no shear -- and the normal part is
+``-mu g (u_cell . n)``, which drives the face-normal velocity to zero. Both of
+those are what a symmetry plane means, and neither needs new machinery.
 
 **The far field** is not, and the treatment here matters more than it looks. The
 outer boundary is a single closed circle, so the same boundary carries the
@@ -87,6 +99,11 @@ class Boundaries:
     fluid: Fluid
     freestream: Freestream
 
+    #: Which ``j = 0`` faces are solid wall, ``True`` where they are. ``None``
+    #: means all of them, which is what a mesh wrapped around a body has and is
+    #: the only thing an O-grid case ever passes.
+    wall_mask: np.ndarray | None = None
+
     #: Reference length, for the bound circulation. Only the far-field vortex
     #: correction uses it, and only through ``Gamma = Cl U c / 2``.
     reference_length: float = 1.0
@@ -104,6 +121,24 @@ class Boundaries:
     def __post_init__(self):
         if self.vortex_centre is None:
             self.vortex_centre = self.faces.wall.centre.mean(axis=0)
+
+    @property
+    def solid_wall(self) -> np.ndarray:
+        """The mask as an array, ``True`` everywhere when there is none.
+
+        Callers that only need to *weight* something by it can use this without
+        branching, and get an all-``True`` array that leaves their arithmetic
+        exactly where it was.
+        """
+        if self.wall_mask is None:
+            return np.ones(self.faces.shape[0], dtype=bool)
+        return self.wall_mask
+
+    def _mirrored_velocity(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """The first cell's velocity with its wall-normal component removed."""
+        normal = self.faces.wall.normal
+        velocity = np.stack((u[:, 0], v[:, 0]), axis=-1)
+        return velocity - np.sum(velocity * normal, axis=-1)[:, None] * normal
 
     def set_circulation(self, lift_coefficient: float) -> None:
         """``Gamma = Cl U c / 2``, from Kutta-Joukowski.
@@ -156,10 +191,29 @@ class Boundaries:
     # Wall
     # ------------------------------------------------------------------
 
-    def wall_velocity(self) -> tuple[np.ndarray, np.ndarray]:
-        """No slip: both components zero on the surface."""
+    def wall_velocity(
+        self, u: np.ndarray | None = None, v: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """No slip on a solid face; the mirrored velocity on a symmetry one.
+
+        ``u`` and ``v`` are needed only where :attr:`wall_mask` says a face is
+        not solid, because that is the only case whose answer depends on the
+        flow. A wall-only boundary returns zeros without looking at them, which
+        is why they are optional and why nothing on the O-grid path moved.
+        """
         zero = np.zeros(self.faces.shape[0])
-        return zero, zero.copy()
+        if self.wall_mask is None:
+            return zero, zero.copy()
+        if u is None or v is None:
+            raise ValueError(
+                "a boundary with a symmetry plane in it needs the velocity "
+                "field: the face value there is the flow's own tangential part"
+            )
+        mirrored = self._mirrored_velocity(u, v)
+        return (
+            np.where(self.wall_mask, 0.0, mirrored[:, 0]),
+            np.where(self.wall_mask, 0.0, mirrored[:, 1]),
+        )
 
     def wall_tangential_velocity(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         """Speed of the first cell centre along the surface."""
@@ -222,8 +276,18 @@ class Boundaries:
         return friction
 
     def wall_shear(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """``tau_w = rho u_tau^2``, the traction the surface exerts on the flow."""
-        return self.fluid.density * self.friction_velocity(u, v) ** 2
+        """``tau_w = rho u_tau^2``, the traction the surface exerts on the flow.
+
+        Zero on a symmetry face, which is what symmetry *means*: the normal
+        derivative of the tangential velocity vanishes there, so there is no
+        shear. A friction velocity computed from the tangential cell speed would
+        be perfectly finite and entirely fictitious, and it would be integrated
+        into a drag, so it is masked out rather than left to be.
+        """
+        shear = self.fluid.density * self.friction_velocity(u, v) ** 2
+        if self.wall_mask is None:
+            return shear
+        return np.where(self.wall_mask, shear, 0.0)
 
     def wall_velocity_gradient(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
         """``dU/dy`` at the first cell centre, from the two-layer profile.
@@ -255,7 +319,9 @@ class Boundaries:
         logarithmic = friction / (_KAPPA * distance)
         return np.minimum(viscous, logarithmic)
 
-    def wall_viscosity(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    def wall_viscosity(
+        self, u: np.ndarray, v: np.ndarray, interior: np.ndarray | None = None
+    ) -> np.ndarray:
         """Effective viscosity on the wall face that reproduces ``tau_w``.
 
         The momentum equation imposes no-slip through a diffusive flux
@@ -282,7 +348,15 @@ class Boundaries:
         distance = self.faces.wall.wall_normal_distance
         speed = np.maximum(self.wall_tangential_velocity(u, v), _SPEED_FLOOR)
         shear = self.wall_shear(u, v)
-        return np.maximum(shear * distance / speed, self.fluid.viscosity)
+        blended = np.maximum(shear * distance / speed, self.fluid.viscosity)
+        if self.wall_mask is None:
+            return blended
+        # A symmetry face takes the interior viscosity instead. The wall function
+        # has nothing to say there -- no boundary layer, no log law -- and the
+        # flux that face does carry is the normal-velocity penalty, which is an
+        # ordinary viscous term and wants the ordinary viscosity.
+        interior = self.fluid.viscosity if interior is None else interior
+        return np.where(self.wall_mask, blended, interior)
 
     def wall_turbulence(
         self, u: np.ndarray | None = None, v: np.ndarray | None = None

@@ -212,11 +212,17 @@ class Gradient:
         far_field: np.ndarray | None,
         i_start: np.ndarray | None = None,
         i_end: np.ndarray | None = None,
+        wall_active: np.ndarray | None = None,
     ) -> np.ndarray:
         """Gradient of a cell field, ``(Ni, Nj, 2)``.
 
         ``wall`` and ``far_field`` are the values on those boundary faces.
-        ``None`` means a zero *normal* gradient there.
+        ``None`` means a zero *normal* gradient there. ``wall_active`` makes that
+        choice face by face rather than for the whole row: where it is False the
+        supplied ``wall`` value is discarded and the zero-normal-gradient
+        construction below is used in its place. A mixed ``j = 0`` boundary needs
+        exactly that, because ``omega`` is prescribed on the solid part of the
+        row and has a vanishing normal derivative on the symmetry part.
 
         **Passing the adjacent cell value is not the same condition, and this
         docstring used to say it was.** It said: "For a zero-gradient condition
@@ -246,7 +252,12 @@ class Gradient:
         is exact at convergence.
         """
         open_i = not self._periodic_i
-        if wall is None or far_field is None or (open_i and (i_start is None or i_end is None)):
+        if (
+            wall is None
+            or far_field is None
+            or wall_active is not None
+            or (open_i and (i_start is None or i_end is None))
+        ):
             seeded = self(
                 field,
                 field[:, 0] if wall is None else wall,
@@ -254,10 +265,13 @@ class Gradient:
                 field[0] if open_i and i_start is None else i_start,
                 field[-1] if open_i and i_end is None else i_end,
             )
+            zero_gradient_wall = field[:, 0] + np.sum(
+                seeded[:, 0] * self._wall_tangential, axis=-1
+            )
             if wall is None:
-                wall = field[:, 0] + np.sum(
-                    seeded[:, 0] * self._wall_tangential, axis=-1
-                )
+                wall = zero_gradient_wall
+            elif wall_active is not None:
+                wall = np.where(wall_active, wall, zero_gradient_wall)
             if far_field is None:
                 far_field = field[:, -1] + np.sum(
                     seeded[:, -1] * self._far_tangential, axis=-1
