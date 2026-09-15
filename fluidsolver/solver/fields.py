@@ -34,7 +34,11 @@ class State:
 
     @classmethod
     def uniform(
-        cls, faces: FaceGeometry, fluid: Fluid, freestream: Freestream
+        cls,
+        faces: FaceGeometry,
+        fluid: Fluid,
+        freestream: Freestream,
+        wall_mask: np.ndarray | None = None,
     ) -> "State":
         """Freestream velocity everywhere, with ``omega`` given its wall profile.
 
@@ -84,7 +88,7 @@ class State:
         """
         shape = faces.shape
         stream = freestream.vector
-        boundaries = Boundaries(faces, fluid, freestream)
+        boundaries = Boundaries(faces, fluid, freestream, wall_mask=wall_mask)
 
         k = np.full(shape, freestream.turbulent_kinetic_energy())
         # omega -> factor nu / (beta1 y^2) approaching a wall; far away the
@@ -97,7 +101,9 @@ class State:
         # boundary condition itself, so the opening iteration does not have to
         # move it.
         _, wall_omega = boundaries.wall_turbulence()
-        omega[:, 0] = wall_omega
+        # Only under solid faces: a symmetry face has no near-wall asymptote, and
+        # the wall distance there is already measured to the plate.
+        omega[:, 0] = np.where(boundaries.solid_wall, wall_omega, omega[:, 0])
 
         state = cls(
             u=np.full(shape, stream[0]),

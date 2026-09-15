@@ -77,6 +77,8 @@ class OGrid:
     #: The ``i`` direction wraps the body. See
     #: :attr:`fluidsolver.mesh.metrics.Metrics.periodic_i`.
     periodic_i = True
+    #: The whole ``j = 0`` row is the body. See ``RectilinearGrid.wall_mask``.
+    wall_mask = None
 
     @property
     def name(self) -> str:

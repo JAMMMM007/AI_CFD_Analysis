@@ -181,3 +181,61 @@ impermeable:
 The invariant stands: the periodic path stays bit-identical. It is checked the
 same way step 6a was checked, against `%.17e` on the cylinder's metrics, `Cd`,
 `Cl`, wake length, separation angle and iteration count.
+
+### What happened in 6b
+
+All three commits kept the periodic path bit-identical, measured at `%.17e`
+against the previous commit on two cases rather than one: the laminar Re 40
+cylinder (metrics, `Cd`, `Cl`, wake length, separation angle, iteration count)
+and a k-omega SST NACA 0012 at 5 degrees after 400 iterations (`Cd`, `Cl`,
+`Cm`, the sums of `k`, `omega` and `mu_t`, the residual). The second case was
+added because most of what A touched -- the wall function, the pinned `omega`
+row, the production strain -- is never reached by a laminar run.
+
+**Two O-grid assumptions the survey above missed**, both silent:
+
+* `health.cell_peclet` rolled the node array along `i`. On an open mesh that
+  joins the outlet to the inlet and reports a cell as long as the domain.
+* The laminar force integral receives no `Boundaries`, because a laminar case
+  has no wall model, so a mask carried only by `Boundaries` never reached it.
+  `compute_forces` and `surface_data` now take the mask separately. Before the
+  second fix a laminar plate reported `Cf` up to 0.93 along the symmetry plane
+  -- sixty times the plate's own -- in its surface data.
+
+And one the plan did not list: **SST's wall distance was measured to the whole
+`j = 0` row**, symmetry plane included. `compute_metrics` takes the mask and
+measures to the solid segments only; on the plate it is exact, `hypot(x, y)`
+ahead of the leading edge and `y` over the plate.
+
+**First end-to-end run.** Laminar, `Re_L = 1e4`, 80 x 49 cells, first layer
+1e-3, growth 1.1. Converged to 9.7e-08 in 503 iterations, 17 s. Mass through the
+outlet 0.97694 of the inlet and through the top 0.02306, summing to one: the
+top carries the boundary layer's displacement, as it should.
+
+    x       Re_x      Cf / Blasius
+    0.047     234     1.0875
+    0.100     499     1.0688
+    0.251    1253     1.0587
+    0.502    2511     1.0528
+    1.005    5025     1.0396
+    1.482    7410     1.0314
+    1.947    9736     0.9887
+
+Friction `Cd` 1.4001e-02 against Blasius's 1.3280e-02, +5.4%. Blasius is the
+`Re_x -> infinity` limit and is approached from above, which is the direction
+of the first six rows; **none of this is claimed as agreement** until a grid
+study says how much of each figure is discretisation error.
+
+**The peak `|v|` of 0.156 U is the leading-edge singularity**, located rather
+than assumed: it sits in the first plate column, `x = 0.002`, `Re_x = 10`. Over
+the plate the column maximum tracks Blasius's edge normal velocity
+`0.8604 U / sqrt(Re_x)` at ratios 0.919, 0.969, 0.988, 0.997, 1.008 from
+`x = 0.02` to `0.5`.
+
+**Open, and not explained:** that ratio then climbs to 1.039, 1.150 and 1.286
+at `x = 1.0`, `1.5` and `1.95`, where `Cf` also turns from above Blasius to
+below it. Both point at the outlet or the top boundary, not at the plate. The
+outlet holds `p = 0` on a boundary one plate length downstream of nothing --
+the domain ends at the trailing edge -- and the streamwise spacing is coarsest
+there. Step 7 separates those: outlet distance, domain height, and streamwise
+refinement, one at a time.

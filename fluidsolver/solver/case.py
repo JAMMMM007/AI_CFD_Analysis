@@ -16,6 +16,7 @@ from fluidsolver.mesh import spacing
 from fluidsolver.mesh.metrics import compute_metrics
 from fluidsolver.mesh.ogrid import OGrid, build_ogrid
 from fluidsolver.mesh.quality import QualityReport, assess
+from fluidsolver.mesh.rectilinear import RectilinearGrid
 from fluidsolver.solver import post
 from fluidsolver.solver.bc import Boundaries
 from fluidsolver.solver.faces import build_faces
@@ -81,9 +82,15 @@ class MeshSettings:
 
 @dataclass
 class Case:
-    """A meshed, configured, runnable case."""
+    """A meshed, configured, runnable case.
 
-    grid: OGrid
+    ``grid`` is either an O-grid wrapped around a body or a rectilinear grid
+    with two open ends. ``Case`` asks it for the same handful of things --
+    ``nodes``, ``periodic_i``, ``wall_mask``, a name and two reference
+    quantities -- and never needs to know which it has.
+    """
+
+    grid: OGrid | RectilinearGrid
     fluid: Fluid
     freestream: Freestream
     numerics: Numerics = field(default_factory=Numerics)
@@ -103,7 +110,9 @@ class Case:
             )
 
         self.metrics = compute_metrics(
-            self.grid.nodes, periodic_i=self.grid.periodic_i
+            self.grid.nodes,
+            periodic_i=self.grid.periodic_i,
+            wall_mask=self.grid.wall_mask,
         )
         self.quality: QualityReport = assess(self.metrics, self.grid.nodes)
         if not self.quality.is_usable:
@@ -135,6 +144,7 @@ class Case:
         self.boundaries = Boundaries(
             self.faces, self.fluid, self.freestream,
             reference_length=self.reference_length,
+            wall_mask=self.grid.wall_mask,
         )
         self.coupling = PressureVelocityCoupling(
             self.faces,
@@ -155,7 +165,9 @@ class Case:
         if self.moment_reference is None:
             self.moment_reference = self.grid.moment_reference
 
-        self.state = State.uniform(self.faces, self.fluid, self.freestream)
+        self.state = State.uniform(
+            self.faces, self.fluid, self.freestream, wall_mask=self.grid.wall_mask
+        )
         self.history = History()
         self.iteration = 0
         self.cfl_ramp = CflRamp(self.numerics)
@@ -323,11 +335,13 @@ class Case:
             self.reference_length,
             self.moment_reference,
             self._wall_model,
+            solid=self.boundaries.solid_wall,
         )
 
     def surface(self) -> post.SurfaceData:
         return post.surface_data(
-            self.state, self.faces, self.fluid, self.freestream, self._wall_model
+            self.state, self.faces, self.fluid, self.freestream, self._wall_model,
+            solid=self.boundaries.solid_wall,
         )
 
     def separation_points(self) -> np.ndarray:

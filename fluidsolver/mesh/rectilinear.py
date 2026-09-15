@@ -53,6 +53,10 @@ class RectilinearGrid:
         default_factory=lambda: np.zeros(2)
     )
     notes: list[str] = field(default_factory=list)
+    #: Which ``j = 0`` faces are solid wall, or ``None`` if all of them are.
+    #: Carried by the grid because it is a fact about the geometry -- where the
+    #: plate starts -- and both the metrics and the boundary conditions need it.
+    wall_mask: np.ndarray | None = None
 
     #: The ``i`` direction has two ends rather than wrapping. See
     #: :attr:`fluidsolver.mesh.metrics.Metrics.periodic_i`.
@@ -207,6 +211,7 @@ def flat_plate_grid(
         reference_length=plate_length,
         moment_reference=np.zeros(2),
     )
+    grid.wall_mask = plate_wall_mask(grid)
     grid.notes.append(
         f"flat plate: symmetry from x = {-upstream:g} to 0, wall from 0 to "
         f"{plate_length:g}; {len(y) - 1} layers to y = {height:g} from a first "

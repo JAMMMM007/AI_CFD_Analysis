@@ -98,7 +98,10 @@ class Metrics:
 
 
 def compute_metrics(
-    nodes: np.ndarray, wall_samples: int = 8, periodic_i: bool = True
+    nodes: np.ndarray,
+    wall_samples: int = 8,
+    periodic_i: bool = True,
+    wall_mask: np.ndarray | None = None,
 ) -> Metrics:
     """Build the finite-volume metrics for a node array.
 
@@ -115,6 +118,13 @@ def compute_metrics(
         distance for cells sitting opposite the middle of a long segment.
     periodic_i
         Whether the ``i`` direction wraps. See :attr:`Metrics.periodic_i`.
+    wall_mask
+        Which ``j = 0`` faces are solid, for the wall distance. ``None`` means all
+        of them. A flat plate's row is part symmetry plane, and SST's blending
+        functions need the distance to the *plate*: measured to the whole row, a
+        cell just ahead of the leading edge would sit a first-layer height from a
+        "wall" that is really a slip plane, and ``F1`` would switch on k-omega in
+        a stream with no boundary layer in it.
 
     The two topologies differ only in which node line follows the last one -- the
     first, or the one after it -- so both are written through a single pair of
@@ -161,7 +171,8 @@ def compute_metrics(
         face_i_centre=face_i_centre,
         face_j_centre=face_j_centre,
         wall_distance=_wall_distance(
-            centroid, nodes[:, 0], wall_samples, closed=periodic_i
+            centroid, nodes[:, 0], wall_samples, closed=periodic_i,
+            segments=wall_mask,
         ),
         periodic_i=periodic_i,
     )
@@ -195,7 +206,11 @@ def _polygon_volume_and_centroid(corners: list[np.ndarray]) -> tuple[np.ndarray,
 
 
 def _wall_distance(
-    centroid: np.ndarray, wall: np.ndarray, samples: int, closed: bool = True
+    centroid: np.ndarray,
+    wall: np.ndarray,
+    samples: int,
+    closed: bool = True,
+    segments: np.ndarray | None = None,
 ) -> np.ndarray:
     """Shortest distance from each cell centroid to the body surface.
 
@@ -246,6 +261,14 @@ def _wall_distance(
     line = np.vstack((wall, wall[:1])) if closed else wall
     start = line[:-1]
     edge = np.diff(line, axis=0)
+    if segments is not None:
+        # Only the solid segments are wall. The neighbour search below steps to
+        # adjacent entries of this *selected* list, which are adjacent segments
+        # wherever the solid part is one contiguous run -- a plate -- and are
+        # still genuine wall segments where it is not, so the minimum taken over
+        # them is never a distance to something that is not wall.
+        start = start[segments]
+        edge = edge[segments]
     n_segments = len(start)
 
     # Seed the search with points along each segment, and remember which segment

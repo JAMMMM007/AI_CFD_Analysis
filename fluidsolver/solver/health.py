@@ -195,12 +195,23 @@ def cell_peclet(metrics: Metrics, nodes: np.ndarray, fluid: Fluid, velocity: flo
     spacing that decides whether convection can be resolved -- taking the short
     edge would report every such cell as comfortable when the opposite is true.
     """
-    along_i = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=-1)
-    along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
-    size = np.maximum(
-        0.5 * (along_i[:, :-1] + along_i[:, 1:]),
-        0.5 * (along_j + np.roll(along_j, -1, axis=0)),
-    )
+    if metrics.periodic_i:
+        along_i = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=-1)
+        along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
+        size = np.maximum(
+            0.5 * (along_i[:, :-1] + along_i[:, 1:]),
+            0.5 * (along_j + np.roll(along_j, -1, axis=0)),
+        )
+    else:
+        # The roll above would join the last node line to the first -- on a flat
+        # plate an edge from the outlet back to the inlet -- and report a cell as
+        # long as the domain, which is what the peak Peclet number would then be.
+        along_i = np.linalg.norm(nodes[1:] - nodes[:-1], axis=-1)
+        along_j = np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1)
+        size = np.maximum(
+            0.5 * (along_i[:, :-1] + along_i[:, 1:]),
+            0.5 * (along_j[:-1] + along_j[1:]),
+        )
     return fluid.density * velocity * size / fluid.viscosity
 
 

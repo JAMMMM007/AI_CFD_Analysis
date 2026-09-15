@@ -222,6 +222,7 @@ def compute_forces(
     reference_length: float,
     moment_reference: np.ndarray,
     boundaries=None,
+    solid: np.ndarray | None = None,
 ) -> Forces:
     """Integrate pressure and friction over the body.
 
@@ -233,11 +234,14 @@ def compute_forces(
     """
     area = faces.wall.area
     length = faces.wall.length
-    solid = (
-        np.ones(len(area))
-        if boundaries is None
-        else boundaries.solid_wall.astype(float)
-    )
+    # ``solid`` is separate from ``boundaries`` because a laminar case passes no
+    # boundaries -- it has no wall model -- and still has a symmetry plane that
+    # is not part of the body.
+    if solid is None:
+        solid = (
+            np.ones(len(area)) if boundaries is None else boundaries.solid_wall
+        )
+    solid = np.asarray(solid, dtype=float)
 
     face_pressure = wall_pressure(state, faces) * solid
     pressure_force = np.sum(face_pressure[:, None] * area, axis=0)
@@ -276,13 +280,24 @@ def compute_forces(
 
 def surface_data(
     state: State, faces: FaceGeometry, fluid: Fluid, freestream: Freestream,
-    boundaries=None,
+    boundaries=None, solid: np.ndarray | None = None,
 ) -> SurfaceData:
-    """Pressure coefficient, skin friction and ``y+`` along the surface."""
+    """Pressure coefficient, skin friction and ``y+`` along the surface.
+
+    ``solid`` zeroes the shear on faces that are not wall. The wall model already
+    does that when there is one; a laminar case has none, and its shear comes
+    from the velocity gradient across the first cell, which on a symmetry plane
+    ahead of a flat plate is ``mu U / y1`` against a face that has no business
+    carrying it. Measured on a laminar plate at ``Re_L = 1e4``: ``Cf`` up to 0.93
+    along the plane, sixty times the plate's own. The force integral was never
+    affected -- it is weighted by the same mask -- but a plotted ``Cf`` was.
+    """
     dynamic = freestream.dynamic_pressure(fluid)
     centre = faces.wall.centre
 
     _, shear = wall_shear_stress(state, faces, fluid, boundaries)
+    if solid is not None:
+        shear = np.where(solid, shear, 0.0)
     friction_velocity = np.sqrt(shear / fluid.density)
     y_plus = (
         fluid.density * friction_velocity * faces.wall.wall_normal_distance

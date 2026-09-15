@@ -34,6 +34,9 @@ from fluidsolver.solver.linalg import (
 )
 from fluidsolver.solver.post import compute_forces, wall_shear_stress
 from fluidsolver.solver.simple import Numerics, PressureVelocityCoupling
+from fluidsolver.solver.case import Case
+from fluidsolver.solver.health import cell_peclet
+from fluidsolver.mesh.rectilinear import flat_plate_grid
 
 
 # ----------------------------------------------------------------------
@@ -1491,6 +1494,97 @@ class TestOpenEnds:
         far_flux = -np.abs(state.flux_j[:, -1]) - 1.0
         assert not boundaries.far_flux_is_solvable(far_flux)
         assert boundaries.far_flux_is_solvable(far_flux, state.flux_i)
+
+
+PLATE_FLUID = Fluid(density=1.0, viscosity=2.0e-4, name="test")
+
+
+@pytest.fixture(scope="module")
+def plate_case():
+    """A converged laminar plate, shared: it is the expensive part of the tests."""
+    grid = flat_plate_grid(
+        first_layer=2.0e-3, growth=1.2, upstream_cells=8, plate_cells=24
+    )
+    case = Case(
+        grid, PLATE_FLUID, Freestream(velocity=1.0),
+        numerics=Numerics(scheme="linear", max_iterations=3000, tolerance=1e-7),
+        model_name="laminar",
+    )
+    case.run()
+    return case
+
+
+class TestPlateCase:
+    """``Case`` on a rectilinear grid, end to end.
+
+    The first thing that exercises every part of the open path at once: an
+    inflow end, an outflow end, a top that decides face by face, and a floor
+    that is symmetry plane then wall. Laminar, so that nothing here depends on a
+    turbulence model and every figure has a closed-form reference to be compared
+    against in the validation case that follows.
+
+    What is asserted is structure -- convergence, conservation, which faces count
+    as body -- not agreement with Blasius. That is a claim about accuracy and
+    belongs in a grid study, not in a test on a mesh chosen for speed.
+    """
+
+    def test_it_converges(self, plate_case):
+        assert plate_case.history.entries[-1].worst < 1e-7
+        assert plate_case.iteration < 3000
+
+    def test_the_mass_that_enters_leaves(self, plate_case):
+        """In through the inlet, out through the outlet and the top together.
+
+        The top carries the displacement of the boundary layer, which is why it
+        is not zero: the plate slows the flow near it, and that mass is pushed
+        out of the domain above. Conservation is of the sum.
+        """
+        state = plate_case.state
+        inlet = state.flux_i[0].sum()
+        leaving = state.flux_i[-1].sum() + state.flux_j[:, -1].sum()
+        assert inlet > 0.0
+        assert np.all(state.flux_j[:, 0] == 0.0)
+        assert abs(leaving - inlet) < 1e-6 * inlet
+        assert state.flux_j[:, -1].sum() > 0.0
+
+    def test_the_wall_distance_is_to_the_plate_not_the_plane(self, plate_case):
+        """Ahead of the leading edge, the distance to the edge itself."""
+        centroid = plate_case.metrics.centroid
+        x, y = centroid[..., 0], centroid[..., 1]
+        expected = np.where(x < 0.0, np.hypot(x, y), y)
+        assert np.allclose(plate_case.metrics.wall_distance, expected, rtol=1e-12, atol=0.0)
+
+    def test_the_symmetry_plane_carries_no_friction_drag(self, plate_case):
+        """Weighted out of the force, and zero in the reported surface data."""
+        solid = plate_case.boundaries.solid_wall
+        assert not solid.all() and solid.any()
+
+        surface = plate_case.surface()
+        assert np.all(surface.skin_friction_coefficient[~solid] == 0.0)
+        assert np.all(surface.skin_friction_coefficient[solid] > 0.0)
+
+        whole = post_forces_over_whole_row(plate_case)
+        assert whole.friction_drag_coefficient > plate_case.forces().friction_drag_coefficient
+
+    def test_the_peclet_number_sees_no_domain_long_cell(self, plate_case):
+        """The roll along i would join the outlet to the inlet."""
+        nodes = plate_case.grid.nodes
+        peclet = cell_peclet(plate_case.metrics, nodes, PLATE_FLUID, 1.0)
+        assert peclet.shape == plate_case.grid.shape
+        longest = max(
+            np.linalg.norm(nodes[1:] - nodes[:-1], axis=-1).max(),
+            np.linalg.norm(nodes[:, 1:] - nodes[:, :-1], axis=-1).max(),
+        )
+        assert peclet.max() <= PLATE_FLUID.density * longest / PLATE_FLUID.viscosity
+
+
+def post_forces_over_whole_row(case):
+    """The force a case would report if nothing told it where the body was."""
+    return compute_forces(
+        case.state, case.faces, case.fluid, case.freestream,
+        case.reference_length, case.moment_reference, None,
+        solid=np.ones(case.faces.shape[0]),
+    )
 
 
 class TestRhieChowConsistency:
